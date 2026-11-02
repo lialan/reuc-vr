@@ -30,6 +30,10 @@ public class UmbrellaChroniclesVR extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         problem = checkGame();
+        // SDL3 (unlike HOTD4's SDL2) calls into libSDL3 when an activity is created again in the same process. After a refused start
+        // (no game: loadLibraries threw) nothing was ever loaded, so a second start from the library crashed with UnsatisfiedLinkError
+        // instead of checking the game again. Nothing native ran in this process: it is a first creation.
+        if (mBrokenLibraries) { mActivityCreated = false; mSDLMainFinished = false; }
         super.onCreate(savedInstanceState);
         if (problem != null) {
             Toast.makeText(this, problem, Toast.LENGTH_LONG).show();
