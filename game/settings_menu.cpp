@@ -5,7 +5,9 @@
 #include "prompt_icons.h"
 #include "render_scale.h"
 #include "rt_ui.h"
-#include <intrin.h>
+#ifdef _WIN32
+#include <intrin.h>   // SDL3-3.2.0's prefetch workaround with clang-cl
+#endif
 #include <SDL3/SDL.h>
 #include "imgui.h"
 #include <algorithm>

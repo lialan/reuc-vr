@@ -3,10 +3,27 @@
 #include "client_update_lock.h"
 #include <fstream>
 #include <iterator>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+extern char** environ;
+#endif
 namespace uc {
+#ifndef _WIN32
+namespace { uint64_t steady_ms() { return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); } }
+#endif
+#ifdef _WIN32
 void ProcessCloser::operator()(void* handle) const {if(handle)CloseHandle(handle);}
 bool game_running(const GameProcess& process) {
     if(!process)return false;
@@ -14,6 +31,7 @@ bool game_running(const GameProcess& process) {
     if(result==WAIT_FAILED)throw std::runtime_error("cannot inspect game process");
     return result==WAIT_TIMEOUT;
 }
+#endif
 std::string last_json_line(std::string_view output) {
     std::string result;
     for(size_t begin=0;begin<output.size();) {
@@ -24,6 +42,7 @@ std::string last_json_line(std::string_view output) {
     }
     return result;
 }
+#ifdef _WIN32
 std::string query_features(const std::filesystem::path& executable,const std::filesystem::path& config,unsigned timeout_ms,std::optional<RendererBackend> backend) {
     if(backend && renderer_backend_name(*backend).empty())throw std::invalid_argument("invalid feature-query renderer");
     const auto exe=std::filesystem::absolute(executable);
@@ -98,4 +117,53 @@ GameProcess launch_game(const std::filesystem::path& executable,const std::files
     std::fprintf(stderr,"[launch] game child pid=%lu network=%s port=%u\n",process.dwProcessId,network ? (network->host ? "host" : "client") : "off",network ? network->port : 0);
     CloseHandle(process.hThread);return GameProcess(process.hProcess);
 }
+#else
+// The game process handle is its pid (stored in the pointer); the launcher that starts games is Windows-only, uc only runs the feature query.
+void ProcessCloser::operator()(void*) const {}
+bool game_running(const GameProcess& process) {
+    if(!process)return false;
+    int status=0;
+    return waitpid(pid_t(reinterpret_cast<intptr_t>(process.get())),&status,WNOHANG)==0;
+}
+std::string query_features(const std::filesystem::path& executable,const std::filesystem::path& config,unsigned timeout_ms,std::optional<RendererBackend> backend) {
+    if(backend && renderer_backend_name(*backend).empty())throw std::invalid_argument("invalid feature-query renderer");
+    const auto exe=std::filesystem::absolute(executable);
+    if(!std::filesystem::is_regular_file(exe))return {};
+    const auto output=std::filesystem::temp_directory_path()/("uc-features-"+std::to_string(getpid())+"-"+std::to_string(steady_ms())+".txt");
+    const std::string exe_text=exe.string(),config_text=std::filesystem::absolute(config).string(),output_text=output.string();
+    std::string backend_name;
+    std::vector<char*> argv{const_cast<char*>(exe_text.c_str()),const_cast<char*>("--features"),const_cast<char*>("--config"),const_cast<char*>(config_text.c_str())};
+    if(backend) {backend_name=std::string(renderer_backend_name(*backend));argv.push_back(const_cast<char*>("--renderer"));argv.push_back(backend_name.data());}
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions,1,output_text.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0600);
+    posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0);
+    pid_t child=0;
+    std::string text;
+    if(posix_spawn(&child,exe_text.c_str(),&actions,nullptr,argv.data(),environ)==0) {
+        std::fprintf(stderr,"[launch] GPU probe child pid=%d timeout_ms=%u\n",int(child),timeout_ms);
+        // The report is read as soon as it is written: the child's exit (GPU driver teardown) is not waited for.
+        const auto deadline=steady_ms()+timeout_ms;bool reported=false,exited=false;int status=0;
+        while(!exited && !reported && steady_ms()<deadline) {
+            exited=waitpid(child,&status,WNOHANG)==child;
+            if(!exited)std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::ifstream in(output,std::ios::binary);text.assign(std::istreambuf_iterator<char>(in),{});
+            reported=!last_json_line(text).empty();
+        }
+        if(!exited) {
+            if(!reported)std::fprintf(stderr,"[launch] GPU probe timed out\n");
+            kill(child,SIGKILL);waitpid(child,&status,0);
+        }
+        std::fprintf(stderr,"[launch] GPU probe exit=%d\n",WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    {std::ifstream in(output,std::ios::binary);text.assign(std::istreambuf_iterator<char>(in),{});}
+    std::error_code ignored;std::filesystem::remove(output,ignored);
+    return last_json_line(text);
+}
+GameProcess launch_game(const std::filesystem::path&,const std::filesystem::path&,const Options*,int,std::optional<net::Endpoint>) {
+    throw std::runtime_error("starting the game from the launcher is supported on Windows only");
+}
+#endif
 }

@@ -1,9 +1,16 @@
 #include "vulkan_renderer.h"
 #include <algorithm>
 #include <limits>
+#ifdef _WIN32
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#else
+#include "file_open.h"
+#include "miniz.h"
+#include <cstdio>
+#include <memory>
+#endif
 
 namespace uc {
 void save_png(const RenderPixels& pixels,const std::filesystem::path& path) {
@@ -11,6 +18,16 @@ void save_png(const RenderPixels& pixels,const std::filesystem::path& path) {
         pixels.height>std::numeric_limits<size_t>::max()/(size_t(pixels.width)*4) ||
         pixels.rgba.size()!=size_t(pixels.width)*pixels.height*4 || pixels.rgba.size()>UINT32_MAX)
         throw std::invalid_argument("invalid PNG readback dimensions/data");
+#ifndef _WIN32
+    // miniz (already linked for mod archives): the same opaque 8-bit RGBA PNG the WIC encoder writes.
+    auto rgba=pixels.rgba;
+    for (size_t i=3;i<rgba.size();i+=4) rgba[i]=255;   // presentation is opaque; EFB alpha carries game data rather than window transparency
+    size_t size=0;
+    std::unique_ptr<void,void(*)(void*)> png(tdefl_write_image_to_png_file_in_memory_ex(rgba.data(),int(pixels.width),int(pixels.height),4,&size,6,MZ_FALSE),mz_free);
+    if (!png) throw std::runtime_error("PNG encoding failed");
+    std::unique_ptr<std::FILE,int(*)(std::FILE*)> file(uc_fopen(path,"wb"),std::fclose);
+    if (!file || std::fwrite(png.get(),1,size,file.get())!=size) throw std::runtime_error("cannot write PNG "+path.string());
+#else
     auto require=[](HRESULT hr) { if (FAILED(hr)) throw std::runtime_error("PNG encoding failed: HRESULT "+std::to_string(static_cast<uint32_t>(hr))); };
     struct ComSession {
         HRESULT result=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
@@ -34,5 +51,6 @@ void save_png(const RenderPixels& pixels,const std::filesystem::path& path) {
     for (size_t i=0;i<bgra.size();i+=4) { std::swap(bgra[i],bgra[i+2]); bgra[i+3]=255; }
     require(frame->WritePixels(pixels.height,pixels.width*4,UINT(bgra.size()),bgra.data()));
     require(frame->Commit()); require(encoder->Commit());
+#endif
 }
 }

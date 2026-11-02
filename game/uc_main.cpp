@@ -90,6 +90,7 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -97,6 +98,16 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <timeapi.h>
+#else
+#include "exe_path.h"
+#include "file_open.h"
+#include "host_process.h"
+#include "host_thread.h"
+#include <execinfo.h>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
+#endif
 
 extern const uc::FnEntry uc_functions[];
 extern const size_t uc_function_count;
@@ -106,8 +117,13 @@ namespace fs = std::filesystem;
 namespace {
 uint32_t guest_writer() { // first translated function on the stack: the guest code storing to the FIFO
     void* frames[32];
+#ifdef _WIN32
     const auto count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
     for (USHORT i = 0; i < count; ++i) if (const auto guest = uc::guest_function_for_host(frames[i])) return guest;
+#else
+    const int count = backtrace(frames, 32);
+    for (int i = 1; i < count; ++i) if (const auto guest = uc::guest_function_for_host(frames[i])) return guest;
+#endif
     return 0;
 }
 struct FifoSink : uc::MmioDevice {   // native resource/vertex ingestion; unowned state bytes remain TD-014
@@ -173,11 +189,20 @@ void print_stats() {
 }
 
 fs::path exe_path() {
+#ifdef _WIN32
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     return fs::path(buf);
+#else
+    return uc::executable_path();
+#endif
 }
 fs::path exe_dir() { return exe_path().parent_path(); }
+#if defined(__APPLE__)
+constexpr SDL_WindowFlags kHighDensity = SDL_WINDOW_HIGH_PIXEL_DENSITY;   // Retina: the swapchain gets the window's pixels, not its points
+#else
+constexpr SDL_WindowFlags kHighDensity = 0;
+#endif
 const bool kPublicRelease = uc::public_release();   // an installed release client (release.json next to the exe) writes no logs, crash reports or debug files
 std::vector<uint8_t> slurp(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
@@ -226,21 +251,43 @@ struct GuestRunner {
 
 // Sleeps until `due` to within ~150 us: a high-resolution waitable timer for most of it, a spin for the rest (the reticle layer's refresh cadence).
 static void precise_sleep_until(std::chrono::steady_clock::time_point due) {
-    static thread_local HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     const auto margin=std::chrono::microseconds(150);
     const auto now=std::chrono::steady_clock::now();
+#ifdef _WIN32
+    static thread_local HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(timer && due-now>margin) {
         LARGE_INTEGER relative; relative.QuadPart=-(std::chrono::duration_cast<std::chrono::nanoseconds>(due-margin-now).count()/100);
         if(SetWaitableTimer(timer,&relative,0,nullptr,nullptr,FALSE)) WaitForSingleObject(timer,INFINITE);
     }
     while(std::chrono::steady_clock::now()<due) YieldProcessor();
+#else
+    if(due-now>margin) {
+#if defined(__APPLE__)
+        // mach_wait_until: an absolute deadline the kernel keeps to a few microseconds (nanosleep may be coalesced).
+        static const mach_timebase_info_data_t timebase=[] { mach_timebase_info_data_t t{}; mach_timebase_info(&t); return t; }();
+        const uint64_t ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(due-margin-now).count());
+        mach_wait_until(mach_absolute_time()+ns*timebase.denom/timebase.numer);
+#else
+        std::this_thread::sleep_until(due-margin);
+#endif
+    }
+    while(std::chrono::steady_clock::now()<due) {
+#if defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+#endif
 }
 static int real_main(int argc, char** argv,uc::Options& startup_options) {
+#ifdef _WIN32
     timeBeginPeriod(1);   // 1 ms timers: sleeps and the modal drag/resize loop's WM_TIMER tick (otherwise 15.6 ms granularity)
     {   // Windows 11 may run a window without focus in EcoQoS and ignore the timer request above; a game wants neither.
         PROCESS_POWER_THROTTLING_STATE throttling{PROCESS_POWER_THROTTLING_CURRENT_VERSION,PROCESS_POWER_THROTTLING_EXECUTION_SPEED|PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,0};
         if(!SetProcessInformation(GetCurrentProcess(),ProcessPowerThrottling,&throttling,sizeof throttling)) std::fprintf(stderr,"power throttling opt-out failed: %lu\n",GetLastError());
     }
+#endif
     std::vector<std::string_view> arguments;
     for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
     auto parsed = uc::parse_options(arguments);
@@ -261,7 +308,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     if(options.features) {   // the launcher's support query: the same runtime files the game loads, no window
         uc::UpscalerSupport support;
         if(options.renderer_backend==uc::RendererBackend::vulkan) support=uc::probe_upscalers(exe_dir(),options.dlss5_enabled);
+#ifdef _WIN32
         else support=uc::probe_native_upscalers(exe_dir(),options.renderer_backend);
+#endif
         uc::FeatureReport report{support.dlss,support.dlss_g,support.fsr,support.fsr_fg,support.dlss_g_max_multiplier,support.dlss_reason,support.dlss_g_reason,support.fsr_reason,support.fsr_fg_reason,support.effects,support.effects_reason,support.anisotropy_max,support.ray_tracing,support.ray_reconstruction,support.ray_tracing_reason,support.ray_reconstruction_reason,support.dlss5,support.dlss5_reason};
         std::printf("%s\n",uc::to_json(report).c_str());
         return 0;   // the caller reads the report as soon as it is written and does not wait for this process to unload the NGX/Streamline runtimes
@@ -273,7 +322,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     if(controlled && (options.headless || options.save_root.empty())) throw std::invalid_argument("--test-control and --test-server require a renderer and an isolated --save-root");
     if(controlled && options.window_mode!=uc::WindowMode::windowed) throw std::invalid_argument("process-local diagnostics require Windowed mode to preserve desktop focus");
     const auto& game = options.game;
-    if(options.no_vulkan_layers && !SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE","~implicit~")) throw std::runtime_error("cannot disable implicit Vulkan layers");   // read by the loader at vkCreateInstance
+#ifdef _WIN32
+    if(options.no_vulkan_layers && !SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE","~implicit~")) throw std::runtime_error("cannot disable implicit Vulkan layers");
+#else
+    if(options.no_vulkan_layers && setenv("VK_LOADER_LAYERS_DISABLE","~implicit~",1)!=0) throw std::runtime_error("cannot disable implicit Vulkan layers");
+#endif   // read by the loader at vkCreateInstance
     uc::intro_init(options.skip_intro);
     // Network play steps at the session tick whatever the frame limit says; the limit then only caps presents.
     const auto pacing=options.netplay ? uc::PacingMode{options.unlock_60fps,options.game_hz} : uc::pacing_for_limit(options.fps_limit,options.game_hz,options.unlock_60fps);   // see Options::fps_limit
@@ -358,6 +411,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     }
     if (!options.det_out.empty()) det_trace = std::make_unique<uc::DetTrace>(options.det_out, boot.mem, options.det_frames);
     std::atomic<bool> det_stop{false};
+#ifndef _WIN32
+    if (options.guest_cpu >= 0) std::fprintf(stderr, "guest CPU %d: no hard CPU affinity on this platform; using the OS scheduling\n", options.guest_cpu);
+#else
     if (options.guest_cpu >= 0) {
         DWORD_PTR process_mask = 0, system_mask = 0;
         if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
@@ -371,6 +427,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             } else std::fprintf(stderr,"guest CPU %d unavailable; using Windows scheduling\n",options.guest_cpu);
         }
     }
+#endif
     uc::NativeInput input;
     std::unique_ptr<uc::NetGame> network;
     const auto local_save_root=options.save_root.empty() ? exe_dir()/"saves" : options.save_root;
@@ -508,10 +565,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             window_width=int(extent.width); window_height=int(extent.height);
         }
         const SDL_WindowFlags graphics_window=options.renderer_backend==uc::RendererBackend::vulkan ? SDL_WINDOW_VULKAN : 0;
-        window.reset(SDL_CreateWindow("Resident Evil: The Umbrella Chronicles", window_width, window_height, graphics_window | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN));
+        window.reset(SDL_CreateWindow("Resident Evil: The Umbrella Chronicles", window_width, window_height, graphics_window | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | kHighDensity));
         if (!window) throw std::runtime_error(SDL_GetError());
         // Enter fullscreen only after the compile overlay closes and Vulkan is ready to present.
         init_renderer(true);
+#ifdef _WIN32
         if(controlled) {
             const auto properties=SDL_GetWindowProperties(window.get());
             const auto hwnd=static_cast<HWND>(SDL_GetPointerProperty(properties,SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr));
@@ -523,6 +581,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             if(!SetWindowPos(hwnd,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE))
                 throw std::runtime_error("cannot raise diagnostic window: "+std::to_string(GetLastError()));
         } else if(!SDL_ShowWindow(window.get())) throw std::runtime_error(SDL_GetError());
+#else
+        if(!SDL_ShowWindow(window.get())) throw std::runtime_error(SDL_GetError());
+#endif
         uc::configure_window_mode(window.get(),options.window_mode,int(options.width),int(options.height));
         int output_width=0,output_height=0;
         if(!SDL_GetWindowSizeInPixels(window.get(),&output_width,&output_height))throw std::runtime_error(SDL_GetError());
@@ -623,10 +684,10 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         const char* path=std::getenv("UC_FRAME_LOG");
         if(path) frame_log=std::make_unique<uc::FrameLog>(fs::path(path));
         else if(!uc::diagnostic_directory().empty())frame_log=std::make_unique<uc::FrameLog>(uc::diagnostic_directory()/"frames.csv");
-        else if(!kPublicRelease && fs::exists(exe_dir()/"frame_log.on")) frame_log=std::make_unique<uc::FrameLog>(exe_dir()/"debug"/("frames-"+std::to_string(GetCurrentProcessId())+".csv"));
+        else if(!kPublicRelease && fs::exists(exe_dir()/"frame_log.on")) frame_log=std::make_unique<uc::FrameLog>(exe_dir()/"debug"/("frames-"+std::to_string(uc::host_process_id())+".csv"));
     } catch(const std::exception& error) {std::fprintf(stderr,"[diagnostics] frame CSV unavailable: %s\n",error.what());}
     uint64_t frame_busy_ns=0,frame_events_ns=0,frame_cpu_last=0,frame_idle_last=0,frame_gpu_busy_last=0,frame_thread_last[8]={}; uint32_t frame_events=0;
-    const auto thread_cycles=[]() -> uint64_t { ULONG64 cycles=0; QueryThreadCycleTime(GetCurrentThread(),&cycles); return cycles; };
+    const auto thread_cycles=[]() -> uint64_t { return uc::host_thread_cpu_time(); };
     uc::FrameRow previous_frame_row; std::array<double,64> recent_intervals{}; size_t recent_intervals_seen=0; double worst_hitch_ms=0; unsigned hitch_lines=0,hitch_second_lines=0,hitches_this_second=0; uint64_t hitch_unlogged=0;
     std::vector<double> present_intervals; present_intervals.reserve(1024);   // ms between presents, reported once per second by --profile
     uint64_t audit_capture_serial=0;
@@ -792,7 +853,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             if(serial==scene_capture_serial) {
                 const auto pixels=renderer.capture(serial,true);
                 const auto directory=exe_dir()/"debug";
-                const auto path=directory/("pass-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(scene_capture_pass)+"-"+std::to_string(serial)+".png");
+                const auto path=directory/("pass-"+std::to_string(uc::host_process_id())+"-"+std::to_string(scene_capture_pass)+"-"+std::to_string(serial)+".png");
                 try {
                     fs::create_directories(directory); uc::save_png(pixels,path);
                     std::fprintf(stderr,"[scene-pass-capture] %s\n",path.string().c_str());
@@ -811,7 +872,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 if (!pixels.width || !pixels.height || pixels.rgba.size()!=size_t(pixels.width)*pixels.height*4) throw std::runtime_error("invalid debug-frame readback");
                 const auto directory=options.capture_dir.empty() ? exe_dir()/"debug" : options.capture_dir;
                 const auto stamp=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                const auto path=directory/("frame-"+std::to_string(stamp)+"-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(serial)+".png");
+                const auto path=directory/("frame-"+std::to_string(stamp)+"-"+std::to_string(uc::host_process_id())+"-"+std::to_string(serial)+".png");
                 try {
                     fs::create_directories(directory);
                     uc::save_png(pixels,path);
@@ -819,7 +880,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                     if (with_motion) {
                         const auto motion=renderer.capture_motion();
                         uc::save_png(renderer.capture_scene(),fs::path(path).replace_extension(".scene.png"));
-                        if (std::FILE* file=_wfopen(fs::path(path).replace_extension(".motion").c_str(),L"wb")) {
+                        if (std::FILE* file=uc::uc_fopen(fs::path(path).replace_extension(".motion"),"wb")) {
                             std::fwrite(&motion.width,4,1,file); std::fwrite(&motion.height,4,1,file);
                             std::fwrite(motion.rg.data(),sizeof(float),motion.rg.size(),file); std::fclose(file);
                         }
@@ -925,7 +986,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         mod_menu.set_save([&live_settings](const nlohmann::ordered_json& section) { live_settings->apply_mods(section); });   // the config's "mods" section
         if(!kPublicRelease)settings_menu->set_open_debug([] {   // the DLSS 5 tab's Open Debug: the debug folder with ngx_dlss5.log
             const auto folder=exe_dir()/"debug"; std::error_code ignored; std::filesystem::create_directories(folder,ignored);
+#ifdef _WIN32
             ShellExecuteW(nullptr,L"open",folder.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+#else
+            SDL_OpenURL(("file://"+folder.string()).c_str());
+#endif
         });
         settings_menu->set_dlss5_status([&renderer]() { return uc::SettingsMenu::Dlss5Report{renderer.dlss5_active(),renderer.dlss5_status()}; });   // why the pass is off in this run (the report only says what the GPU could do)
     }
@@ -1046,6 +1111,14 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         }
         const auto services=input.consume_service_actions();
         debug_capture_requested|=(services.pressed&(uint64_t(1)<<unsigned(uc::Action::screenshot)))!=0;
+        {   // UC_CAPTURE_EVERY=<seconds>: the screenshot action on a timer (unattended checks of what the window shows, e.g. on a new platform)
+            static const double every=[] { const char* v=std::getenv("UC_CAPTURE_EVERY"); return v ? std::atof(v) : 0.0; }();
+            static auto next=std::chrono::steady_clock::now()+std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(every));
+            if(every>0 && std::chrono::steady_clock::now()>=next) {
+                debug_capture_requested=true;
+                next+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(every));
+            }
+        }
         if(!controlled && options.window_mode==uc::WindowMode::windowed &&
             (services.pressed&(uint64_t(1)<<unsigned(uc::Action::release_cursor)))) {
             capture_pointer(false);
@@ -1234,14 +1307,14 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     std::fprintf(stderr,"audio stats: native frames %llu nonzero samples %llu\n",(unsigned long long)sound_stats.frames,(unsigned long long)sound_stats.nonzero_samples);
     if(options.audio_audit) {   // off in the public release (cleared at startup)
         fs::create_directories(exe_dir()/"debug");
-        const auto path=exe_dir()/"debug"/("audio-gaps-"+std::to_string(GetCurrentProcessId())+".txt");
-        std::FILE* out=_wfopen(path.c_str(),L"w");
+        const auto path=exe_dir()/"debug"/("audio-gaps-"+std::to_string(uc::host_process_id())+".txt");
+        std::FILE* out=uc::uc_fopen(path,"w");
         if(!out) throw std::runtime_error("cannot create audio audit report");
         uc::audio_gap_audit_report(out);
         const bool failed=std::ferror(out)!=0;
         const int closed=std::fclose(out);
         if(failed || closed!=0) throw std::runtime_error("cannot write audio audit report");
-        std::fprintf(stderr,"audio gap report: %ls\n",path.c_str());
+        std::fprintf(stderr,"audio gap report: %s\n",path.string().c_str());
     }
     uc::audio_hle_shutdown();
     uc::game_input_shutdown();
@@ -1257,15 +1330,19 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     std::fprintf(stderr, "runtime stopped; all guest and file workers joined\n");
     if (options.gx_gaps) {
         std::error_code error; fs::create_directories(exe_dir() / "debug", error);
-        const auto path = exe_dir() / "debug" / ("gx-gaps-" + std::to_string(GetCurrentProcessId()) + ".txt");
-        if (std::FILE* out = _wfopen(path.c_str(), L"w")) { uc::gx_gap_audit_report(out); std::fclose(out); std::fprintf(stderr, "gx gap report: %ls\n", path.c_str()); }
+        const auto path = exe_dir() / "debug" / ("gx-gaps-" + std::to_string(uc::host_process_id()) + ".txt");
+        if (std::FILE* out = uc::uc_fopen(path, "w")) { uc::gx_gap_audit_report(out); std::fclose(out); std::fprintf(stderr, "gx gap report: %s\n", path.string().c_str()); }
     }
     uc::trace_dump_all(stderr, 24);
     print_stats();
     return result;
 }
 
+#ifdef _WIN32
 int wmain(int argc, wchar_t** argv) {
+#else
+int main(int argc, char** argv) {
+#endif
     uc::Options startup_options;
     std::optional<uc::DiagnosticLog> diagnostics;
     try {
@@ -1279,11 +1356,15 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<char*> arguments;
         encoded.reserve(size_t(argc));arguments.reserve(size_t(argc));
         for(int i=0;i<argc;++i) {
+#ifndef _WIN32
+            encoded.emplace_back(argv[i]);   // already UTF-8
+#else
             const int size=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,argv[i],-1,nullptr,0,nullptr,nullptr);
             if(!size)throw std::invalid_argument("invalid Unicode argument");
             std::string text(size_t(size),'\0');
             if(!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,argv[i],-1,text.data(),size,nullptr,nullptr))throw std::runtime_error("cannot encode Unicode argument");
             text.pop_back();encoded.push_back(std::move(text));
+#endif
         }
         for(auto& text:encoded)arguments.push_back(text.data());
         const int result=real_main(argc, arguments.data(),startup_options);

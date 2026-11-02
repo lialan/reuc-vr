@@ -3,9 +3,14 @@
 #include <array>
 #include <cctype>
 #include <stdexcept>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <SDL3/SDL_locale.h>
+#include <SDL3/SDL_stdinc.h>
+#endif
 namespace uc::launcher {
 namespace {
 constexpr Language supported[]={
@@ -30,6 +35,7 @@ std::string resolve_language(std::string_view locale) {
     for(auto language:supported)if(language.code==primary)return std::string(language.code);
     return "en";
 }
+#ifdef _WIN32
 std::string system_language() {
     ULONG count=0,size=0;
     if(!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME,&count,nullptr,&size) || !size)return "en";
@@ -38,6 +44,20 @@ std::string system_language() {
     const std::wstring_view first(buffer.c_str());
     return resolve_language(std::string(first.begin(),first.end()));
 }
+#else
+// The first of the user's preferred UI languages (System Settings on macOS, the locale elsewhere), as "language-COUNTRY".
+std::string system_language() {
+    int count=0;
+    SDL_Locale** locales=SDL_GetPreferredLocales(&count);
+    std::string first="en";
+    if(locales && count>0 && locales[0] && locales[0]->language) {
+        first=locales[0]->language;
+        if(locales[0]->country)first+=std::string("-")+locales[0]->country;
+    }
+    SDL_free(locales);
+    return resolve_language(first);
+}
+#endif
 std::string config_language(const ConfigDocument& document) {
     const auto& root=document.properties;
     if(!root.contains("launcher"))return "system";

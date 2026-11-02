@@ -34,7 +34,12 @@ target_link_libraries(uc_host_input PUBLIC uc_runtime SDL3::SDL3)
 add_library(uc_gamepad_input STATIC gamepad_input.cpp)   # SDL gamepads: events in, NativeInput sticks, buttons and gyro out
 target_include_directories(uc_gamepad_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_gamepad_input PUBLIC uc_input uc_gamepad_math SDL3::SDL3)   # no runtime: the launcher reads gamepads too
-add_library(uc_wiimote_input STATIC wiimote_input.cpp wiimote_hid.cpp)   # the Wii Remote over Windows HID: a thread reads it, NativeInput's WiimoteTarget gets its buttons, pointer, stick and swings
+if(WIN32)
+  set(uc_wiimote_hid_source wiimote_hid.cpp)
+else()
+  set(uc_wiimote_hid_source wiimote_hid_posix.cpp)   # Wii Remote HID: Windows only for now
+endif()
+add_library(uc_wiimote_input STATIC wiimote_input.cpp ${uc_wiimote_hid_source})   # the Wii Remote over Windows HID: a thread reads it, NativeInput's WiimoteTarget gets its buttons, pointer, stick and swings
 target_include_directories(uc_wiimote_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_wiimote_input PUBLIC uc_wiimote_protocol uc_wiimote_math uc_wiimote_config uc_input)
 if(WIN32)
@@ -50,7 +55,12 @@ target_include_directories(uc_netplay_game PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_netplay_game PUBLIC uc_game_input uc_game_pacing uc_options uc_gx nlohmann_json::nlohmann_json)
 target_include_directories(uc_game_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_game_input PUBLIC uc_input_probe uc_runtime uc_mods)
-add_library(uc_test_server STATIC test_protocol.cpp test_pipe.cpp test_server.cpp test_draws.cpp)
+if(WIN32)
+  set(uc_test_pipe_source test_pipe.cpp)
+else()
+  set(uc_test_pipe_source test_pipe_posix.cpp)
+endif()
+add_library(uc_test_server STATIC test_protocol.cpp ${uc_test_pipe_source} test_server.cpp test_draws.cpp)
 target_include_directories(uc_test_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(uc_test_server PUBLIC ${CMAKE_SOURCE_DIR}/renderer)
 target_link_libraries(uc_test_server PUBLIC uc_game_input uc_runtime)
@@ -97,7 +107,12 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   target_link_libraries(step_probe PRIVATE uc_game uc_common test_support)
   add_test(NAME test_step_probe_selfcheck COMMAND step_probe --selfcheck)
   include(${CMAKE_SOURCE_DIR}/cmake/mimalloc.cmake)
-  add_executable(uc allocator.cpp uc_main.cpp audio_output.cpp compile_screen.cpp det_trace.cpp frame_log.cpp settings_menu.cpp system_report.cpp)
+  if(WIN32)
+    set(uc_platform_sources compile_screen.cpp system_report.cpp)
+  else()
+    set(uc_platform_sources compile_screen_posix.cpp system_report_posix.cpp)
+  endif()
+  add_executable(uc allocator.cpp uc_main.cpp audio_output.cpp det_trace.cpp frame_log.cpp settings_menu.cpp ${uc_platform_sources})
   if(WIN32)
     target_sources(uc PRIVATE ${CMAKE_SOURCE_DIR}/assets/app.rc)
     target_link_libraries(uc PRIVATE dxgi winmm shell32)
@@ -109,11 +124,16 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   endif()
   target_link_libraries(uc PRIVATE uc_game uc_common uc_cpu_topology uc_platform uc_options_config uc_intro uc_vulkan uc_input_probe uc_host_input uc_gamepad_input uc_wiimote_input uc_test_server uc_crash_bundle
     uc_live_settings uc_ui_style uc_launcher_locale uc_binding_editor uc_gamepad_panel uc_launch uc_game_mods uc_mod_menu uc_netplay_game)
-  add_custom_command(TARGET uc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:uc>/data/shaders
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_DIRECTX_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_UPSCALER_RUNTIME} ${UC_DLSS5_RUNTIME_FILES} $<TARGET_FILE_DIR:uc>
+  # The lists of the optional backends are empty where those are off (macOS): copy_if_different needs at least one file.
+  set(uc_post_build COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:uc>/data/shaders
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)
+  if(UC_DIRECTX_SHADER_FILES)
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_DIRECTX_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)
+  endif()
+  if(UC_UPSCALER_RUNTIME OR UC_DLSS5_RUNTIME_FILES)
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_UPSCALER_RUNTIME} ${UC_DLSS5_RUNTIME_FILES} $<TARGET_FILE_DIR:uc>)
+  endif()
+  add_custom_command(TARGET uc POST_BUILD ${uc_post_build}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed $<TARGET_FILE_DIR:uc>/data
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3-shared> $<TARGET_FILE_DIR:uc> VERBATIM)
   # Linker map lets crash reports (exe offsets) be resolved to runtime function names offline.

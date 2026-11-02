@@ -11,7 +11,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "host_process.h"
 namespace uc {
 AudioOutput::AudioOutput(bool muted) {
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
@@ -35,7 +35,7 @@ std::FILE* dump_file() {
     static std::FILE* file=[]()->std::FILE* {
         const char* prefix=std::getenv("UC_AUDIO_DUMP");
         if(!prefix) return nullptr;
-        return std::fopen((std::string(prefix)+"."+std::to_string(GetCurrentProcessId())).c_str(),"wb");
+        return std::fopen((std::string(prefix)+"."+std::to_string(host_process_id())).c_str(),"wb");
     }();
     return file;
 }

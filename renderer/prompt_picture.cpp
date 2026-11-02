@@ -2,7 +2,10 @@
 #include "prompt_icons.h"
 #include "pad_glyphs.h"
 #include "wide_view.h"
-#include <intrin.h>
+#ifdef _WIN32
+#include <intrin.h>   // SDL3-3.2.0's prefetch workaround with clang-cl
+#endif
+#include "system_fonts.h"
 #include <SDL3/SDL.h>
 #include "imgui.h"
 #include <algorithm>
@@ -10,9 +13,6 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
 namespace uc {
 namespace {
 struct Token {std::string label;std::optional<PhysicalInput> input;bool cap=false;bool both_directions=false;bool gyro=false;};   // gyro: the gamepad's motion icon (the gesture of a shake or swing)
@@ -162,11 +162,11 @@ void picture(ImDrawList& list,const gx::PromptDraw& prompt,RenderExtent extent,c
 }
 }
 void load_prompt_font(std::vector<char>& font_bytes) {
-        wchar_t directory[32768];const auto size=GetWindowsDirectoryW(directory,32768);
-        if(!size || size>=32768)throw std::runtime_error("Windows fonts directory unavailable");
-        std::ifstream file(std::filesystem::path(std::wstring(directory,size))/"Fonts"/"segoeuib.ttf",std::ios::binary);
+        const auto files=ui_font_files(UiFont::sans_bold);
+        if(files.empty())throw std::runtime_error("system fonts directory unavailable");
+        std::ifstream file(files.front(),std::ios::binary);
         font_bytes.assign(std::istreambuf_iterator<char>(file),{});
-        if(font_bytes.empty() || font_bytes.size()>INT_MAX)throw std::runtime_error("Segoe UI font unavailable");
+        if(font_bytes.empty() || font_bytes.size()>INT_MAX)throw std::runtime_error("prompt font unavailable: "+files.front().string());
         ImFontConfig font_config;font_config.FontDataOwnedByAtlas=false;
         if(!ImGui::GetIO().Fonts->AddFontFromMemoryTTF(font_bytes.data(),int(font_bytes.size()),20,&font_config))throw std::runtime_error("native prompt font initialization failed");
 }

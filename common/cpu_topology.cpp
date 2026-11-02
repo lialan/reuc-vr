@@ -4,11 +4,33 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#endif
 namespace uc {
+#ifndef _WIN32
+// No processor-set API here (macOS has no hard affinity): no cores to pin, so the guest threads keep the OS scheduling. The fingerprint
+// still names the machine for the calibration cache.
+CpuTopology cpu_topology() {
+    std::ostringstream identity;
+#if defined(__APPLE__)
+    char brand[128]{}; size_t size = sizeof(brand);
+    sysctlbyname("machdep.cpu.brand_string", brand, &size, nullptr, 0);
+    identity << brand << ',';
+#endif
+    char host[256]{}; gethostname(host, sizeof(host) - 1);
+    identity << sysconf(_SC_NPROCESSORS_ONLN) << ',' << host;
+    return {identity.str(), {}};
+}
+#else
 CpuTopology cpu_topology() {
     // shortcut: guest affinity accepts a group-local 0..62 index; add group-aware
     // guest scheduling before calibrating machines with multiple processor groups.
@@ -61,6 +83,7 @@ CpuTopology cpu_topology() {
     for(const auto& [index,core]:cores)if(core.cpu>=0)result.cores.push_back(core);
     return result;
 }
+#endif
 uint64_t cpu_worker_mask(const std::vector<CpuCore>& cores,int cpu,uint64_t allowed) {
     if(cpu<0 || cpu>=63 || !(allowed&(uint64_t(1)<<cpu)))return allowed;
     for(const auto& core:cores)if(core.mask&(uint64_t(1)<<cpu))return allowed&~(core.mask&~(uint64_t(1)<<cpu));

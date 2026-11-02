@@ -1,17 +1,36 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 #include "upscaler_probe.h"
 #include "public_release.h"
 #include "ngx_dlss5.h"
 #include "streamline.h"
+#if UC_VENDOR_UPSCALERS
 #include "streamline_api.h"
 #include <ffx_api/ffx_api_loader.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
 namespace uc {
+namespace {
+#if defined(__APPLE__)
+void allow_portability(VkInstanceCreateInfo& info, std::vector<const char*>& names) {
+    uint32_t n=0; vkEnumerateInstanceExtensionProperties(nullptr,&n,nullptr);
+    std::vector<VkExtensionProperties> available(n); vkEnumerateInstanceExtensionProperties(nullptr,&n,available.data());
+    if (std::none_of(available.begin(),available.end(),[](const auto& e) { return std::strcmp(e.extensionName,VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)==0; })) return;
+    names.assign(info.ppEnabledExtensionNames,info.ppEnabledExtensionNames+info.enabledExtensionCount);
+    names.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    info.enabledExtensionCount=uint32_t(names.size()); info.ppEnabledExtensionNames=names.data();
+    info.flags|=VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+}
+#else
+void allow_portability(VkInstanceCreateInfo&, std::vector<const char*>&) {}
+#endif
+}  // namespace
 std::vector<std::string> dlss5_instance_extensions(const std::filesystem::path& directory) {
     std::error_code ignored;
     if (!std::filesystem::exists(directory / kDlss5Runtime, ignored)) return {};
@@ -56,6 +75,7 @@ const char* ray_tracing_gap(VkPhysicalDevice physical) {
 }
 namespace {
 // DLSS and DLSS-G through Streamline on the first NVIDIA GPU (the one the game picks: discrete first).
+#if UC_VENDOR_UPSCALERS
 void probe_dlss(const std::filesystem::path& directory, UpscalerSupport& support) {
     std::string reason;
     const bool rr=std::filesystem::exists(directory / "sl.dlss_d.dll");
@@ -118,6 +138,7 @@ bool probe_fsr_fg(std::string& reason) {
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO}; application.apiVersion=VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; instance_info.pApplicationInfo=&application;
     VkInstance instance=VK_NULL_HANDLE;
+    std::vector<const char*> portability_names; allow_portability(instance_info, portability_names);
     if (vkCreateInstance(&instance_info, nullptr, &instance)!=VK_SUCCESS) { reason="no Vulkan 1.3 instance"; return false; }
     uint32_t count=0; vkEnumeratePhysicalDevices(instance, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count); vkEnumeratePhysicalDevices(instance, &count, devices.data());
@@ -144,11 +165,13 @@ bool probe_fsr_fg(std::string& reason) {
     vkDestroyInstance(instance, nullptr);
     return ok;
 }
+#endif
 // What the renderer asks of the device for the effects (the same pick as the game: NVIDIA/discrete first).
 void probe_effects(UpscalerSupport& support) {
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO}; application.apiVersion=VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; instance_info.pApplicationInfo=&application;
     VkInstance instance=VK_NULL_HANDLE;
+    std::vector<const char*> portability_names; allow_portability(instance_info, portability_names);
     if (vkCreateInstance(&instance_info, nullptr, &instance)!=VK_SUCCESS) { support.effects_reason=support.ray_tracing_reason="no Vulkan 1.3 instance"; return; }
     uint32_t count=0; vkEnumeratePhysicalDevices(instance, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count); vkEnumeratePhysicalDevices(instance, &count, devices.data());
@@ -195,6 +218,7 @@ void probe_dlss5(const std::filesystem::path& directory, UpscalerSupport& suppor
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; instance_info.pApplicationInfo = &application;
     instance_info.enabledExtensionCount = uint32_t(names.size()); instance_info.ppEnabledExtensionNames = names.data();
     VkInstance instance = VK_NULL_HANDLE;
+    std::vector<const char*> portability_names; allow_portability(instance_info, portability_names);
     if (vkCreateInstance(&instance_info, nullptr, &instance) != VK_SUCCESS) { support.dlss5_reason = "no Vulkan 1.3 instance with the DLSS 5 extensions"; return; }
     uint32_t count = 0; vkEnumeratePhysicalDevices(instance, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count); vkEnumeratePhysicalDevices(instance, &count, devices.data());
@@ -255,6 +279,7 @@ void probe_dlss5(const std::filesystem::path& directory, UpscalerSupport& suppor
     }
     vkDestroyInstance(instance, nullptr);
 }
+#if UC_VENDOR_UPSCALERS
 void probe_fsr(const std::filesystem::path& directory, UpscalerSupport& support) {
     const auto path=directory / "amd_fidelityfx_vk.dll";
     HMODULE module=LoadLibraryW(path.c_str());
@@ -265,6 +290,15 @@ void probe_fsr(const std::filesystem::path& directory, UpscalerSupport& support)
     FreeLibrary(module);
     if (support.fsr) support.fsr_fg=probe_fsr_fg(support.fsr_fg_reason);
 }
+#else
+// Without the vendor SDKs (macOS, Android): DLSS and FSR are reported unavailable, with the reason the settings show.
+void probe_dlss(const std::filesystem::path&, UpscalerSupport& support) {
+    support.dlss_reason=support.dlss_g_reason=support.ray_reconstruction_reason="DLSS is not available on this platform";
+}
+void probe_fsr(const std::filesystem::path&, UpscalerSupport& support) {
+    support.fsr_reason=support.fsr_fg_reason="AMD FSR is not available on this platform";
+}
+#endif
 }
 UpscalerSupport probe_upscalers(const std::filesystem::path& directory, bool dlss5) {
     UpscalerSupport support;

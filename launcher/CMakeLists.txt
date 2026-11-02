@@ -8,6 +8,9 @@ endif()
 add_library(uc_launcher_locale STATIC localization.cpp)
 target_include_directories(uc_launcher_locale PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_launcher_locale PUBLIC uc_input_config)
+if(NOT WIN32)
+  target_link_libraries(uc_launcher_locale PRIVATE SDL3::SDL3)   # the preferred UI languages
+endif()
 target_include_directories(uc_binding_editor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(uc_binding_editor PUBLIC uc_input)
 add_library(uc_gamepad_panel STATIC gamepad_panel.cpp wiimote_panel.cpp)   # the Controllers tab with its Gamepad and Wii Remote windows: shared by the launcher and the in-game menu

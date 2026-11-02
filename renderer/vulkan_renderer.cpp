@@ -1,6 +1,8 @@
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 #include "late_aim.h"
 #include "texture_replacement.h"
 #include "post_effects.h"
@@ -10,7 +12,9 @@
 #include "buffer_memory.h"
 #include "upscale_math.h"
 #include "upscaler_probe.h"
+#ifdef _WIN32
 #include <vulkan/vulkan_win32.h>
+#endif
 #include <tuple>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
@@ -107,7 +111,20 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     debug_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
     debug_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
     debug_info.pfnUserCallback = debug; debug_info.pUserData = this;
+#if defined(__APPLE__)
+    // Vulkan on Metal (KosmicKrisp, MoltenVK) is a portability driver: the loader lists it only to an instance that asks for those.
+    bool portability = false;
+    {
+        uint32_t n = 0; vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> available(n); vkEnumerateInstanceExtensionProperties(nullptr, &n, available.data());
+        portability = std::any_of(available.begin(), available.end(), [](const auto& e) { return std::strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0; });
+        if (portability) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    }
+#endif
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; instance_info.pApplicationInfo = &application;
+#if defined(__APPLE__)
+    if (portability) instance_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
     instance_info.enabledExtensionCount = uint32_t(extensions.size()); instance_info.ppEnabledExtensionNames = extensions.data();
     if (validation) { instance_info.enabledLayerCount = 1; instance_info.ppEnabledLayerNames = &layer; instance_info.pNext = &debug_info; }
     {   // Optional backends must be ready before the instance, so live picks never need a new device.
@@ -230,8 +247,15 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     {   // FidelityFX resolves these entry points by their extension names, including after a live switch.
         uint32_t n = 0; vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> supported(n); vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, supported.data());
+#ifdef _WIN32
         disallow_exclusive_=!exclusive_fullscreen && capabilities2 && std::any_of(supported.begin(),supported.end(),[](const auto& extension){return std::strcmp(extension.extensionName,VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)==0;});
         if(disallow_exclusive_)device_extensions.push_back(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+#else
+        (void)exclusive_fullscreen; disallow_exclusive_=false;   // exclusive fullscreen exists on Win32 surfaces only
+#endif
+        // A driver that implements only a subset of Vulkan (MoltenVK) lists VK_KHR_portability_subset, and the device must then enable it.
+        if (std::any_of(supported.begin(), supported.end(), [](const auto& extension) { return std::strcmp(extension.extensionName, "VK_KHR_portability_subset") == 0; }))
+            device_extensions.push_back("VK_KHR_portability_subset");
         for (const char* name : {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME})
             if (std::any_of(supported.begin(), supported.end(), [&](const auto& extension) { return std::strcmp(extension.extensionName, name) == 0; })) device_extensions.push_back(name);
         if (through_streamline && std::any_of(supported.begin(),supported.end(),[](const auto& extension) { return std::strcmp(extension.extensionName,VK_KHR_PRESENT_ID_EXTENSION_NAME)==0; }))
@@ -276,6 +300,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     logic_ops_=core.logicOp;
     VkPhysicalDeviceFeatures enabled{}; enabled.logicOp=logic_ops_; enabled.independentBlend=motion_outputs_; enabled.shaderInt16=core.shaderInt16; device_info.pEnabledFeatures=&enabled;
     enabled.samplerAnisotropy=core.samplerAnisotropy; anisotropy_supported_=core.samplerAnisotropy; enabled.textureCompressionBC=core.textureCompressionBC;
+    enabled.shaderStorageImageExtendedFormats=core.shaderStorageImageExtendedFormats;   // r8/rg8/rg16f storage images of GTAO, SMAA and motion blur
     { VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(physical_,&properties); anisotropy_limit_=properties.limits.maxSamplerAnisotropy; }
     device_info.queueCreateInfoCount = 1; device_info.pQueueCreateInfos = &queue_info;   // queue_info.queueCount: 3 with the interpolation swapchain
     device_info.enabledExtensionCount = uint32_t(device_extensions.size()); device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -1604,9 +1629,11 @@ void VulkanRenderer::rebuild() {
     if (capabilities.maxImageCount) images = std::min(images, capabilities.maxImageCount);
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR}; create.surface = surface_; create.minImageCount = images;
     // Borderless must not silently become driver-managed exclusive fullscreen.
+#ifdef _WIN32
     VkSurfaceFullScreenExclusiveInfoEXT fullscreen{VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
     fullscreen.fullScreenExclusive=VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
     if(disallow_exclusive_)create.pNext=&fullscreen;
+#endif
     create.imageFormat = chosen.format; create.imageColorSpace = chosen.colorSpace; create.imageExtent = extent_; create.imageArrayLayers = 1;
     create.imageUsage = swapchain_usage; create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; create.preTransform = capabilities.currentTransform;
     create.compositeAlpha = VkCompositeAlphaFlagBitsKHR(capabilities.supportedCompositeAlpha & (0u - capabilities.supportedCompositeAlpha));
