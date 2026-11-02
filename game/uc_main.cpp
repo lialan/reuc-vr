@@ -583,7 +583,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         if(xr && !options.width && !options.height) { options.width=1280; options.height=720; }
         // The automatic internal resolution on the headset: 0.75x 720p (960x540 a scene per eye). Chapter 1's heaviest fight holds 30 fps
         // there on the Quest 3 (GPU about 82% busy); 1.07x, the 720p window's own, ran at 20-24. render_scale in config.json overrides it.
-        if(xr && !options.render_scale) options.render_scale=0.75;
+        // Since the eye's picture takes the eye image's shape (about 0.95 wide per high, VulkanRenderer::initialize), the scale sets its rows:
+        // 1.0x is 687x720 per eye, about the pixels 0.75x had at 16:9 (960x540) with a third more rows and nothing stretched.
+        if(xr && !options.render_scale) options.render_scale=1.0;
 #endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();

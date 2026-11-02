@@ -141,6 +141,9 @@ def main():
             (out / "uc.log").write_bytes(result.stdout)
             tar = command("exec-out", f"run-as {PACKAGE} tar -C {private} -cf - logs", check=False, timeout=120)
             (out / "logs.tar").write_bytes(tar.stdout)
+            caps = command("exec-out", f"run-as {PACKAGE} sh -c 'cd {private} && [ -d captures ] && tar -cf - captures'", check=False, timeout=300)
+            if caps.stdout:   # frame captures the run asked for (--capture-dir captures)
+                (out / "captures.tar").write_bytes(caps.stdout)
         except Exception as error:   # noqa: BLE001 - best effort after a failed run
             report["pull_error"] = repr(error)
         (out / "report.json").write_text(json.dumps(report, indent=2))

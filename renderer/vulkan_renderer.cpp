@@ -121,7 +121,11 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         preview_->set_screen_lens({1.7320508f / (16.f / 9), 1.7320508f});
         stereo_ = preview_.get();
         std::fprintf(stderr, "[vr-preview] stereo preview: scale %.3f game units per metre, eyes side by side\n", settings.scale);
+        // The picture takes the simulated eye's shape (preview_publish: 52+41 degrees wide, 50+42 high), as the headset's takes its eye image's.
+        render_aspect_ = double(std::tan(52.f * .017453292f) + std::tan(41.f * .017453292f)) / (std::tan(50.f * .017453292f) + std::tan(42.f * .017453292f));
+        set_render_scale(configured_scale_);
     }
+    if (preview_) std::fprintf(stderr, "[vr] eye picture aspect %.3f\n", render_aspect_);
     layers_ = (xr_ || preview_) ? 2 : 1;   // the headset (or its preview): both eyes in every pass (multiview)
     std::vector<const char*> extensions;
     if (!xr_) {   // the headset needs no window surface: OpenXR adds what it needs to the instance
@@ -426,6 +430,11 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (xr_) {   // the headset: the session and its swapchain; the game's picture keeps its own size (the screen plane scales it)
         xr_->attach(instance_, physical_, device, family_, shaders_);
         stereo_ = &xr_->scene();
+        // Each eye's picture has the shape of its eye image, so the screen pass maps it 1:1 onto the eye's view (a 16:9 picture stretched
+        // over a nearly square eye gave the vertical view 540 rows at 0.75x). The game keeps its 16:9 view (aim, hit tests, menus): the
+        // per-eye reprojection maps its clip space to each eye's frustum whatever the target's shape.
+        if (xr_->eye_width() && xr_->eye_height()) { render_aspect_ = double(xr_->eye_width()) / xr_->eye_height(); set_render_scale(configured_scale_); }
+        std::fprintf(stderr, "[vr] eye picture aspect %.3f\n", render_aspect_);
         const auto picture=manual_render_extent(configured_scale_,render_aspect_);
         resize(picture.width, picture.height);
     } else
@@ -1750,7 +1759,10 @@ void VulkanRenderer::make_attachment(VkImage& target,VkDeviceMemory& memory,VkIm
 void VulkanRenderer::rebuild() {
     if (fsr_presentation_) fsr_g_->release_context();
     if (swapchain_ && !fsr_presentation_ && !streamline_swapchain()) retire_for_resize(); else retire_images(true);
-    if (xr_) extent_ = requested_;   // the headset: no window swapchain, the game's picture at its own size
+    if (xr_) {   // the headset: no window swapchain; the picture at the eye's shape, exactly the visible scene (the EFB copy into it is 1:1)
+        const auto visible=manual_render_extent(device_render_scale(configured_scale_,max_image_dimension_,render_aspect_),render_aspect_);
+        extent_ = {visible.width, visible.height};
+    }
     else {
     VkSurfaceCapabilitiesKHR capabilities; vk_check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &capabilities), "surface capabilities");
     VkImageUsageFlags swapchain_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;

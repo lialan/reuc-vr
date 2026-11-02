@@ -34,7 +34,9 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 2 && c->width == LG_XR_NATIVE_WIDTH && c->resolution == LG_XR_NATIVE_HEIGHT) {
         c->resolution = LG_XR_DEFAULT_HEIGHT; c->width = LG_XR_DEFAULT_WIDTH;
     }
-    c->version = 2;
+    /* written before version 3, high foveation was the default: now off (the eye image holds only the screen pass) */
+    if (c->version < 3 && c->foveation == 3) c->foveation = 0;
+    c->version = 3;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {
