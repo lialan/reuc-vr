@@ -69,7 +69,7 @@ size_t compare(const uint8_t* a, const uint8_t* b, size_t size, uint32_t base, d
     for (size_t o = 0; o + 4 <= size; o += 4) {
         if (std::memcmp(a + o, b + o, 4) == 0 || in_stack(base + uint32_t(o)) || g_frame_words.count(base + uint32_t(o))) continue;
         uint32_t wa, wb; std::memcpy(&wa, a + o, 4); std::memcpy(&wb, b + o, 4);
-        wa = _byteswap_ulong(wa); wb = _byteswap_ulong(wb);
+        wa = uc_bswap32(wa); wb = uc_bswap32(wb);
         float fa, fb; std::memcpy(&fa, &wa, 4); std::memcpy(&fb, &wb, 4);
         const double denom = std::max(std::fabs(double(fa)), 1e-6);
         const double rel = std::fabs(double(fa) - double(fb)) / denom;
@@ -107,7 +107,7 @@ std::string prove(ppc::Ctx& c, uint8_t* mem, const Job& job) {
         if (bad) {
             const size_t o = first >= 0x90000000 ? kMem1 + (first - 0x90000000) : first - 0x80000000;
             uint32_t wa, wb; std::memcpy(&wa, original.data() + o, 4); std::memcpy(&wb, fixed.data() + o, 4);
-            wa = _byteswap_ulong(wa); wb = _byteswap_ulong(wb);
+            wa = uc_bswap32(wa); wb = uc_bswap32(wb);
             float fa, fb; std::memcpy(&fa, &wa, 4); std::memcpy(&fb, &wb, 4);
             char line[320];
             std::snprintf(line, sizeof line, "{\"status\":\"fail\",\"reason\":\"case %u/%u: %zu words differ, first %08X original %08X (%g) fixed %08X (%g)\",\"max_rel\":%g}",
@@ -160,6 +160,7 @@ int selfcheck(ppc::Ctx& c, uint8_t* mem) {
     return failures ? 1 : 0;
 }
 }
+#ifdef _WIN32
 #include <windows.h>
 // A wild guest pointer from an incomplete context ends the probe; name the guest function so the report can say why.
 static LONG CALLBACK report_access_violation(PEXCEPTION_POINTERS info) {
@@ -169,8 +170,26 @@ static LONG CALLBACK report_access_violation(PEXCEPTION_POINTERS info) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+static void install_report() { AddVectoredExceptionHandler(1, report_access_violation); }
+#else
+#include "host_context.h"
+#include <csignal>
+static void report_access_violation(int signal, siginfo_t*, void* context) {
+    std::fprintf(stderr, "guest access violation in function %08X\n", uc::guest_function_for_host(reinterpret_cast<const void*>(uc::host_context_pc(context))));
+    std::fflush(stderr);
+    std::signal(signal, SIG_DFL);   // then die of it, as the Windows handler lets the exception continue
+}
+static void install_report() {
+    struct sigaction action{};
+    action.sa_sigaction = report_access_violation;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, nullptr);
+    sigaction(SIGBUS, &action, nullptr);
+}
+#endif
 int main(int argc, char** argv) {
-    AddVectoredExceptionHandler(1, report_access_violation);
+    install_report();
     uc::guest_mem_init(); auto* mem = uc::guest_mem_base();
     ppc::Ctx c{}; c.mem = mem; c.r[2] = 0x806CC700; c.r[13] = 0x806CA620;
     if (argc == 2 && std::string(argv[1]) == "--selfcheck") return selfcheck(c, mem);
