@@ -34,6 +34,24 @@ int main() {
     c.f[1] = -3.9; op_fctiwz(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0xFFFFFFFD);
     c.f[1] = 1e20; op_fctiwz(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0x7FFFFFFF);
     c.f[1] = -1e20; op_fctiwz(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0x80000000);
+    // The PowerPC results for NaN and out-of-range values on every host: an arm64 float->int conversion saturates where x86 gives
+    // 0x80000000, so the clamp happens before any conversion (NaN -> 0x80000000 like the Broadway, not 0 like arm64 fcvtzs).
+    c.f[1] = std::nan("");  op_fctiw(c, 2, 1, false);  CHECK(uint32_t(bits(c.f[2])) == 0x80000000);
+    c.f[1] = std::nan("");  op_fctiwz(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0x80000000);
+    c.f[1] = 1e10;  op_fctiw(c, 2, 1, false);  CHECK(uint32_t(bits(c.f[2])) == 0x7FFFFFFF);
+    c.f[1] = -1e10; op_fctiw(c, 2, 1, false);  CHECK(uint32_t(bits(c.f[2])) == 0x80000000);
+    c.f[1] = 2147483647.4; op_fctiw(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0x7FFFFFFF);
+    c.f[1] = -2147483648.6; op_fctiwz(c, 2, 1, false); CHECK(uint32_t(bits(c.f[2])) == 0x80000000);
+    // fmul then fadd are two roundings, fmadd is one, on every host: the compiler must not fuse separate guest instructions
+    // (-ffp-contract=fast would). x*x - 1 with x = 1+2^-30 keeps its 2^-60 term only when fused.
+    {
+        const double x = 1.0 + std::ldexp(1.0, -30);
+        c.f[10] = x; c.f[11] = -1.0;   // registers the checks below do not use
+        op_fmul(c, 12, 10, 10, false); op_fadd(c, 12, 12, 11, false);
+        CHECK(c.f[12] == std::ldexp(1.0, -29));
+        op_fmadd(c, 13, 10, 11, 10, false);   // f10*f10 + f11
+        CHECK(c.f[13] == std::ldexp(1.0, -29) + std::ldexp(1.0, -60));
+    }
     c.r[3] = 0x80003000; c.r[4] = 0;
     op_stfiwx(c, 2, 3, 4);            CHECK(rd32(c, 0x80003000) == 0x80000000);
     // frsp, fmr, fneg, fabs, fnabs
@@ -184,7 +202,12 @@ int main() {
         op_psq_st(c,20,3,0,0,0);
         if(rd32(c,c.r[3])!=rounded_bits || rd32(c,c.r[3]+4)!=(rounded_bits^0x80000000u))
             std::fprintf(stderr,"PSQ bits %08x expected %08x actual %08x:%08x\n",bits,rounded_bits,rd32(c,c.r[3]),rd32(c,c.r[3]+4));
-        CHECK(rd32(c,c.r[3])==rounded_bits && rd32(c,c.r[3]+4)==(rounded_bits^0x80000000u));
+        // A signalling NaN may also come back unchanged: where the load and the store meet in one function the compiler drops the
+        // float->double->float round trip, and arm64 then keeps the signalling bit (as the Broadway's single loads and stores do) instead of
+        // quieting it like a separate conversion. Every other value must match the scalar conversion bit for bit.
+        const bool signalling_nan=(bits&0x7F800000u)==0x7F800000u && (bits&0x007FFFFFu) && !(bits&0x00400000u);
+        const bool kept=signalling_nan && rd32(c,c.r[3])==bits && rd32(c,c.r[3]+4)==(bits^0x80000000u);
+        CHECK(kept || (rd32(c,c.r[3])==rounded_bits && rd32(c,c.r[3]+4)==(rounded_bits^0x80000000u)));
     }
     for(double value : {1.0000000596046448,1.0000001788139343,-1.0000000596046448,1e-46,-1e-46,1e39,-1e39}) {
         volatile double scalar=value;
