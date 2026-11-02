@@ -581,6 +581,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         // The offscreen display is 1024x768: the game would render 4:3 (a narrower view, more of the world culled at the eyes' edges, and
         // its menus laid out for another shape). The headset gets the game's own 16:9 picture, at 720p unless asked otherwise.
         if(xr && !options.width && !options.height) { options.width=1280; options.height=720; }
+        // The automatic internal resolution on the headset: 0.75x 720p (960x540 a scene per eye). Chapter 1's heaviest fight holds 30 fps
+        // there on the Quest 3 (GPU about 82% busy); 1.07x, the 720p window's own, ran at 20-24. render_scale in config.json overrides it.
+        if(xr && !options.render_scale) options.render_scale=0.75;
 #endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();
@@ -981,8 +984,13 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         const auto* desktop=SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
         const uint32_t monitor_width=desktop ? uint32_t(desktop->w) : options.width, monitor_height=desktop ? uint32_t(desktop->h) : options.height;
         uc::SettingsTargets targets;
-        targets.render_scale=[&renderer,&options,monitor_width,monitor_height](double scale) {
-            options.render_scale=scale ? scale : uc::monitor_render_scale(monitor_width,monitor_height);   // a renderer restart starts from it
+#ifdef UC_OPENXR
+        const bool headset=bool(xr);
+#else
+        const bool headset=false;
+#endif
+        targets.render_scale=[&renderer,&options,monitor_width,monitor_height,headset](double scale) {
+            options.render_scale=scale ? scale : headset ? 0.75 : uc::monitor_render_scale(monitor_width,monitor_height);   // a renderer restart starts from it (the headset's automatic: 0.75)
             renderer.set_render_scale(options.render_scale);
         };
         targets.upscaling=[&](const uc::Options& next) {

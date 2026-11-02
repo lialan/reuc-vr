@@ -243,6 +243,7 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
         }
         create_screen_pass(shaders);
         overlay_.initialize(physical, device_, render_format_, width_, height_, shaders);
+        panel_.set_eye_size(int(width_), int(height_));
         overlay_depth_image_ = overlay_.depth_image();
         std::fprintf(stderr, "[vulkan-xr] stereo swapchain %ux%u x2, %u images, format %d rendered as %d\n", width_, height_, count, int(format), int(render_format_));
     } catch (...) { detach(); throw; }

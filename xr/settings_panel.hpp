@@ -21,8 +21,9 @@ public:
     const std::array<XoFrame,2> &guns() const {return guns_;}
     const std::array<ControllerHaptic,2> &haptics() const {return haptics_;}
     bool open() const {return panel_.open;}
+    void set_eye_size(int width,int height) {eye_w_=width;eye_h_=height;}   // the swapchain's size, for the stats (width_/height_ are the settings)
 private:
-    XpPanel panel_{};int width_,height_,previous_menu_=0,previous_upper_[2]{},previous_trigger_[2]{};
+    XpPanel panel_{};int width_,height_,eye_w_=0,eye_h_=0,previous_menu_=0,previous_upper_[2]{},previous_trigger_[2]{};
     // "Show stats": counted here, sampled and repainted every half second
     int64_t held_=0,stats_since_=0;unsigned stats_frames_=0,stats_samples_=0;bool stats_shown_=false;
     std::string stats_text_;

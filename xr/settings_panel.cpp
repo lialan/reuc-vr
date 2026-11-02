@@ -70,7 +70,7 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
             LgStats stats{};const double elapsed=double(now-stats_since_);
             stats.fps=int(double(stats_frames_)*1e9/elapsed+.5);
             stats.frame_ms=stats_frames_?float(elapsed/1e6/stats_frames_):-1;
-            stats.eye_w=width_;stats.eye_h=height_;
+            stats.eye_w=eye_w_?eye_w_:width_;stats.eye_h=eye_h_?eye_h_:height_;
             lg_stats_sample(&stats);stats_since_=now;stats_frames_=0;
             char lines[LG_STATS_LINES][LG_STATS_LINE];lg_stats_format(&stats,lines);
             std::string text;for(const auto &l:lines){text+=l;text+='\n';}
