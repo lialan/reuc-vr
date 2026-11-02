@@ -29,24 +29,34 @@ if(WIN32)
   include(patch_sdl.cmake)
 endif()
 set(shader_dir ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+# Every game vertex stage gets an Invariant position (tools/spirv_invariant_position.py): layered draws over the same vertices test depth
+# EQUAL/LEQUAL, and only invariance makes the position bit-identical across the pipelines the driver compiles.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+macro(uc_invariant_step out file)
+  set(${out} COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py ${file})
+endmacro()
 foreach(stage vert frag)
   if(stage STREQUAL "vert")
     set(entry vertexMain)
     set(shader_stage vertex)
+    uc_invariant_step(invariant ${shader_dir}/smoke.${stage}.spv)
   else()
     set(entry fragmentMain)
     set(shader_stage fragment)
+    set(invariant)
   endif()
   add_custom_command(OUTPUT ${shader_dir}/smoke.${stage}.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -target spirv -profile spirv_1_5 -entry ${entry} -stage ${shader_stage} -fvk-use-entrypoint-name -o ${shader_dir}/smoke.${stage}.spv
+    ${invariant}
     DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 endforeach()
 # The headset's vertex stage for draws without per-vertex texture matrices (pipeline key word 0 bit 17 clear).
 add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.nobank.vert.spv
   COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
   COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST -DNO_BANK -entry vertexMain -stage vertex -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.nobank.vert.spv
-  DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py ${shader_dir}/smoke.stereo.nobank.vert.spv
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 # Early-Z variants: the specialized fragment shader without the alpha test (pipelines that cannot discard), early fragment tests declared.
 foreach(family "" motion stereo)
   if(family STREQUAL "")
@@ -74,21 +84,27 @@ add_custom_command(OUTPUT ${shader_dir}/smoke.uber.spv
 foreach(stage vert frag uber)
   if(stage STREQUAL "vert")
     set(motion_args -entry vertexMain -stage vertex)
+    uc_invariant_step(invariant ${shader_dir}/smoke.motion.${stage}.spv)
   elseif(stage STREQUAL "frag")
     set(motion_args -entry fragmentMain -stage fragment)
   else()
     set(motion_args -DUBER -entry fragmentMain -stage fragment)
   endif()
+  if(NOT stage STREQUAL "vert")
+    set(invariant)
+  endif()
   add_custom_command(OUTPUT ${shader_dir}/smoke.motion.${stage}.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DMOTION ${motion_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.motion.${stage}.spv
+    ${invariant}
     DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 endforeach()
 # Shadow map vertex stage: the motion vertex shader without lighting and texture coordinates (depth only, no fragment stage).
 add_custom_command(OUTPUT ${shader_dir}/smoke.shadow.vert.spv
   COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
   COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DMOTION -DSHADOW -entry vertexMain -stage vertex -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.shadow.vert.spv
-  DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py ${shader_dir}/smoke.shadow.vert.spv
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 add_custom_command(OUTPUT ${shader_dir}/rcas.comp.spv
   COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
   COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rcas.slang -entry main -stage compute -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/rcas.comp.spv
@@ -186,14 +202,19 @@ endforeach()
 foreach(stage vert frag uber)
   if(stage STREQUAL "vert")
     set(stereo_args -entry vertexMain -stage vertex)
+    uc_invariant_step(invariant ${shader_dir}/smoke.stereo.${stage}.spv)
   elseif(stage STREQUAL "frag")
     set(stereo_args -entry fragmentMain -stage fragment)
   else()
     set(stereo_args -DUBER -entry fragmentMain -stage fragment)
   endif()
+  if(NOT stage STREQUAL "vert")
+    set(invariant)
+  endif()
   add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.${stage}.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST ${stereo_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.${stage}.spv
+    ${invariant}
     DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 endforeach()
 # The headset's screen pass (xr_compositor.cpp): multiview, both eyes in one pass.

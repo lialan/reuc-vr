@@ -36,7 +36,9 @@ void xr_settings_load(LgXrSettings *c)
     }
     /* written before version 3, high foveation was the default: now off (the eye image holds only the screen pass) */
     if (c->version < 3 && c->foveation == 3) c->foveation = 0;
-    c->version = 3;
+    /* written before version 4, the Quest's default eye height was 1440: now native */
+    if (c->version < 4 && c->resolution == LG_XR_OLD_QUEST_HEIGHT && c->width == 0) { c->resolution = LG_XR_NATIVE_HEIGHT; c->width = LG_XR_NATIVE_WIDTH; }
+    c->version = 4;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

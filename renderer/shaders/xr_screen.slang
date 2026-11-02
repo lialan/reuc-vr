@@ -21,7 +21,32 @@ VOut vertexMain(uint id : SV_VertexID, uint view : SV_ViewID) {
     return o;
 }
 
+// Edge smoothing (FXAA, Lottes' 2009 form) as the picture is magnified onto the eye: the game draws without anti-aliasing and the eye's
+// picture (687x720 at the default scale) spreads over about 100 degrees, so its stair-stepped edges crawled with every movement. Works on
+// the picture's own texels and its stored (sRGB-encoded) colours, as FXAA expects. Specialization constant 0 = 0 turns it off (UC_XR_FXAA=0).
+[[vk::constant_id(0)]] const uint fxaaOn = 1;
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+float3 tap(float2 uv, float layer) { return picture.SampleLevel(linear, float3(uv, layer), 0).rgb; }
+float3 fxaa(float2 uv, float layer) {
+    uint width, height, layers; picture.GetDimensions(width, height, layers);
+    const float2 texel = float2(1.0 / width, 1.0 / height);
+    const float3 nw = tap(uv + float2(-0.5, -0.5) * texel, layer), ne = tap(uv + float2(0.5, -0.5) * texel, layer);
+    const float3 sw = tap(uv + float2(-0.5, 0.5) * texel, layer), se = tap(uv + float2(0.5, 0.5) * texel, layer);
+    const float3 m = tap(uv, layer);
+    const float lnw = luma(nw), lne = luma(ne), lsw = luma(sw), lse = luma(se), lm = luma(m);
+    const float lmin = min(lm, min(min(lnw, lne), min(lsw, lse))), lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
+    float2 dir = float2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));
+    const float reduce = max((lnw + lne + lsw + lse) * (0.25 / 8.0), 1.0 / 128.0);
+    const float scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * scale, -8.0, 8.0) * texel;
+    const float3 a = 0.5 * (tap(uv + dir * (1.0 / 3.0 - 0.5), layer) + tap(uv + dir * (2.0 / 3.0 - 0.5), layer));
+    const float3 b = a * 0.5 + 0.25 * (tap(uv - dir * 0.5, layer) + tap(uv + dir * 0.5, layer));
+    const float lb = luma(b);
+    return (lb < lmin || lb > lmax) ? a : b;
+}
+
 [shader("fragment")]
 float4 fragmentMain(VOut i, uint view : SV_ViewID) : SV_Target0 {
+    if (fxaaOn != 0) return float4(fxaa(i.uv, float(view)), 1);
     return float4(picture.Sample(linear, float3(i.uv, float(view))).rgb, 1);
 }

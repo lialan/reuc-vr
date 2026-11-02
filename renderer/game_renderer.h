@@ -20,6 +20,7 @@ public:
         }
     }
     void use_xr(class XrCompositor* xr) { if(vulkan_) vulkan_->use_xr(xr); }   // the headset output (Vulkan only), before initialize()
+    void set_native_eye_scale(bool on) { if(vulkan_) vulkan_->set_native_eye_scale(on); }   // the headset: each eye at the eye image's size (before initialize())
     void set_menu_context(bool menu) { if(vulkan_) vulkan_->set_menu_context(menu); }   // the headset HUD: HOTD4's screen in menus, the display's edges in gameplay
     void initialize(SDL_Window* window,bool validation,const std::filesystem::path& shaders,double scale,double aspect,bool exclusive) {
         if(vulkan_) vulkan_->initialize(window,validation,shaders,scale,aspect,exclusive);

@@ -81,6 +81,7 @@ public:
     void warm_pipelines(const std::function<void(size_t,size_t)>& progress);
     void set_uber_only(bool enabled) { owner(); uber_only_=enabled; }   // tests: draw everything with the ubershader
     void set_render_scale(double scale); // Multiplier of720p; output resize preserves it.
+    void set_native_eye_scale(bool on) { native_eye_scale_=on; }   // the headset: the scale making the scene exactly the eye image (set before initialize)
     void set_prompt_style(PromptStyle);
     // The renderer's own bloom (bloom_pass.h) replaces the game's, whose composite draw is always skipped. Off or strength 0: no bloom at all. Live; off in a fresh renderer.
     void set_bloom(const BloomSettings&);
@@ -197,6 +198,7 @@ private:
         Buffer upload;
         VkExtent2D extent{};
         uint32_t mip_levels=1;
+        bool auto_mips=false;   // the headset: levels 1.. generated on the GPU from a one-level GX texture (sampled with auto_samplers_)
         gx::TextureChannels channels=gx::TextureChannels::rgba;
         bool bc7=false;   // a texture replacement: BC7 blocks, not RGBA8
         VkDeviceSize allocation_size=0;
@@ -292,6 +294,7 @@ private:
     GraphicsEffects chosen_effects_;   // as configured
     GraphicsEffects effects_;   // effective_effects(chosen_effects_): what the passes run from
     bool anisotropy_supported_=false; float anisotropy_limit_=1;
+    bool depth_clamp_=false;   // the headset: game pipelines clamp depth instead of clipping at the eye frustum's near and far planes
     void create_samplers();
     void apply_scene_path(bool anisotropy_changed, bool path_before);
     void destroy_samplers();
@@ -434,6 +437,7 @@ private:
     VkExtent2D extent_{};
     VkExtent2D requested_{};
     double configured_scale_=0.5, render_aspect_=16.0/9;
+    bool native_eye_scale_=false;
     uint32_t max_image_dimension_=0;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<PipelineKey,VkPipeline> pipelines_, uber_pipelines_;   // guarded by pipelines_mutex_ with the members below: compile threads insert too
@@ -472,6 +476,7 @@ private:
     bool logic_ops_=false;
     VkDescriptorSetLayout texture_layout_=VK_NULL_HANDLE;
     std::array<VkSampler,256> texture_samplers_{};
+    std::array<VkSampler,256> auto_samplers_{};   // texture_samplers_ with linear mip filtering, for textures with generated mips (linear minification modes)
     VkImage efb_ = VK_NULL_HANDLE;
     VkExtent2D efb_extent_{};
     VkDeviceMemory efb_memory_ = VK_NULL_HANDLE;

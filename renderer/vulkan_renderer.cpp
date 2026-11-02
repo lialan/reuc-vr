@@ -371,6 +371,11 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     VkPhysicalDeviceFeatures enabled{}; enabled.logicOp=logic_ops_; enabled.independentBlend=motion_outputs_; enabled.shaderInt16=core.shaderInt16; device_info.pEnabledFeatures=&enabled;
     enabled.occlusionQueryPrecise=core.occlusionQueryPrecise;   // UC_FRAG_DUMP: exact fragment counts per draw
     enabled.samplerAnisotropy=core.samplerAnisotropy; anisotropy_supported_=core.samplerAnisotropy; enabled.textureCompressionBC=core.textureCompressionBC;
+    // The headset: each eye's frustum keeps the game's near and far planes (its fog reads that depth), but a turned head puts the far plane
+    // through the game's distant backdrop at an angle: what fell beyond it was clipped, and the view through the train's windows came out
+    // spotty, changing with every head movement. Depth clamping keeps it drawn at the far depth instead (the game tests LEQUAL).
+    depth_clamp_=layers_>1 && core.depthClamp && !std::getenv("UC_VR_NO_DEPTH_CLAMP"); enabled.depthClamp=depth_clamp_;
+    if (layers_>1) std::fprintf(stderr,"[vr] depth clamp %s\n",depth_clamp_ ? "on" : core.depthClamp ? "off (UC_VR_NO_DEPTH_CLAMP)" : "unavailable");
     enabled.shaderStorageImageExtendedFormats=core.shaderStorageImageExtendedFormats;   // r8/rg8/rg16f storage images of GTAO, SMAA and motion blur
     { VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(physical_,&properties); anisotropy_limit_=properties.limits.maxSamplerAnisotropy; }
     device_info.queueCreateInfoCount = 1; device_info.pQueueCreateInfos = &queue_info;   // queue_info.queueCount: 3 with the interpolation swapchain
@@ -433,8 +438,13 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         // Each eye's picture has the shape of its eye image, so the screen pass maps it 1:1 onto the eye's view (a 16:9 picture stretched
         // over a nearly square eye gave the vertical view 540 rows at 0.75x). The game keeps its 16:9 view (aim, hit tests, menus): the
         // per-eye reprojection maps its clip space to each eye's frustum whatever the target's shape.
-        if (xr_->eye_width() && xr_->eye_height()) { render_aspect_ = double(xr_->eye_width()) / xr_->eye_height(); set_render_scale(configured_scale_); }
-        std::fprintf(stderr, "[vr] eye picture aspect %.3f\n", render_aspect_);
+        if (xr_->eye_width() && xr_->eye_height()) {
+            render_aspect_ = double(xr_->eye_width()) / xr_->eye_height();
+            // Native: the scene (720 rows at 1x) gets exactly the eye image's rows, so the eye sees the game at the display's resolution
+            // with nothing resampled (2064x2208 on the Quest 3: 3.07x). An explicit render_scale overrides it.
+            set_render_scale(native_eye_scale_ ? std::clamp(xr_->eye_height() / 720.0, 0.5, 6.0) : configured_scale_);
+        }
+        std::fprintf(stderr, "[vr] eye picture aspect %.3f, scale %.3f\n", render_aspect_, configured_scale_);
         const auto picture=manual_render_extent(configured_scale_,render_aspect_);
         resize(picture.width, picture.height);
     } else
@@ -530,13 +540,29 @@ VulkanRenderer::Texture VulkanRenderer::make_texture(const gx::TexturePixels* pi
     if(texture.extent.width>max_image_dimension_ || texture.extent.height>max_image_dimension_) throw std::invalid_argument("texture extent exceeds device image limits");
     texture.mip_levels=pixels ? uint32_t(pixels->levels.size()) : 1;
     texture.mip_levels=std::min(texture.mip_levels,uint32_t(std::bit_width(std::max(texture.extent.width,texture.extent.height))));
+    const uint32_t source_levels=texture.mip_levels;
+    // The headset (stereo): most of the game's textures have one level and are minified a lot in a headset's view (a 687x720 eye picture
+    // magnified over about 100 degrees): without mips they sparkled with every head movement. Such a texture gets the full chain, levels
+    // 1.. made on the GPU when it is uploaded, and a sampler with linear mip filtering. UC_NO_AUTO_MIPS=1: one level, as on the desktop.
+    static const bool no_auto_mips=std::getenv("UC_NO_AUTO_MIPS")!=nullptr;
+    // Only fully opaque textures: a cut-out texture's transparent texels are black, and averaging them into the levels below pulled black
+    // into the cut-out's edges and shrank what its alpha test keeps, so outlines blacked out and flickered as the level changed with distance.
+    const auto opaque=[&] {
+        const auto& rgba=pixels->levels[0].rgba;
+        for(size_t i=3;i<rgba.size();i+=4) if(rgba[i]!=255) return false;
+        return true;
+    };
+    if(layers_>1 && !no_auto_mips && !gpu_only && pixels && pixels->levels.size()==1 && !texture.bc7 && texture.channels==gx::TextureChannels::rgba && opaque()) {
+        texture.mip_levels=uint32_t(std::bit_width(std::max(texture.extent.width,texture.extent.height)));
+        texture.auto_mips=texture.mip_levels>1;
+    }
     try {
         if(!gpu_only) texture.upload=make_buffer(upload_size,VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         size_t at=0;
-        if(!gpu_only) for(uint32_t i=0;i<texture.mip_levels;++i) { const auto& mip=pixels ? pixels->levels[i] : white; std::memcpy(static_cast<std::byte*>(texture.upload.mapped)+at,mip.rgba.data(),mip.rgba.size()); at+=mip.rgba.size(); }
+        if(!gpu_only) for(uint32_t i=0;i<source_levels;++i) { const auto& mip=pixels ? pixels->levels[i] : white; std::memcpy(static_cast<std::byte*>(texture.upload.mapped)+at,mip.rgba.data(),mip.rgba.size()); at+=mip.rgba.size(); }
         VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; create.imageType=VK_IMAGE_TYPE_2D; create.format=format;
         create.extent={texture.extent.width,texture.extent.height,1}; create.mipLevels=texture.mip_levels; create.arrayLayers=gpu_only ? layers_ : 1; create.samples=VK_SAMPLE_COUNT_1_BIT;
-        create.tiling=VK_IMAGE_TILING_OPTIMAL; create.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|(gpu_only ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+        create.tiling=VK_IMAGE_TILING_OPTIMAL; create.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|(gpu_only || texture.auto_mips ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
         vk_check(vkCreateImage(device,&create,nullptr,&texture.image),"texture image");
         VkMemoryRequirements requirements; vkGetImageMemoryRequirements(device,texture.image,&requirements);
         texture.allocation_size=requirements.size;
@@ -722,6 +748,10 @@ void VulkanRenderer::create_samplers() {
         sampler.maxLod=mip ? VK_LOD_CLAMP_NONE : 0.f;
         sampler.anisotropyEnable=anisotropy>1 && (mode&128); sampler.maxAnisotropy=sampler.anisotropyEnable ? float(anisotropy) : 1.f;   // linear minification, with or without a mip filter: most of the game's textures have one level and sampler mode 0x9x
         vk_check(vkCreateSampler(device,&sampler,nullptr,&texture_samplers_[mode]),"texture sampler");
+        if(layers_>1 && (mode&128)) {   // generated mips (make_texture auto_mips): linear minification also filters between levels
+            auto mips=sampler; mips.mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR; mips.maxLod=VK_LOD_CLAMP_NONE;
+            vk_check(vkCreateSampler(device,&mips,nullptr,&auto_samplers_[mode]),"generated-mip texture sampler");
+        }
         if(motion_outputs_) {   // scene draws sample as if at output resolution (DLSS/FSR guides: log2(internal/output) - 1)
             auto biased=sampler; biased.mipLodBias=(upscaler_kind_==UpscalerKind::smaa || upscaler_kind_==UpscalerKind::off) ? 0.f : float(-std::log2(upscale_ratio(upscale_mode_))-1.0);   // SMAA and the pass-through: no upscaling, no jitter, no bias
             vk_check(vkCreateSampler(device,&biased,nullptr,&scene_samplers_[mode]),"scene texture sampler");
@@ -731,6 +761,7 @@ void VulkanRenderer::create_samplers() {
 void VulkanRenderer::destroy_samplers() {
     for(auto& sampler:texture_samplers_) { if(sampler) vkDestroySampler(device,sampler,nullptr); sampler=VK_NULL_HANDLE; }
     for(auto& sampler:scene_samplers_) { if(sampler) vkDestroySampler(device,sampler,nullptr); sampler=VK_NULL_HANDLE; }
+    for(auto& sampler:auto_samplers_) { if(sampler) vkDestroySampler(device,sampler,nullptr); sampler=VK_NULL_HANDLE; }
 }
 void VulkanRenderer::set_effects(const GraphicsEffects& effects) {
     owner();
@@ -896,7 +927,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; input.vertexBindingDescriptionCount = 1; input.pVertexBindingDescriptions = &binding; input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VkPrimitiveTopology(key[69]);
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = cull_mode(key); raster.frontFace = VK_FRONT_FACE_CLOCKWISE; raster.lineWidth = 1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = cull_mode(key); raster.frontFace = VK_FRONT_FACE_CLOCKWISE; raster.lineWidth = 1; raster.depthClampEnable = depth_clamp_;
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState blend{};
         blend.colorWriteMask=(mode.color_write ? VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT : 0)|(mode.alpha_write ? VK_COLOR_COMPONENT_A_BIT : 0);
@@ -2211,12 +2242,27 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         VkDeviceSize uniform_offset=0;
         for (size_t i=0;i<count;++i) {
             std::array<VkDescriptorImageInfo,8> image{};
+            std::array<bool,8> generated_mips{};   // the map's texture has GPU-made mips (auto_samplers_)
             for(size_t map=0;map<8;++map) {
                 const auto* chosen=&draw_texture(packet.draws[i],map);
                 if(*chosen)if(const auto alias=copy_aliases_.find(chosen->get());alias!=copy_aliases_.end() && !alias->second.requested.expired())chosen=&alias->second.rendered;
                 if(*chosen && (*chosen)->gpu_only) {
                     auto copied=copy_textures_.find(chosen->get());
                     if(copied!=copy_textures_.end() && copied->second.initialized) {
+                        static const bool diag=std::getenv("UC_DIAG_COPY")!=nullptr;   // diagnostics: 3D draws sampling an EFB copy, once per callsite
+                        if(diag) {
+                            static std::set<uint64_t> seen;
+                            const auto& d=packet.draws[i]; const auto& u=*d.uniforms;
+                            if(seen.insert((uint64_t(d.callsite)<<4)|map).second && seen.size()<64) {
+                                std::string gens; char b[160];
+                                for(int g=0;g<8;++g) { std::snprintf(b,sizeof b," g%d src%u proj%u",g,(u.tex_gens[g]>>7)&31,(u.tex_gens[g]>>1)&1); gens+=b; }
+                                bool indirect=false; for(auto c:u.ind_cmd) indirect|=c!=0;
+                                std::fprintf(stderr,"[diag-copy] callsite %08X %s map %zu copy %ux%u ind %d blend %u z test %u write %u cmp %u |%s\n",d.callsite,d.transforms->projection[3][3]==0 ? "persp" : "ortho",map,
+                                             (*chosen)->levels[0].width,(*chosen)->levels[0].height,int(indirect),unsigned(d.blend.mode),gpu_draws[i].key[68]&1,(gpu_draws[i].key[68]>>4)&1,(gpu_draws[i].key[68]>>1)&7,gens.c_str());
+                                for(int g=0;g<2;++g) for(int r=0;r<3;++r) { const auto& row=u.tex_rows[g*3+r]; std::fprintf(stderr,"[diag-copy]   g%d row%d %.4f %.4f %.4f %.4f\n",g,r,row[0],row[1],row[2],row[3]); }
+                                for(int r=0;r<4;++r) { const auto& row=d.transforms->projection[r]; std::fprintf(stderr,"[diag-copy]   P row%d %.4f %.4f %.4f %.4f\n",r,row[0],row[1],row[2],row[3]); }
+                            }
+                        }
                         slot.copy_sources.push_back(*chosen);
                         image[map]={VK_NULL_HANDLE,copied->second.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                         continue;
@@ -2238,6 +2284,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     found=texture_indices.emplace(source.get(),slot.textures.size()-1).first;
                 }
                 image[map]={VK_NULL_HANDLE,slot.textures[found->second]->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                generated_mips[map]=slot.textures[found->second]->auto_mips;
             }
             if(i==0 || packet.draws[i].uniforms.block()!=packet.draws[i-1].uniforms.block() ||
                !std::equal(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,gpu_draws[i-1].key.begin()+1)) {
@@ -2264,7 +2311,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             for(size_t map=0;map<8;++map) {
                 const auto wrap=packet.draws[i].texture_wrap[map];
                 if(!texture_samplers_[wrap]) throw std::invalid_argument("invalid native texture sampler mode");
-                samplers[map]={i<scene_draws ? scene_samplers_[wrap] : texture_samplers_[wrap],VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED};
+                const VkSampler plain=generated_mips[map] && auto_samplers_[wrap] ? auto_samplers_[wrap] : texture_samplers_[wrap];
+                samplers[map]={i<scene_draws ? scene_samplers_[wrap] : plain,VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED};
             }
             VkDescriptorBufferInfo palette{slot.palettes.buffer,0,VK_WHOLE_SIZE};
             VkDescriptorBufferInfo bank{slot.banks.buffer,0,VK_WHOLE_SIZE};
@@ -2417,12 +2465,24 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (texture.initialized) continue;
         texture.uploader=&slot;
         barrier(slot.command,texture.image,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_2_NONE,0,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_IMAGE_ASPECT_COLOR_BIT,texture.mip_levels);
-        std::vector<VkBufferImageCopy> copies(texture.mip_levels); VkDeviceSize at=0;
-        for(uint32_t i=0;i<texture.mip_levels;++i) {
+        const uint32_t uploaded=texture.auto_mips ? 1 : texture.mip_levels;   // generated mips: only level 0 comes from the CPU
+        std::vector<VkBufferImageCopy> copies(uploaded); VkDeviceSize at=0;
+        for(uint32_t i=0;i<uploaded;++i) {
             const auto width=std::max(1u,texture.extent.width>>i),height=std::max(1u,texture.extent.height>>i);
             copies[i].bufferOffset=at; copies[i].imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,i,0,1}; copies[i].imageExtent={width,height,1}; at+=texture.bc7 ? gx::bc7_level_size(width,height) : VkDeviceSize(width)*height*4;
         }
         vkCmdCopyBufferToImage(slot.command,texture.upload.buffer,texture.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(copies.size()),copies.data());
+        if(texture.auto_mips) {   // each level a linear blit of the one above, as EFB copies make theirs (record_texture_copy)
+            for(uint32_t i=1;i<texture.mip_levels;++i) {
+                barrier(slot.command,texture.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_IMAGE_ASPECT_COLOR_BIT,1,i-1);
+                VkImageBlit mip{}; mip.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,i-1,0,1}; mip.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,i,0,1};
+                mip.srcOffsets[1]={int32_t(std::max(1u,texture.extent.width>>(i-1))),int32_t(std::max(1u,texture.extent.height>>(i-1))),1};
+                mip.dstOffsets[1]={int32_t(std::max(1u,texture.extent.width>>i)),int32_t(std::max(1u,texture.extent.height>>i)),1};
+                vkCmdBlitImage(slot.command,texture.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,texture.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&mip,VK_FILTER_LINEAR);
+            }
+            barrier(slot.command,texture.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_IMAGE_ASPECT_COLOR_BIT,1,texture.mip_levels-1);
+            barrier(slot.command,texture.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT|VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,VK_IMAGE_ASPECT_COLOR_BIT,texture.mip_levels);
+        } else
         barrier(slot.command,texture.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,VK_IMAGE_ASPECT_COLOR_BIT,texture.mip_levels);
     }
     // A render target of the frame: efb_ (output resolution) or the internal scene targets. Between passes color is TRANSFER_SRC, depth

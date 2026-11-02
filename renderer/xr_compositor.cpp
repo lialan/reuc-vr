@@ -268,8 +268,13 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(EyeConstants)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout_; layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
     vk(vkCreatePipelineLayout(device_, &layout, nullptr, &layout_), "pipeline layout");
+    // xr_screen.slang constant 0: edge smoothing as the picture is magnified onto the eye (UC_XR_FXAA=0 turns it off, for comparison)
+    const uint32_t fxaa = [] { const char* v = std::getenv("UC_XR_FXAA"); return v && *v == '0' ? 0u : 1u; }();
+    const VkSpecializationMapEntry fxaa_entry{0, 0, sizeof(uint32_t)};
+    const VkSpecializationInfo fxaa_info{1, &fxaa_entry, sizeof fxaa, &fxaa};
+    std::fprintf(stderr, "[vulkan-xr] screen pass edge smoothing %s\n", fxaa ? "on" : "off");
     const VkPipelineShaderStageCreateInfo stages[] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex_, "vertexMain", nullptr},
-                                                      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment_, "fragmentMain", nullptr}};
+                                                      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment_, "fragmentMain", &fxaa_info}};
     VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
@@ -359,10 +364,22 @@ bool XrCompositor::begin_frame() {
                      anchor.poseInReferenceSpace.position.y, anchor.poseInReferenceSpace.position.z, yaw * 57.2957795f);
     }
     std::array<xr::StereoPose, 2> eyes;
+    // UC_VR_WOBBLE=1 (diagnostics): a slow artificial head sway on top of the tracked pose (yaw +-6 degrees and +-4 cm sideways, about a
+    // 3 s period), so runs with the headset lying still move as a worn one does.
+    static const bool wobble = [] { const char* v = std::getenv("UC_VR_WOBBLE"); return v && *v == '1'; }();
+    const double phase = wobble ? double(frame_.predictedDisplayTime % 3000000000ll) / 3e9 * 6.283185307 : 0.0;
+    const float yaw = wobble ? float(0.105 * std::sin(phase)) : 0.f, sway = wobble ? float(0.04 * std::sin(phase * 1.7)) : 0.f;
+    const float qy[4] = {0, std::sin(yaw / 2), 0, std::cos(yaw / 2)};   // x y z w
     for (unsigned i = 0; i < 2; ++i) {
         const auto& v = views_[i];
         eyes[i].orientation = {v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w};
         eyes[i].position = {v.pose.position.x, v.pose.position.y, v.pose.position.z};
+        if (wobble) {   // yaw about the head's vertical axis (q = qy * q, the position rotated with it), then the sideways sway
+            const float x = eyes[i].orientation[0], y = eyes[i].orientation[1], z = eyes[i].orientation[2], w = eyes[i].orientation[3];
+            eyes[i].orientation = {qy[3] * x + qy[1] * z, qy[3] * y + qy[1] * w, qy[3] * z - qy[1] * x, qy[3] * w - qy[1] * y};
+            const float px = eyes[i].position[0], pz = eyes[i].position[2], c = std::cos(yaw), s = std::sin(yaw);
+            eyes[i].position[0] = c * px + s * pz + sway; eyes[i].position[2] = -s * px + c * pz;
+        }
         eyes[i].tangents = {std::tan(-v.fov.angleLeft), std::tan(v.fov.angleRight), std::tan(-v.fov.angleDown), std::tan(v.fov.angleUp)};
     }
     scene_.publish(eyes);

@@ -495,6 +495,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         }
     }
     double render_aspect=16.0/9;
+    bool native_eye_scale=false;   // the headset without an explicit render_scale: each eye's scene at the eye image's size (every renderer restart)
     // Native ultrawide (renderer/ultrawide.h): the packets are scaled for the shape of the output, whatever shape the EFB was created in.
     int view_width=0,view_height=0;   // the last output size the factors were made for (a change of the interface position remakes them)
     const auto view_for_output=[&options,&view_width,&view_height,&network,deterministic](int width,int height) {
@@ -521,6 +522,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         renderer.allow_dlss5(options.dlss5_enabled);
 #ifdef UC_OPENXR
         renderer.use_xr(xr.get());
+        renderer.set_native_eye_scale(native_eye_scale);
 #endif
         renderer.initialize(window.get(), options.validation, exe_dir() / "data" / "shaders", options.render_scale,render_aspect,options.window_mode==uc::WindowMode::exclusive);
         std::fprintf(stderr,"[startup] renderer initialized after %.1f ms; setting effects\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-renderer_start).count());
@@ -583,9 +585,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         if(xr && !options.width && !options.height) { options.width=1280; options.height=720; }
         // The automatic internal resolution on the headset: 0.75x 720p (960x540 a scene per eye). Chapter 1's heaviest fight holds 30 fps
         // there on the Quest 3 (GPU about 82% busy); 1.07x, the 720p window's own, ran at 20-24. render_scale in config.json overrides it.
-        // Since the eye's picture takes the eye image's shape (about 0.95 wide per high, VulkanRenderer::initialize), the scale sets its rows:
-        // 1.0x is 687x720 per eye, about the pixels 0.75x had at 16:9 (960x540) with a third more rows and nothing stretched.
-        if(xr && !options.render_scale) options.render_scale=1.0;
+        // Native VR: without an explicit render_scale the renderer gives each eye's scene exactly the eye image's size (2064x2208 on the
+        // Quest 3; VulkanRenderer::initialize); 1.0 is only the placeholder it replaces.
+        if(xr && !options.render_scale) { options.render_scale=1.0; native_eye_scale=true; }
 #endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();
