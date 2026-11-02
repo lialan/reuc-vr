@@ -3,6 +3,7 @@
 Run from scripts: python -m uctest.netplay [--port 27889] [--speed 8].
 All input uses the existing test server; saves/config stay in each run directory.
 """
+from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import argparse
 import contextlib
 import csv
@@ -593,7 +594,7 @@ def main():
     # The FPS and speed checks need a fixed tick: a tick change inside a measurement window would move the ratios.
     os.environ.setdefault("UC_NET_TICK_AUTO", "0")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", default="dist/uc.exe")
+    parser.add_argument("--exe", default=DEFAULT_EXE)
     parser.add_argument("--port", type=int, default=27889, choices=range(1024, 65535), metavar="1024..65534")
     parser.add_argument("--speed", type=int, default=8, choices=range(1, 33), metavar="1..32")
     parser.add_argument("--connect-delay", type=int, default=0, choices=range(31), metavar="0..30", help="delay client startup to exercise the network wait watchdog")

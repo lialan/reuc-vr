@@ -3,6 +3,7 @@
 python -m uctest.netplay_chapter --from after-ch2 --chapter 2 --speed 8 --max-minutes 8
 A desync leaves desync-<frame>.ram (guest RAM of that frame and the one before) in both peers' folders; UC_NET_HASH_DETAIL=1 logs the RAM chunk hashes per hash frame.
 """
+from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import argparse
 import contextlib
 import json
@@ -27,7 +28,7 @@ def free_port():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", default="dist/uc.exe")
+    parser.add_argument("--exe", default=DEFAULT_EXE)
     parser.add_argument("--from", dest="saves_from", default="after-ch1-clean", help="checkpoint name or saves directory with the chapter unlocked and no mid-chapter save point (that one asks two questions at the save slot)")
     parser.add_argument("--chapter", type=int, default=2, choices=range(1, 5))
     parser.add_argument("--speed", type=int, default=8, choices=range(1, 33), metavar="1..32")

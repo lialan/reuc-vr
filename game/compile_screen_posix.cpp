@@ -10,6 +10,10 @@ CompileScreen::~CompileScreen() = default;
 void CompileScreen::show() {}
 void CompileScreen::wait_for_peer(std::string_view message) { std::fprintf(stderr, "[network] %.*s\n", int(message.size()), message.data()); }
 void CompileScreen::update(size_t done, size_t total) {
-    if (total && (done == total || done % 64 == 0)) std::fprintf(stderr, "[pipeline] precompiled %zu/%zu\n", done, total);
+    static size_t logged = size_t(-1);   // update() is called while waiting too: one line per 64 finished pipelines
+    if (total && done != logged && (done == total || done / 64 != logged / 64 || logged == size_t(-1))) {
+        std::fprintf(stderr, "[pipeline] precompiled %zu/%zu\n", done, total);
+        logged = done;
+    }
 }
 }  // namespace uc

@@ -1,4 +1,5 @@
 """Drives uc.exe --test-server: waits on game state, sends input, fails with artifacts."""
+from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import collections
 import contextlib
 import json
@@ -60,7 +61,7 @@ class StepFailed(Exception):
 class Game:
     BUTTONS = {"A": 0x0800, "B": 0x0400, "minus": 0x0010, "plus": 0x1000}
 
-    def __init__(self, *, exe="dist/uc.exe", run_dir=None, speed=1, skip_intro=True, seconds=600, transport_factory=None, launch=True, god=False, skip_tutorials=False, saves=None, game_args=(), mods=False, mod_settings=None):
+    def __init__(self, *, exe=DEFAULT_EXE, run_dir=None, speed=1, skip_intro=True, seconds=600, transport_factory=None, launch=True, god=False, skip_tutorials=False, saves=None, game_args=(), mods=False, mod_settings=None):
         self.exe = (ROOT / exe).resolve()
         self.run_dir = Path(run_dir) if run_dir else ROOT / "build" / "autotest" / str(time.time_ns())
         self.name = re.sub(r"[^A-Za-z0-9_-]", "_", self.run_dir.name)[-32:] or "run"

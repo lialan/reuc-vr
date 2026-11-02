@@ -1,4 +1,5 @@
 """python -m uctest list | run <scenario> [--speed k] [--measure s] [--repeat n]"""
+from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import argparse
 import json
 import shutil
@@ -84,7 +85,7 @@ def main(argv=None):
         return dumpview.command(dumpview.Bundle(args.bundle), args.what, args.arguments)
     if args.command == "demo":
         from . import demo as demo_module
-        args.exe = args.exe or str(demo_module.ROOT / "dist" / "uc.exe")
+        args.exe = args.exe or str(demo_module.ROOT / "dist" / DEFAULT_EXE_NAME)
         return {"record": lambda: demo_module.record(args, run_once), "check": lambda: demo_module.check(args), "profile": lambda: demo_module.profile(args), "replay": lambda: demo_module.replay(args)}[args.action]()
     if args.command == "bench" and not args.runs:
         args.runs = 1 if args.demo else 3

@@ -1,4 +1,5 @@
 """Unequal render workloads must keep network simulation near realtime and in sync."""
+from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import argparse
 import contextlib
 import json
@@ -13,7 +14,7 @@ from .transport import PipeTransport
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", default="dist/uc.exe")
+    parser.add_argument("--exe", default=DEFAULT_EXE)
     args = parser.parse_args()
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

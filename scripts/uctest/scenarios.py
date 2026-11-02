@@ -17,6 +17,43 @@ def boot_to_title(g, args):
     return {"capture": g.capture()}
 
 
+def create_saves(g, args):
+    """A fresh install (no saves): answer the game's "Save game data not found. Create data?" dialog with the check mark, then skip the
+    movies to the title. The run's saves folder then holds a new save file; copy it to UC_INSTALL_DIR/saves to start other scenarios from it."""
+    import time
+    from .menus import screen_of
+    deadline = time.monotonic() + 120
+    with g.step("create_data"):
+        while screen_of(g.frame) != "title":
+            if time.monotonic() > deadline:
+                g.fail("the save dialogs did not lead to the title screen", "title")
+            g.aim(-0.35, 0.2, settle_frames=3)   # the check mark (left button) of the yes/no dialogs; also skips the movies
+            g.press("A", 3, -0.35, 0.2)
+            n = g.frame.get("n", 0)
+            g.wait(lambda f: screen_of(f) == "title" or f["n"] > n + 60, frames=300, seconds=10, awaited="title")
+    if not getattr(args, "new_game", True):
+        return {"capture": g.capture()}
+    from . import steps as steps_module
+    with g.step("title_start"):
+        steps_module.select(g, "title_start")
+    # NEW GAME on the save page, then confirm what follows (name/difficulty/"save here?" pages) with the check mark or A, capturing each page.
+    captures = []
+    for i in range(40):
+        on_save_page = screen_of(g.frame) == "save_select"
+        # The load page, "select the file to save to" and its confirmation share one signature: rotate NEW GAME, slot 1 and the check
+        # mark (a press where a page has no button does nothing).
+        x, y = [(0.0, -0.35), (-0.425, -0.05), (-0.35, 0.2)][i % 3] if on_save_page else (-0.35, 0.2)
+        g.aim(x, y, settle_frames=3)
+        g.press("A", 3, x, y)
+        n = g.frame.get("n", 0)
+        g.wait(lambda f: f["n"] > n + 90, frames=400, seconds=15, awaited="next page")
+        if not on_save_page or i < 9:
+            captures.append(g.capture())
+        if screen_of(g.frame) in ("scenario", "chapter", "mission"):
+            break
+    return {"captures": captures, "screen": screen_of(g.frame)}
+
+
 def reach_gameplay(g, chapter=1):
     with g.step("skip_movies"):
         steps.skip_movies(g)
@@ -1634,7 +1671,7 @@ def pointer_range(g, args):
     return result
 
 
-SCENARIOS = {"boot_to_title": boot_to_title, "train_gameplay": train_gameplay, "no_tutorials": no_tutorials, "controls": controls, "weapon_switch": weapon_switch, "perf": perf, "fight": fight, "autoplay": autoplay, "resize": resize,
+SCENARIOS = {"boot_to_title": boot_to_title, "create_saves": create_saves, "train_gameplay": train_gameplay, "no_tutorials": no_tutorials, "controls": controls, "weapon_switch": weapon_switch, "perf": perf, "fight": fight, "autoplay": autoplay, "resize": resize,
              "pause": pause, "overlay": overlay, "mods_smoke": mods_smoke, "hook_probe": hook_probe, "hook_block": hook_block, "weapon_damage": weapon_damage, "fire_rate": fire_rate, "hook_replace": hook_replace, "camera_api": camera_api, "player_api": player_api, "input_force": input_force, "input_block": input_block, "enemy_api": enemy_api, "state_dump": state_dump, "player_dump": player_dump, "game_api": game_api, "timers_api": timers_api, "arc_grow": train_gameplay, "arc_member": arc_member, "movie_probe": movie_probe, "movie_replace": movie_replace, "inspector_live": inspector_live, "randomizer_live": randomizer_live, "randomizer_plain": randomizer_live, "camera_capture": camera_capture, "arc_member_plain": arc_member, "guest_api": guest_api, "text_replace": text_replace, "text_replace_plain": text_replace, "audio_replace": audio_replace, "audio_replace_silent": audio_replace_silent, "dol_names": dol_names}
 SCENARIO_MODS = {"mods_smoke": MODS_SMOKE_MODS, "hook_probe": ["hook_probe"], "hook_block": ["hook_block"], "weapon_damage": ["damage_big"], "fire_rate": ["fire_rate_2"], "hook_replace": ["hook_replace"], "camera_api": ["camera_probe"], "player_api": ["player_probe"], "input_force": ["input_force"], "input_block": ["input_block"], "enemy_api": ["enemy_kill"], "game_api": ["game_probe"], "timers_api": ["timer_probe"], "arc_grow": ["arc_grow"], "arc_member": ["arc_member"], "movie_probe": ["movie_probe"], "movie_replace": ["movie_replace"], "inspector_live": ["inspector"], "randomizer_live": ["randomizer"], "guest_api": ["guest_probe"], "text_replace": ["text_marker"], "audio_replace": ["audio_tone"], "audio_replace_silent": ["audio_silent"], "dol_names": ["dol_names"]}   # example mods a scenario needs installed before the game starts (Game(mods=[...]))
 SCENARIO_MODS["weapon_switch"] = ["timer_probe"]   # enable the input API with a fixture that leaves input unchanged
