@@ -20,6 +20,10 @@ inline ViewFactors factors_for_aspect(double aspect, bool edges = false) {
 // x and y travel in one atomic word, so a reader never sees the x of one window shape with the y of another; `edges` only moves the interface.
 inline std::atomic<uint64_t>& view_state() { static std::atomic<uint64_t> state{uint64_t(0x3F800000u) | uint64_t(0x3F800000u) << 32}; return state; }   // 1.0f | 1.0f << 32
 inline std::atomic<bool>& view_edges_state() { static std::atomic<bool> edges{false}; return edges; }
+// VR (headset or its desktop preview): the game's perspective is built with both view tangents scaled by this (its shape kept), so the game culls
+// to a frustum that covers the headset's eyes rather than its own picture. Each eye is reprojected from the world, so only the culled objects come
+// back; the pixels drawn stay the same. 1 (off) unless VR sets it. 2D is not touched (unlike the factors above).
+inline std::atomic<float>& vr_fov_scale() { static std::atomic<float> scale{1.f}; return scale; }
 inline void set_view_factors(ViewFactors factors) {
     uint32_t x, y; std::memcpy(&x, &factors.x, 4); std::memcpy(&y, &factors.y, 4);
     view_state().store(uint64_t(x) | uint64_t(y) << 32); view_edges_state().store(factors.edges);

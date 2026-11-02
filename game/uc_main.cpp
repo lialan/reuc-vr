@@ -481,6 +481,19 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     const std::unique_ptr<uc::XrCompositor> xr=options.headless ? nullptr : uc::make_android_xr();
     if(xr) std::fprintf(stderr,"[xr] headset output on\n");
 #endif
+    {   // VR (headset or UC_VR_PREVIEW): the game culls to a frustum that covers the eyes (wide_view.h vr_fov_scale; UC_VR_FOV_SCALE, 1 = off)
+        bool vr=!options.headless && std::getenv("UC_VR_PREVIEW") && std::string_view(std::getenv("UC_VR_PREVIEW"))=="1";
+#ifdef UC_OPENXR
+        vr=vr || xr!=nullptr;
+#endif
+        if(vr) {
+            float scale=1.6f;
+            if(const char* v=std::getenv("UC_VR_FOV_SCALE")) scale=float(std::atof(v));
+            if(!(scale>=1.f && scale<=4.f)) throw std::invalid_argument("UC_VR_FOV_SCALE must be 1..4");
+            gx::vr_fov_scale().store(scale);
+            std::fprintf(stderr,"[vr] game view widened %.2fx (culling covers the headset's eyes)\n",scale);
+        }
+    }
     double render_aspect=16.0/9;
     // Native ultrawide (renderer/ultrawide.h): the packets are scaled for the shape of the output, whatever shape the EFB was created in.
     int view_width=0,view_height=0;   // the last output size the factors were made for (a change of the interface position remakes them)

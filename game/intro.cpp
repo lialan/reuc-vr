@@ -2,6 +2,7 @@
 #include "dispatch.h"
 #include "gx_vertices.h"
 #include "wide_view.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -56,6 +57,12 @@ void hle_MTXPerspective(ppc::Ctx& c) {
                 aspect*=ky;
             }
             c.f[1]=fov; c.f[2]=aspect;
+        }
+        const float vr=gx::vr_fov_scale().load(std::memory_order_relaxed);
+        fov=float(c.f[1]);
+        if(vr>1.f && std::isfinite(fov) && fov>0 && fov<180) {   // VR: both tangents grow (the aspect stays), culling covers the headset's view
+            const double tangent=std::tan(double(fov)*3.14159265358979323846/360.0)*vr;
+            c.f[1]=std::min(170.0,std::atan(tangent)*360.0/3.14159265358979323846);
         }
     }
     uc::call_indirect(c,0x80265468);
