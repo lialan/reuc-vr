@@ -28,6 +28,7 @@
 #include "scene_lights.h"
 #include "shadow_map.h"
 #include "shadow_math.h"
+#include "../xr/stereo_scene.hpp"
 #include "upscale_mode.h"
 #include "upscaler.h"
 #ifdef _WIN32
@@ -263,6 +264,13 @@ private:
     void collect();
     SDL_Window* window_ = nullptr;
     class XrCompositor* xr_ = nullptr;   // not owned
+    // The desktop stereo preview (UC_VR_PREVIEW=1, no headset): the headset's stereo path (multiview, HOTD4's per-draw reprojection) with
+    // fixed Quest 3 eyes, both eyes side by side in the window and in captures. stereo_: the scene the draws are reprojected with, the
+    // headset's or the preview's.
+    std::unique_ptr<xr::StereoScene> preview_;
+    xr::StereoScene* stereo_ = nullptr;
+    bool preview_frame_open_ = false, preview_lens_seen_ = false;
+    void preview_publish();
     bool xr_frame_ = false;   // this presented frame draws into the headset (begin_frame() said so)
     uint32_t layers_ = 1;     // 2 with the headset: the EFB, its copies and the presented picture hold one layer per eye (multiview)
     bool world_drawn_ = false;   // this frame drew the world already: full-screen 2D after it fills the eye (HOTD4's FILL), before it is the HUD screen

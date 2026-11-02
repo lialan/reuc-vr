@@ -14,6 +14,7 @@
 #include "xr_overlay.h"
 #include <functional>
 #include "gx_transforms.h"
+#include "gl_clip.h"
 #include <vulkan/vulkan.h>
 #ifdef __ANDROID__
 #include <jni.h>
@@ -40,9 +41,6 @@ struct XrConfig {
     std::function<void()> restart;    // the panel's "Reset game" (the activity's restartGame)
 };
 void xr_check(XrResult result, const char* what);
-// GL-convention column-major clip transform (HOTD4's matrices) from this renderer's Vulkan-ready row-major projection (gx::make_projection):
-// the Y row's sign back and the depth range 0..w back to -w..w.
-xr::Matrix gl_from_vulkan(const gx::Projection& projection);
 
 class XrCompositor {
 public:

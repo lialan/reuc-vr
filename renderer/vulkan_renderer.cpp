@@ -7,6 +7,7 @@
 #ifdef UC_OPENXR
 #include "xr_compositor.h"
 #endif
+#include "gl_clip.h"
 #include "late_aim.h"
 #include "texture_replacement.h"
 #include "post_effects.h"
@@ -77,6 +78,28 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanRenderer::debug(VkDebugUtilsMessageSeverity
 VulkanRenderer::~VulkanRenderer() {
     try { shutdown(); } catch (const std::exception& error) { std::fprintf(stderr, "Vulkan shutdown failed: %s\n", error.what()); }
 }
+// The stereo preview's stand-in for xrLocateViews: a head at the anchor (HOTD4 anchors the camera on the head), eyes 63 mm apart, each with a
+// Quest 3-like asymmetric field of view (wider towards its own side), in the compositor's tangent order (left, right, down, up). UC_VR_YAW and
+// UC_VR_PITCH (degrees, left and up positive) turn the head, to look past the game's own frustum.
+void VulkanRenderer::preview_publish() {
+    static const float yaw = std::getenv("UC_VR_YAW") ? float(std::atof(std::getenv("UC_VR_YAW"))) * .017453292f : 0.f;
+    static const float pitch = std::getenv("UC_VR_PITCH") ? float(std::atof(std::getenv("UC_VR_PITCH"))) * .017453292f : 0.f;
+    const float cy = std::cos(yaw / 2), sy = std::sin(yaw / 2), cp = std::cos(pitch / 2), sp = std::sin(pitch / 2);
+    const std::array<float, 4> head{cy * sp, sy * cp, -sy * sp, cy * cp};   // yaw about Y, then pitch about the turned X (x, y, z, w)
+    constexpr float kHalfIpd = .0315f;
+    const float outer = std::tan(52.f * .017453292f), inner = std::tan(41.f * .017453292f), down = std::tan(50.f * .017453292f), up = std::tan(42.f * .017453292f);
+    std::array<xr::StereoPose, 2> eyes;
+    for (int eye = 0; eye < 2; ++eye) {
+        const float offset[3] = {eye ? kHalfIpd : -kHalfIpd, 0, 0};
+        float turned[3];
+        lg_stereo_rotate(head.data(), offset, turned);
+        eyes[eye].orientation = head;
+        eyes[eye].position = {turned[0], turned[1], turned[2]};
+        eyes[eye].tangents = eye ? std::array<float, 4>{inner, outer, down, up} : std::array<float, 4>{outer, inner, down, up};
+    }
+    preview_->publish(eyes);
+}
+
 void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::filesystem::path& shaders, double render_scale, double render_aspect, bool exclusive_fullscreen) {
     if (instance_) throw std::logic_error("renderer already initialized");
     owner_ = std::this_thread::get_id(); window_ = window;
@@ -85,7 +108,18 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (!window) throw std::invalid_argument("Vulkan requires an SDL window");
     uint32_t version = 0; vk_check(vkEnumerateInstanceVersion(&version), "vkEnumerateInstanceVersion");
     if (version < VK_API_VERSION_1_3) throw std::runtime_error("Vulkan 1.3 loader required");
-    layers_ = xr_ ? 2 : 1;   // the headset: both eyes in every pass (multiview)
+    if (const char* v = std::getenv("UC_VR_PREVIEW"); !xr_ && v && *v == '1') {
+        // The headset's stereo on the desktop: HOTD4's defaults (1 game unit per metre, the screen plane 3 m ahead; UC_VR_SCALE overrides
+        // the scale) and the screen lens the compositor starts from, before a frame shows the game's own.
+        xr::StereoSettings settings;
+        if (const char* s = std::getenv("UC_VR_SCALE")) settings.scale = float(std::atof(s));
+        if (!(settings.scale > 0)) throw std::invalid_argument("UC_VR_SCALE must be positive");
+        preview_ = std::make_unique<xr::StereoScene>(settings);
+        preview_->set_screen_lens({1.7320508f / (16.f / 9), 1.7320508f});
+        stereo_ = preview_.get();
+        std::fprintf(stderr, "[vr-preview] stereo preview: scale %.3f game units per metre, eyes side by side\n", settings.scale);
+    }
+    layers_ = (xr_ || preview_) ? 2 : 1;   // the headset (or its preview): both eyes in every pass (multiview)
     std::vector<const char*> extensions;
     if (!xr_) {   // the headset needs no window surface: OpenXR adds what it needs to the instance
         Uint32 count = 0; const char* const* required = SDL_Vulkan_GetInstanceExtensions(&count);
@@ -267,7 +301,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     std::vector<const char*> device_extensions;
     if (!xr_) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);   // the headset's swapchain is the runtime's
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    if (xr_) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
+    if (layers_ > 1) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
     if(chosen_maintenance)device_extensions.push_back(chosen_maintenance);
     {   // FidelityFX resolves these entry points by their extension names, including after a live switch.
         uint32_t n = 0; vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
@@ -294,7 +328,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         vkGetPhysicalDeviceFeatures2(physical_, &query);
         VkPhysicalDeviceFeatures core_features{}; vkGetPhysicalDeviceFeatures(physical_, &core_features);
         // The headset has no effects path (HOTD4 has none).
-        if (!xr_ && unused.dynamicRenderingUnusedAttachments && core_features.independentBlend) { device_extensions.push_back(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME); unused.pNext = features13.pNext; features13.pNext = &unused; motion_outputs_ = true; }
+        if (layers_ == 1 && unused.dynamicRenderingUnusedAttachments && core_features.independentBlend) { device_extensions.push_back(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME); unused.pNext = features13.pNext; features13.pNext = &unused; motion_outputs_ = true; }
         else { std::fprintf(stderr, "Upscaling unavailable: VK_EXT_dynamic_rendering_unused_attachments or independentBlend missing\n"); upscaler_kind_ = UpscalerKind::off; frame_generation_ = false; }
     }
     // Ray tracing (ray query in compute/fragment shaders): all of it or none, so a GPU without it still creates the device.
@@ -383,6 +417,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
 #ifdef UC_OPENXR
     if (xr_) {   // the headset: the session and its swapchain; the game's picture keeps its own size (the screen plane scales it)
         xr_->attach(instance_, physical_, device, family_, shaders_);
+        stereo_ = &xr_->scene();
         const auto picture=manual_render_extent(configured_scale_,render_aspect_);
         resize(picture.width, picture.height);
     } else
@@ -1007,14 +1042,20 @@ RenderPixels VulkanRenderer::capture(uint64_t serial, bool efb) {
         if (slot.submitted && slot.serial == serial && (efb || slot.copied)) {
             vk_check(vkGetFenceStatus(device, slot.fence), "capture requires completed frame");
             collect();
-            const auto size=efb ? efb_extent_ : extent_;
+            const auto eye_size=efb ? efb_extent_ : extent_;
+            const uint32_t eyes=layers_;   // stereo: both eyes side by side, the left eye's layer first
+            const VkExtent2D size{eye_size.width*eyes,eye_size.height};
             const VkDeviceSize bytes=VkDeviceSize(size.width)*size.height*4;
             if(slot.pixels.size!=bytes) { destroy_buffer(slot.pixels); slot.pixels=make_buffer(bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT); }
             vk_check(vkResetCommandBuffer(slot.command, 0), "reset capture command");
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vk_check(vkBeginCommandBuffer(slot.command, &begin), "begin capture");
-            VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {size.width, size.height, 1};
-            vkCmdCopyImageToBuffer(slot.command, efb ? efb_ : slot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.pixels.buffer, 1, &copy);
+            VkBufferImageCopy copies[2]{};
+            for (uint32_t eye=0; eye<eyes; ++eye) {
+                auto& copy=copies[eye]; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, eye, 1}; copy.imageExtent = {eye_size.width, eye_size.height, 1};
+                copy.bufferOffset=VkDeviceSize(eye_size.width)*eye*4; copy.bufferRowLength=size.width;
+            }
+            vkCmdCopyImageToBuffer(slot.command, efb ? efb_ : slot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.pixels.buffer, eyes, copies);
             VkBufferMemoryBarrier2 host_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2}; host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT; host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
             host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; host_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT; host_barrier.srcQueueFamilyIndex = host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             host_barrier.buffer = slot.pixels.buffer; host_barrier.size = VK_WHOLE_SIZE;
@@ -2014,6 +2055,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
 #ifdef UC_OPENXR
                 if (xr_) xr_->observe(draw.transforms->projection);   // HOTD4's lens tally: the screen plane matches the game's field of view
 #endif
+                if (preview_) { preview_->observe(gl_from_vulkan(draw.transforms->projection), LG_STEREO_WORLD); preview_lens_seen_ = true; }
                 // The map uses last frame's dominant light (stable by its hysteresis), so the casters can be drawn as the scene packets arrive.
                 if (effects_.shadows!=EffectLevel::off && dominant_light_ && dominant_light_->kind==gx::LightKind::directional)
                     shadow_fit_=fit_shadow(*frame_projection_,*dominant_light_,kShadowDistance,shadow_preset(effects_.shadows).resolution);
@@ -2160,7 +2202,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (display && !xr_->frame_open()) { xr_frame_ = xr_->begin_frame(); world_drawn_ = false; }
     } else
 #endif
-    if (packet.present && display && !hold) {
+    {
+        if (preview_ && display && !preview_frame_open_) { preview_publish(); preview_frame_open_ = true; world_drawn_ = false; }   // as the headset's frame opens
+    }
+    if (!xr_ && packet.present && display && !hold) {
         const bool legacy_retirement=!present_fences_ && !retired_.empty();
         if(legacy_retirement && !retirement_acquired_) {
             VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -2362,8 +2407,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     push.effects|=kEffectRtMaterial|(records[draw_record[d]-first_record].flags&kRtModelValid ? kEffectRtModelValid : 0u);
                 }
             }
-#ifdef UC_OPENXR
-            if (layers_>1 && xr_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
+            if (layers_>1 && stereo_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
                 bool texture_view=false;
                 for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
                 const double sx=double(target.extent.width)/640, sy=double(target.extent.height)/480;
@@ -2376,7 +2420,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 facts.offscreen=copy_target && !packet.present; facts.multiview=1; facts.fills_screen=covers && world_drawn_;
                 const int kind=lg_stereo_classify_draw(&facts);
                 if (kind==LG_STEREO_WORLD && facts.perspective) world_drawn_=true;
-                const auto& matrices=xr_->scene().transforms(gl_from_vulkan(draw.transforms->projection),kind);
+                const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
                 float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*kStereoBlockBytes);
                 for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
                     const float* m=matrices.view_projection[eye];
@@ -2387,7 +2431,6 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 push.motion=uint32_t(d);
             }
-#endif
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
             vkCmdDrawIndexed(slot.command, info.index_count, 1, info.first_index, info.first_vertex, 0);
             const auto depth=draw.uniforms->pixel[1]&31;
@@ -2646,6 +2689,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             barrier(slot.command, present_image->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
             VkImageBlit blit{}; blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.srcOffsets[1] = blit.dstOffsets[1] = {int32_t(extent_.width), int32_t(extent_.height), 1};
+            if (preview_) {   // the stereo preview: the left eye's layer on the window's left half, the right eye's on the right half
+                VkImageBlit eyes[2]{blit, blit};
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    eyes[eye].srcSubresource.baseArrayLayer = eye;
+                    eyes[eye].dstOffsets[0] = {int32_t(extent_.width * eye / 2), 0, 0};
+                    eyes[eye].dstOffsets[1] = {int32_t(extent_.width * (eye + 1) / 2), int32_t(extent_.height), 1};
+                }
+                vkCmdBlitImage(slot.command, slot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, present_image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, eyes, VK_FILTER_LINEAR);
+            } else
             vkCmdBlitImage(slot.command, slot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, present_image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
             barrier(slot.command, present_image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,present_layout,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT);
@@ -2677,6 +2729,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
 #ifdef UC_OPENXR
     if (xr_ && packet.present && display && xr_->frame_open()) { xr_->end_frame(xr_frame_); if (xr_frame_) ++presentations_; xr_frame_ = false; }
 #endif
+    if (preview_ && packet.present && display && preview_frame_open_) {   // as the headset's frame ends: the frame's most-used lens sizes the screen
+        if (preview_lens_seen_) preview_->finish_frame();
+        preview_lens_seen_ = false; preview_frame_open_ = false;
+    }
     if (!present_image) return true;
     VkSwapchainPresentFenceInfoKHR present_fence{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR}; present_fence.swapchainCount = 1; present_fence.pFences = &present_image->fence;
     // With DLSS-G Streamline presents (and paces) the frames itself and never signals a present fence: its swapchain images are not tracked here.

@@ -222,16 +222,20 @@ add_library(uc_vulkan STATIC vulkan_renderer.cpp png.cpp prompt_overlay.cpp menu
 if(ANDROID)
   target_sources(uc_vulkan PRIVATE vulkan_android_entry.cpp)
 endif()
-# The headset output (HOTD4 VR's OpenXR host and camera policy): with the Khronos OpenXR loader (UC_OPENXR_DIR, the unpacked AAR).
+# HOTD4 VR's camera policy (StereoScene and its projection math): no OpenXR, so the desktop stereo preview (UC_VR_PREVIEW) uses it too.
+add_library(uc_stereo STATIC ${PROJECT_SOURCE_DIR}/xr/stereo_projection.c ${PROJECT_SOURCE_DIR}/xr/stereo_scene.cpp)
+target_include_directories(uc_stereo PUBLIC ${PROJECT_SOURCE_DIR}/xr)
+target_link_libraries(uc_vulkan PUBLIC uc_stereo)
+# The headset output (HOTD4 VR's OpenXR host): with the Khronos OpenXR loader (UC_OPENXR_DIR, the unpacked AAR).
 if(UC_OPENXR)
   set(OpenXR_DIR ${UC_OPENXR_DIR})   # a <Package>_DIR is used as it is: the NDK toolchain limits searches to its sysroot
   find_package(OpenXR REQUIRED CONFIG)
-  add_library(uc_xr STATIC ${PROJECT_SOURCE_DIR}/xr/stereo_projection.c ${PROJECT_SOURCE_DIR}/xr/stereo_scene.cpp ${PROJECT_SOURCE_DIR}/xr/xr_actions.c
+  add_library(uc_xr STATIC ${PROJECT_SOURCE_DIR}/xr/xr_actions.c
     ${PROJECT_SOURCE_DIR}/xr/xr_controls.c ${PROJECT_SOURCE_DIR}/xr/xr_menu.c ${PROJECT_SOURCE_DIR}/xr/xr_panel.c ${PROJECT_SOURCE_DIR}/xr/xr_settings.c
     ${PROJECT_SOURCE_DIR}/xr/xr_overlay_geometry.c ${PROJECT_SOURCE_DIR}/xr/display_cadence.c ${PROJECT_SOURCE_DIR}/xr/host_stats.c
     ${PROJECT_SOURCE_DIR}/xr/controller_input.cpp ${PROJECT_SOURCE_DIR}/xr/settings_panel.cpp xr_compositor.cpp xr_overlay.cpp)
   target_include_directories(uc_xr PUBLIC ${PROJECT_SOURCE_DIR}/xr ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(uc_xr PUBLIC OpenXR::openxr_loader Vulkan::Vulkan uc_gx)
+  target_link_libraries(uc_xr PUBLIC OpenXR::openxr_loader Vulkan::Vulkan uc_gx uc_stereo)
   target_link_libraries(uc_vulkan PUBLIC uc_xr)
   target_compile_definitions(uc_vulkan PUBLIC UC_OPENXR=1)
 endif()

@@ -44,16 +44,6 @@ void xr_time(int what, std::chrono::steady_clock::time_point a, std::chrono::ste
 void xr_check(XrResult result, const char* what) {
     if (XR_FAILED(result)) throw std::runtime_error(std::string(what) + " failed (OpenXR " + std::to_string(result) + ")");
 }
-xr::Matrix gl_from_vulkan(const gx::Projection& r) {
-    xr::Matrix m{};
-    for (int c = 0; c < 4; ++c) {
-        m[c * 4 + 0] = r[0][c];
-        m[c * 4 + 1] = -r[1][c];
-        m[c * 4 + 2] = 2 * r[2][c] - r[3][c];
-        m[c * 4 + 3] = r[3][c];
-    }
-    return m;
-}
 
 namespace {
 xr::ControllerSettings controller_settings(const LgXrSettings& s) {
@@ -432,7 +422,7 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         b.srcStageMask = src; b.srcAccessMask = src_access; b.dstStageMask = dst; b.dstAccessMask = dst_access;
         b.oldLayout = from; b.newLayout = to; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = picture; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.image = picture; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};   // both eyes' layers: the right eye's was sampled in TRANSFER_SRC
         VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.imageMemoryBarrierCount = 1; dependency.pImageMemoryBarriers = &b;
         vkCmdPipelineBarrier2(command, &dependency);
     };
