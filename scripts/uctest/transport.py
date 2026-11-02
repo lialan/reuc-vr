@@ -19,6 +19,17 @@ class PipeTransport:
             self._cmd = self._connect(base + "-cmd.sock", "wb", deadline, alive)
             self._evt = self._connect(base + "-evt.sock", "rb", deadline, alive)
 
+    @classmethod
+    def tcp(cls, name, port, connect_seconds=180.0):
+        """The channels of a game on the Quest, forwarded by adb (adb forward tcp:PORT localabstract:uc-test-NAME-cmd, PORT+1 the events)."""
+        self = cls.__new__(cls)
+        self.name = name
+        self._cmd = socket.create_connection(("127.0.0.1", port), timeout=connect_seconds).makefile("wb", buffering=0)
+        events = socket.create_connection(("127.0.0.1", port + 1), timeout=connect_seconds)
+        events.settimeout(None)
+        self._evt = events.makefile("rb", buffering=0)
+        return self
+
     def _open(self, path, mode, deadline, alive):
         while True:
             try:
@@ -47,7 +58,7 @@ class PipeTransport:
     def read_line(self):
         try:
             data = self._evt.readline()
-        except OSError:
+        except (OSError, ValueError):   # ValueError: the channel was closed under the reader at shutdown
             return None
         return data.decode("utf-8").rstrip("\r\n") if data else None
 

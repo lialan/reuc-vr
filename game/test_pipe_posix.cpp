@@ -4,6 +4,7 @@
 #include "test_pipe.h"
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,11 @@ namespace uc {
 namespace {
 constexpr size_t kMaxLine = 4096, kMaxOut = 4096;
 std::string socket_path(const std::string& name, const char* suffix) {
+#ifdef __ANDROID__
+    // The abstract namespace (a leading NUL): reachable from the host with adb forward localabstract:uc-test-<name>-cmd (scripts/uctest --quest);
+    // an app's own folder is not reachable by adbd.
+    return std::string(1, '\0') + "uc-test-" + name + suffix;
+#endif
     const char* dir = std::getenv("TMPDIR");
     std::string path = dir && *dir ? dir : "/tmp";
     if (path.back() != '/') path += '/';
@@ -28,9 +34,11 @@ int listen_at(const std::string& path) {
     const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) throw std::runtime_error("cannot create test socket");
     address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    unlink(path.c_str());   // a socket file left by a crashed run
-    if (bind(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || listen(fd, 1) != 0) {
+    std::memcpy(address.sun_path, path.data(), path.size());
+    const bool abstract = !path.empty() && path[0] == '\0';
+    if (!abstract) { address.sun_path[path.size()] = 0; unlink(path.c_str()); }   // a socket file left by a crashed run
+    const socklen_t length = abstract ? socklen_t(offsetof(sockaddr_un, sun_path) + path.size()) : socklen_t(sizeof(address));
+    if (bind(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0 || listen(fd, 1) != 0) {
         close(fd);
         throw std::runtime_error("test socket already in use: " + path);
     }

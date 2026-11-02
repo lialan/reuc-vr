@@ -7,6 +7,7 @@ import sys
 import time
 
 from .client import CHECKPOINTS, GUEST_CPU, Game, StepFailed, resolve_saves
+from .transport import PipeTransport
 from .scenarios import SCENARIO_MOD_SETTINGS, SCENARIO_MODS, SCENARIO_PREPARE, SCENARIOS
 
 
@@ -14,6 +15,8 @@ def run_once(name, args):
     skipped = SCENARIO_PREPARE.get(name, lambda: None)()
     if skipped:
         return {"scenario": name, "ok": True, "seconds": 0, "result": {"skipped": skipped}}, "(skipped)"
+    if getattr(args, "quest", False):
+        return run_on_quest(name, args)
     g = Game(**({"exe": args.exe} if args.exe else {}), speed=args.speed, god=args.god, skip_tutorials=args.skip_tutorials or name == "fight", saves=resolve_saves(args.saves_from), game_args=args.game_arg,
              mods=SCENARIO_MODS.get(name, False), mod_settings=SCENARIO_MOD_SETTINGS.get(name))
     start = time.monotonic()
@@ -35,6 +38,54 @@ def run_once(name, args):
     return report, g.run_dir
 
 
+QUEST_SERIAL = "2G97C5ZJ0G02DQ"
+QUEST_PORT = 47610
+
+
+def run_on_quest(name, args):
+    """The scenario against the Quest app (scripts/quest/run.py --interactive, test server on abstract sockets, adb forward). Run it under
+    quest3-lock: the headset is shared."""
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    run_dir = root / "build-android" / "quest-runs" / f"uctest-{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    adb = ["adb", "-s", QUEST_SERIAL]
+    game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", "1800", "--speed", str(args.speed)] + list(args.game_arg)
+    runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")]
+                              + [f"--arg={a}" for a in game_args], stdout=open(run_dir / "runner.log", "wb"), stderr=subprocess.STDOUT)
+    try:
+        deadline = time.monotonic() + 300
+        while b"uc-test-quest-cmd" not in subprocess.run(adb + ["shell", "cat /proc/net/unix"], capture_output=True).stdout:
+            if time.monotonic() > deadline or runner.poll() is not None:
+                raise SystemExit(f"the Quest app did not open its test server (see {run_dir})")
+            time.sleep(2)
+        for offset, channel in ((0, "cmd"), (1, "evt")):
+            subprocess.run(adb + ["forward", f"tcp:{QUEST_PORT + offset}", f"localabstract:uc-test-quest-{channel}"], check=True)
+        g = Game(run_dir=run_dir / "harness", speed=args.speed, god=args.god, launch=False,
+                 transport_factory=lambda: PipeTransport.tcp("quest", QUEST_PORT))
+        start = time.monotonic()
+        report = {"scenario": name, "ok": False, "speed": args.speed, "quest": True}
+        try:
+            with g:
+                report["result"] = SCENARIOS[name](g, args)
+            report["ok"] = True
+        except StepFailed as error:
+            report["error"] = str(error)
+        report["seconds"] = round(time.monotonic() - start, 1)
+        report["steps"] = g.steps
+        (run_dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
+        return report, run_dir
+    finally:
+        (run_dir / "app").mkdir(parents=True, exist_ok=True)
+        (run_dir / "app" / "STOP").write_text("")
+        try:
+            runner.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            runner.kill()
+        subprocess.run(adb + ["forward", "--remove-all"], capture_output=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="uctest")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -42,6 +93,7 @@ def main(argv=None):
     run = sub.add_parser("run")
     run.add_argument("scenario", choices=sorted(SCENARIOS))
     run.add_argument("--speed", type=int, default=1, choices=range(1, 33), metavar="1..32")
+    run.add_argument("--quest", action="store_true", help="run on the Quest 3 app over adb (scripts/quest/run.py; hold quest3-lock)")
     run.add_argument("--measure", type=float, default=0, help="seconds of FPS measurement (perf)")
     run.add_argument("--exe", help="game executable to launch instead of dist/uc.exe (e.g. an instrumented build staged next to dist/data)")
     run.add_argument("--repeat", type=int, default=1)
