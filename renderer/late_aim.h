@@ -37,8 +37,8 @@ inline bool reticle_texture(const TexturePixels& texture) {
     const uint32_t edge = reticle_edge(texture);
     return edge == 100 || edge == 120 || edge == 154 || edge == 178 || edge == 200;   // 178: the red halo of the empty-magazine / reload state; 200: the four red arrows of the held A+B / grab prompt
 }
-// Centre of the draw's screen-space bounding box in Vulkan NDC (x right, y down, like aim units); the harness's draw summary negates y.
-inline std::optional<std::array<float,2>> draw_center_ndc(const DrawPacket& draw) {
+// The draw's screen-space bounding box in Vulkan NDC of its viewport (x0, y0, x1, y1; x right, y down); nullopt with no vertex in front of the camera.
+inline std::optional<std::array<float,4>> draw_bounds_ndc(const DrawPacket& draw) {
     const auto& t = draw.transforms;
     const bool indexed = draw.state->descriptors[0] != Mode::none;
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; bool any = false;
@@ -54,7 +54,12 @@ inline std::optional<std::array<float,2>> draw_center_ndc(const DrawPacket& draw
         x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y); any = true;
     }
     if (!any) return std::nullopt;
-    return std::array<float,2>{(x0 + x1) / 2, (y0 + y1) / 2};
+    return std::array<float,4>{x0, y0, x1, y1};
+}
+// Centre of the draw's screen-space bounding box in Vulkan NDC (x right, y down, like aim units); the harness's draw summary negates y.
+inline std::optional<std::array<float,2>> draw_center_ndc(const DrawPacket& draw) {
+    if (const auto box = draw_bounds_ndc(draw)) return std::array<float,2>{((*box)[0] + (*box)[2]) / 2, ((*box)[1] + (*box)[3]) / 2};
+    return std::nullopt;
 }
 // The wake the game draws behind each reticle (a strip of its recent positions, in the player's tint): it follows the reticle when that is shifted.
 inline bool reticle_tail_callsite(uint32_t callsite) { return callsite == 0x8006CED4; }

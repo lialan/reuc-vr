@@ -16,7 +16,13 @@ namespace uc {
 std::unique_ptr<XrCompositor> make_android_xr() {
     if (const char* v = std::getenv("UC_XR"); v && *v == '0') return nullptr;
     LgXrSettings settings = LG_XR_SETTINGS_DEFAULT;
+    // The game's size of a metre, as HOTD4's android_main sets it for its games (Let's Go Jungle: decimetres): Umbrella Chronicles' world is in
+    // decimetres too (the camera's eye is 15 units above the floor, scripts/uctest camera_api), so 10 units per metre.
+    setenv("LINDBERGH_XR_SCALE", "10", 0);
     xr_settings_load(&settings);
+    // A vr.cfg the panel saved before this default holds HOTD4's 1 (metres): that meant "the default", which is now 10 (as xr_settings_load
+    // treats the old 2064x2280 eye size).
+    if (settings.scale == 1.0f) settings.scale = 10.0f;
     XrConfig config;
     config.width = uint32_t(settings.width); config.height = uint32_t(settings.resolution);   // HOTD4: resolution is the eye height
     config.refresh = float(settings.refresh);

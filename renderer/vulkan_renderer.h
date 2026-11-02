@@ -270,6 +270,7 @@ private:
     std::unique_ptr<xr::StereoScene> preview_;
     xr::StereoScene* stereo_ = nullptr;
     bool preview_frame_open_ = false, preview_lens_seen_ = false;
+    uint64_t preview_world_frames_ = 0;   // frames that drew the world (UC_VR_CLASSIFY_DUMP picks one)
     void preview_publish();
     bool xr_frame_ = false;   // this presented frame draws into the headset (begin_frame() said so)
     uint32_t layers_ = 1;     // 2 with the headset: the EFB, its copies and the presented picture hold one layer per eye (multiview)

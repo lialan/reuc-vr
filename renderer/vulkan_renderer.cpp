@@ -109,9 +109,10 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     uint32_t version = 0; vk_check(vkEnumerateInstanceVersion(&version), "vkEnumerateInstanceVersion");
     if (version < VK_API_VERSION_1_3) throw std::runtime_error("Vulkan 1.3 loader required");
     if (const char* v = std::getenv("UC_VR_PREVIEW"); !xr_ && v && *v == '1') {
-        // The headset's stereo on the desktop: HOTD4's defaults (1 game unit per metre, the screen plane 3 m ahead; UC_VR_SCALE overrides
-        // the scale) and the screen lens the compositor starts from, before a frame shows the game's own.
+        // The headset's stereo on the desktop: the headset's defaults (10 game units per metre as xr_android.cpp sets for this game, the
+        // screen plane 3 m ahead; UC_VR_SCALE overrides the scale) and the screen lens the compositor starts from, before a frame shows the game's own.
         xr::StereoSettings settings;
+        settings.scale = 10;
         if (const char* s = std::getenv("UC_VR_SCALE")) settings.scale = float(std::atof(s));
         if (!(settings.scale > 0)) throw std::invalid_argument("UC_VR_SCALE must be positive");
         preview_ = std::make_unique<xr::StereoScene>(settings);
@@ -2410,16 +2411,58 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (layers_>1 && stereo_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
                 bool texture_view=false;
                 for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
-                const double sx=double(target.extent.width)/640, sy=double(target.extent.height)/480;
-                const double vx0=std::min(draw_viewport.x,draw_viewport.x+draw_viewport.width), vx1=std::max(draw_viewport.x,draw_viewport.x+draw_viewport.width);
-                const double vy0=std::min(draw_viewport.y,draw_viewport.y+draw_viewport.height), vy1=std::max(draw_viewport.y,draw_viewport.y+draw_viewport.height);
-                const auto& source=packet.display_source;
-                const bool covers=vx0<=source[0]*sx+1 && vy0<=source[1]*sy+1 && vx1>=(source[0]+source[2])*sx-1 && vy1>=(source[1]+source[3])*sy-1;
+                const auto& source=packet.display_source;   // diagnostics only
                 LgStereoDrawFacts facts{};
-                facts.perspective=draw.transforms->projection[3][3]==0; facts.texture_view=texture_view;   // as ultrawide.h tells perspective from ortho facts.covers_viewport=covers;
-                facts.offscreen=copy_target && !packet.present; facts.multiview=1; facts.fills_screen=covers && world_drawn_;
-                const int kind=lg_stereo_classify_draw(&facts);
+                facts.perspective=draw.transforms->projection[3][3]==0; facts.texture_view=texture_view;   // as ultrawide.h tells perspective from ortho
+                // HOTD4 (vulkan_guest.cpp): a 2D draw covers / fills the screen by its geometry's clip-space box (+-0.95 / +-0.98 of its
+                // viewport), not by its viewport, which here is the whole scene for every draw, HUD text included.
+                facts.covers_viewport=1;
+                if (!facts.perspective) if (const auto box=gx::draw_bounds_ndc(draw)) {
+                    const auto& b=*box;
+                    facts.covers_viewport=b[0]<=-.95f && b[1]<=-.95f && b[2]>=.95f && b[3]>=.95f;
+                    facts.fills_screen=b[0]<=-.98f && b[1]<=-.98f && b[2]>=.98f && b[3]>=.98f;
+                }
+                // HOTD4's "offscreen" is a target that is not eye-sized. Here every pass draws into the EFB, which holds both eyes, and its
+                // copies are per eye: the scene's packets (copied whole, 640x360, or at half size, 320x180) are eye renders. Only a small
+                // perspective copy (a render-to-texture picture) keeps the game's camera; 2D passes over copies (the game's own post chain)
+                // keep identity in each eye.
+                const bool small_copy=copy_target && packet.texture_copy->source[2]<300;
+                facts.offscreen=copy_target && !packet.present && (!facts.perspective || small_copy);
+                facts.multiview=1;
+                int kind=lg_stereo_classify_draw(&facts);
+                if (kind==LG_STEREO_FILL && !world_drawn_) kind=LG_STEREO_HUD;   // HOTD4: full-screen 2D with no world yet is a 2D screen (menus); over a world, a fade
                 if (kind==LG_STEREO_WORLD && facts.perspective) world_drawn_=true;
+                static const bool class_stats=std::getenv("UC_VR_CLASS_STATS")!=nullptr;
+                if (class_stats) {   // diagnostics: per second, how many draws went to each stereo class (and the 2D draws by packet kind)
+                    static uint64_t counts[4][2][2]{}; static auto since=std::chrono::steady_clock::now();
+                    ++counts[kind&3][facts.perspective][texture_view];
+                    static std::map<std::string,uint64_t> huds;
+                    {
+                        static const char* kNames[]={"world","hud","pass","fill"};
+                        std::array<uint32_t,4> copy_source{};
+                        if (packet.texture_copy) copy_source=packet.texture_copy->source;
+                        char key[260]; std::snprintf(key,sizeof key,"%s persp=%d present=%d copy=%u,%u %ux%u tex=%d covers=%d viewport %.0f,%.0f %.0fx%.0f source %d,%d %dx%d target %ux%u",kNames[kind&3],int(facts.perspective),int(packet.present),
+                            copy_source[0],copy_source[1],copy_source[2],copy_source[3],int(texture_view),int(facts.covers_viewport),
+                            draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height,int(source[0]),int(source[1]),int(source[2]),int(source[3]),target.extent.width,target.extent.height);
+                        ++huds[key];
+                    }
+                    if (std::chrono::steady_clock::now()-since>std::chrono::seconds(1)) {
+                        std::fprintf(stderr,"[vr-class-sec] world p=%llu o=%llu otex=%llu | hud p=%llu o=%llu otex=%llu | pass %llu | fill %llu\n",
+                            (unsigned long long)(counts[0][1][0]+counts[0][1][1]),(unsigned long long)counts[0][0][0],(unsigned long long)counts[0][0][1],
+                            (unsigned long long)(counts[1][1][0]+counts[1][1][1]),(unsigned long long)counts[1][0][0],(unsigned long long)counts[1][0][1],
+                            (unsigned long long)(counts[2][0][0]+counts[2][0][1]+counts[2][1][0]+counts[2][1][1]),(unsigned long long)(counts[3][0][0]+counts[3][0][1]+counts[3][1][0]+counts[3][1][1]));
+                        for (const auto& [k,n]:huds) std::fprintf(stderr,"[vr-class-hud] %6llu %s\n",(unsigned long long)n,k.c_str());
+                        std::memset(counts,0,sizeof counts); huds.clear(); since=std::chrono::steady_clock::now();
+                    }
+                }
+                static const long dump_frame=std::getenv("UC_VR_CLASSIFY_DUMP") ? std::atol(std::getenv("UC_VR_CLASSIFY_DUMP")) : -1;
+                if (dump_frame>0 && preview_world_frames_==uint64_t(dump_frame)) {   // diagnostics (preview): the Nth frame after N-1 that drew the world, draw by draw
+                    static const char* kNames[]={"world","hud","pass","fill"};
+                    const auto& p=draw.transforms->projection;
+                    std::fprintf(stderr,"[vr-class] frame %llu packet present=%d copy=%d draw %zu: %s persp=%d texview=%d covers=%d world_drawn=%d offscreen=%d viewport %.0f,%.0f %.0fx%.0f target %ux%u source %d,%d %dx%d p00 %.3f p11 %.3f p03 %.3f p13 %.3f\n",
+                                 (unsigned long long)frame_index_,int(packet.present),int(bool(copy_target)),d,kind>=0&&kind<4?kNames[kind]:"?",int(facts.perspective),int(texture_view),int(facts.covers_viewport),int(world_drawn_),int(facts.offscreen),
+                                 draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height,target.extent.width,target.extent.height,int(source[0]),int(source[1]),int(source[2]),int(source[3]),p[0][0],p[1][1],p[0][3],p[1][3]);
+                }
                 const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
                 float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*kStereoBlockBytes);
                 for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
@@ -2731,6 +2774,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
 #endif
     if (preview_ && packet.present && display && preview_frame_open_) {   // as the headset's frame ends: the frame's most-used lens sizes the screen
         if (preview_lens_seen_) preview_->finish_frame();
+        if (world_drawn_) ++preview_world_frames_;
         preview_lens_seen_ = false; preview_frame_open_ = false;
     }
     if (!present_image) return true;
