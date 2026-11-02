@@ -110,7 +110,8 @@ float4 lightControl(float4 base, uint channel, uint control, float3 position, fl
 float4 shadeChannel(float4 base, uint channel, float3 position, float3 normal) {
     if(channel>=drawState.pixel.w) return float4(0.0);
     float4 color = lightControl(base,channel,drawState.channels[channel],position,normal);
-    color.a = lightControl(base,channel,drawState.channels[channel+2],position,normal).a;
+    if (drawState.channels[channel+2] != drawState.channels[channel])   // the same control word lights alpha exactly as the colour
+        color.a = lightControl(base,channel,drawState.channels[channel+2],position,normal).a;
     return color;
 }
 // GX regular texgen (XF 0x1040+n): source row, AB11/ABC1 input, ST/STQ through the texture matrix,
@@ -180,7 +181,9 @@ Output vertexMain(Input input) {
 #if defined(MOTION) || defined(UC_DIRECTX)
     output.rawColor0 = input.color; output.rawColor1 = input.color1; output.viewPosition = viewPosition.xyz; output.viewNormal = viewNormal;
 #endif
-    [unroll] for (uint id = 0; id < 8; ++id) output.texcoords[id] = generateTexcoord(id, input);
+    // Only the coordinates the TEV stages read (the renderer's mask in fog[1].y, bit 8 valid); the rest are never interpolated into use.
+    const uint coordMask = (drawState.fog[1].y & 0x100u) != 0 ? drawState.fog[1].y : 0xFFu;
+    [unroll] for (uint id = 0; id < 8; ++id) output.texcoords[id] = (coordMask & (1u << id)) != 0 ? generateTexcoord(id, input) : float3(0.0, 0.0, 1.0);
 #endif
 #ifdef UC_DIRECTX
     output.position.y = -output.position.y; // Direct3D's viewport maps positive clip Y upward.
@@ -217,6 +220,10 @@ float fogAmount(float depth) {
 }
 float3 applyFog(float3 color, float depth) {
     if(((drawState.fog[0].w>>21)&7u)==0) return color;
+#ifdef TEV_FAST
+    uint fogBits=drawState.fog[1].x;   // the headset: the blend in float (no 8-bit rounding of colour and amount)
+    return lerp(saturate(color),float3((fogBits>>16)&255u,(fogBits>>8)&255u,fogBits&255u)/255.0,fogAmount(depth));
+#endif
     int ifog=int(round(fogAmount(depth)*256.0));
     uint rgb=drawState.fog[1].x;
     int3 fogColor=int3((rgb>>16)&255u,(rgb>>8)&255u,rgb&255u);

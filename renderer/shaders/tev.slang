@@ -202,6 +202,18 @@ float tevInteger(float af, float bf, float cf, float df, uint env) {
     if (scaleMode == 1) value <<= 1; else if (scaleMode == 2) value <<= 2; else if (scaleMode == 3) value >>= 1;
     return float((value + 128) >> 8) / 255.0; // +128 after scaling: best Dolphin same-frame match (G21)
 }
+#ifdef TEV_FAST
+// The headset (TEV_FAST): the stage in float, d + lerp(a, b, c) with bias and scale, about 5 instructions a channel where the
+// hardware-integer emulation above takes about 30 (8-bit rounding of every input, the integer lerp, the rounded result). Inputs are
+// clamped instead of wrapped to their low 8 bits and the result is not rounded to 1/255 steps: at most a step of difference in
+// ordinary stages. The compare modes stay exact.
+float3 tevFloat(float3 a, float3 b, float3 c, float3 d, uint env) {
+    const float3 l = lerp(saturate(a), saturate(b), saturate(c));
+    const uint biasMode = (env >> 16) & 3, scaleMode = (env >> 20) & 3;
+    float3 value = d + (((env >> 18) & 1) != 0 ? -l : l) + (biasMode == 1 ? 128.0 / 255.0 : (biasMode == 2 ? -128.0 / 255.0 : 0.0));
+    return value * (scaleMode == 1 ? 2.0 : (scaleMode == 2 ? 4.0 : (scaleMode == 3 ? 0.5 : 1.0)));
+}
+#endif
 float3 combineColor(float3 a, float3 b, float3 c, float3 d, uint env) {
     float3 result;
     bool equal = ((env >> 18) & 1) != 0;
@@ -218,7 +230,11 @@ float3 combineColor(float3 a, float3 b, float3 c, float3 d, uint env) {
             result = d + ((equal ? qa == qb : qa > qb) ? c : float3(0.0));
         }
     } else {
+#ifdef TEV_FAST
+        result = tevFloat(a, b, c, d, env);
+#else
         result = float3(tevInteger(a.r, b.r, c.r, d.r, env), tevInteger(a.g, b.g, c.g, d.g, env), tevInteger(a.b, b.b, c.b, d.b, env));
+#endif
     }
     return ((env >> 19) & 1) != 0 ? clamp(result, 0.0, 1.0) : clamp(result, -4.0, 4.0);
 }
@@ -230,7 +246,13 @@ float combineAlpha(float a, float b, float c, float d, float3 colorA, float3 col
         uint qa = mode == 3 ? quantize(a) : packedCompare(colorA, mode);
         uint qb = mode == 3 ? quantize(b) : packedCompare(colorB, mode);
         result = d + ((equal ? qa == qb : qa > qb) ? c : 0.0);
-    } else result = tevInteger(a, b, c, d, env);
+    } else {
+#ifdef TEV_FAST
+        result = tevFloat(float3(a), float3(b), float3(c), float3(d), env).x;
+#else
+        result = tevInteger(a, b, c, d, env);
+#endif
+    }
     return ((env >> 19) & 1) != 0 ? clamp(result, 0.0, 1.0) : clamp(result, -4.0, 4.0);
 }
 float2 imageSize(uint id) {

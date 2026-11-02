@@ -2203,6 +2203,18 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 std::memcpy(uniform_at,&*packet.draws[i].uniforms,sizeof(gx::DrawUniform));
                 std::array<uint32_t,kTevWords> tev{}; std::copy(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,tev.begin());
                 std::memcpy(uniform_at+sizeof(gx::DrawUniform),tev.data(),sizeof tev);
+                // The texture coordinates the stages read (fog[5], a spare word; bit 8: valid): the vertex shader generates only those.
+                // Key words 1..: stage count, swap tables, then per stage colour/alpha env, order, konst; order bit 6 samples a texture
+                // at coordinate (order >> 3) & 7; an indirect stage also reads its indirect map's coordinate (IREF, indirect[9]).
+                const auto& key=gpu_draws[i].key; const auto& u=*packet.draws[i].uniforms;
+                uint32_t coords=key[1]==0 ? 1u : 0u;
+                for(uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) {
+                    const uint32_t order=key[5+4*stage];
+                    if(order&64) coords|=1u<<((order>>3)&7);
+                    if(u.ind_cmd[stage]) coords|=1u<<((u.indirect[9]>>((u.ind_cmd[stage]&3)*6+3))&7);
+                }
+                const uint32_t coord_word=coords|0x100u;
+                std::memcpy(uniform_at+offsetof(gx::DrawUniform,fog)+5*sizeof(uint32_t),&coord_word,sizeof coord_word);
             }
             VkDescriptorBufferInfo uniform{slot.uniforms.buffer,uniform_offset,kDrawUniformBytes};
             std::array<VkDescriptorImageInfo,8> samplers{};

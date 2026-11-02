@@ -51,6 +51,9 @@ foreach(family "" motion stereo)
     set(early_name smoke.${family}.early.frag.spv)
     string(TOUPPER ${family} early_upper)
     set(early_defs -D${early_upper})
+    if(family STREQUAL "stereo")
+      list(APPEND early_defs -DTEV_FAST)   # the headset's shaders: float TEV and fog
+    endif()
   endif()
   add_custom_command(OUTPUT ${shader_dir}/${early_name}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
@@ -185,7 +188,7 @@ foreach(stage vert frag uber)
   endif()
   add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.${stage}.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
-    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO ${stereo_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.${stage}.spv
+    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST ${stereo_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.${stage}.spv
     DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 endforeach()
 # The headset's screen pass (xr_compositor.cpp): multiview, both eyes in one pass.
