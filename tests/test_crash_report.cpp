@@ -1,27 +1,67 @@
 #include "check.h"
 #include "crash_report.h"
 #include "dispatch.h"
+#include <cstdio>
 #include <filesystem>
+#include <string>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include "fatal.h"
+#include "guest_mem.h"
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // A throw while writing must not re-enter terminate from inside the crash path.
 static_assert(noexcept(uc::crash_report_write(std::string_view{}, nullptr)));
 
 static bool g_written = false;
-__declspec(noinline) static void fn_a(ppc::Ctx&) {
+[[gnu::noinline]] static void fn_a(ppc::Ctx&) {
     // A report written from inside a translated function names that function's guest address.
     g_written = uc::crash_report_write("synthetic crash for the test", nullptr);
 }
-__declspec(noinline) static void fn_b(ppc::Ctx&) {}
+[[gnu::noinline]] static void fn_b(ppc::Ctx&) {}
+
+#ifndef _WIN32
+// A host fault in unmapped guest RAM exits with code 3 and names the guest address (the gap between MEM1 and MEM2: guest 85000000).
+static void test_fault_names_guest_address() {
+    int err[2];
+    CHECK(pipe(err) == 0);
+    const pid_t child = fork();
+    if (child == 0) {
+        dup2(err[1], 2);
+        uc::guest_mem_init();
+        uc::install_crash_handlers();
+        *reinterpret_cast<volatile uint32_t*>(uc::guest_mem_base() + 0x05000000u) = 1;
+        _exit(0);   // not reached
+    }
+    close(err[1]);
+    std::string text; char buffer[512]; ssize_t n;
+    while ((n = read(err[0], buffer, sizeof buffer)) > 0) text.append(buffer, size_t(n));
+    close(err[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 3);
+    CHECK(text.find("host signal") != std::string::npos);
+    CHECK(text.find("= guest 85000000") != std::string::npos);
+    if (text.find("= guest 85000000") == std::string::npos) std::fprintf(stderr, "child stderr:\n%s\n", text.c_str());
+}
+#endif
+
 
 int main() {
+#ifndef _WIN32
+    test_fault_names_guest_address();
+#endif
     const uc::FnEntry table[] = {{0x80001000, fn_a}, {0x80002000, fn_b}};
     uc::dispatch_init(table, 2, 0x80001000, 0x80003000);
     CHECK(uc::guest_function_for_host(reinterpret_cast<const char*>(&fn_a) + 1) == 0x80001000);
@@ -85,8 +125,15 @@ int main() {
     }
 
     // Host threads reserve stack for the handler so a stack overflow can still be reported.
+#ifdef _WIN32
     ULONG guarantee = 0;
     std::thread([&] { uc::crash_guard_thread(); SetThreadStackGuarantee(&guarantee); }).join();
     CHECK(guarantee >= 64 * 1024);
+#else
+    // POSIX: an alternate signal stack of at least 64 KB, so the handler runs even when the thread overflowed its own stack.
+    stack_t alt{};
+    std::thread([&] { uc::crash_guard_thread(); sigaltstack(nullptr, &alt); }).join();
+    CHECK(!(alt.ss_flags & SS_DISABLE) && alt.ss_size >= 64 * 1024);
+#endif
     return 0;
 }

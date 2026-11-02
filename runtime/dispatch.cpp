@@ -1,8 +1,12 @@
 #include "dispatch.h"
 #include <algorithm>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <libunwind.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -20,7 +24,9 @@ void dispatch_init(const FnEntry* table, size_t count, uint32_t text_begin, uint
     for (size_t i = 0; i < count; ++i) g_by_host.push_back({reinterpret_cast<uintptr_t>(table[i].fn), table[i].addr});
     std::sort(g_by_host.begin(), g_by_host.end());
 }
-uint32_t guest_function_for_host(const void* pc) {
+// Start of the host function containing pc, from the unwind tables; 0 when pc is not in code with unwind information.
+static uintptr_t host_function_start(const void* pc) {
+#ifdef _WIN32
     // x64 unwind data names the function containing pc exactly; chained (split hot/cold) entries lead to the primary.
     DWORD64 image = 0;
     auto* entry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(pc), &image, nullptr);
@@ -30,7 +36,22 @@ uint32_t guest_function_for_host(const void* pc) {
         entry = reinterpret_cast<PRUNTIME_FUNCTION>(const_cast<uint8_t*>(info) + 4 + ((info[2] + 1) & ~1) * 2);
     }
     if (!entry) return 0;
-    const uintptr_t begin = uintptr_t(image + entry->BeginAddress);
+    return uintptr_t(image + entry->BeginAddress);
+#else
+    // libunwind: a cursor moved to pc finds the unwind entry (compact unwind on macOS, DWARF CFI elsewhere) that covers it.
+    unw_context_t context;
+    unw_cursor_t cursor;
+    if (unw_getcontext(&context) != 0 || unw_init_local(&cursor, &context) != 0) return 0;
+    if (unw_set_reg(&cursor, UNW_REG_IP, unw_word_t(reinterpret_cast<uintptr_t>(pc))) != 0) return 0;
+    unw_proc_info_t info{};
+    if (unw_get_proc_info(&cursor, &info) != 0 || info.start_ip == 0) return 0;
+    if (reinterpret_cast<uintptr_t>(pc) < info.start_ip || reinterpret_cast<uintptr_t>(pc) >= info.end_ip) return 0;
+    return uintptr_t(info.start_ip);
+#endif
+}
+uint32_t guest_function_for_host(const void* pc) {
+    const uintptr_t begin = host_function_start(pc);
+    if (!begin) return 0;
     auto it = std::lower_bound(g_by_host.begin(), g_by_host.end(), std::pair<uintptr_t, uint32_t>{begin, 0});
     return it != g_by_host.end() && it->first == begin ? it->second : 0;
 }

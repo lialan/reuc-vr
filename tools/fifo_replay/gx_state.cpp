@@ -30,11 +30,11 @@ void GxStream::material(gx::DrawPacket& draw) const {
         u.ind_cmd[i]=bp_[0x10+i];
     }
     u.pixel={bp_[0xF3]&0xFFFFFF,bp_[0x40]&31,bp_[0x42]&511,xf_[0x1009]&3};
-    for(size_t i=0;i<5;++i)u.fog[i]=bp_[0xEE+i];
+    for(size_t i=0;i<5;++i)u.fog[i]=bp_[0xEE +i];
     for(size_t i=0;i<9;++i)u.indirect[i]=bp_[6+i];
     u.indirect[9]=bp_[0x27];u.indirect[10]=bp_[0x25];u.indirect[11]=bp_[0x26];
     for(size_t i=0;i<2;++i) {u.materials[i]=rgba(xf_[0x100C+i]);u.ambient[i]=rgba(xf_[0x100A+i]);}
-    for(size_t i=0;i<4;++i)u.channels[i]=xf_[0x100E+i];
+    for(size_t i=0;i<4;++i)u.channels[i]=xf_[0x100E +i];
     for(size_t i=0;i<8;++i) {
         auto& light=u.lights[i];auto base=0x600+i*16;
         // Native lighting accumulates light energy in byte units; material colors are normalized.
