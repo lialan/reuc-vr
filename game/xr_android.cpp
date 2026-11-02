@@ -59,6 +59,12 @@ void feed_xr_input(XrCompositor& xr, NativeInput& input) {
     for (const auto& m : kMap) {
         const bool down = (snapshot.held & m.cabinet) != 0, was = (previous & m.cabinet) != 0;
         if (down != was) input.host_button(PhysicalInput{PhysicalKind::wii_button, m.wii}, down);
+        // Diagnostics for "the trigger did not shoot": every press of fire (aimed: on the game's picture), reload (the trigger off the
+        // picture, or grip) and A, with the ray's place on the kAimWidth x kAimHeight picture. [kpad] in native_input.cpp shows what the game read.
+        if (down && !was && (m.cabinet & (CAB_P1_TRIGGER | CAB_P1_RELOAD | CAB_P1_ACTION)))
+            std::fprintf(stderr, "[xr-input] %s ray %s %d,%d held %04X\n",
+                         m.cabinet == CAB_P1_TRIGGER ? "fire" : m.cabinet == CAB_P1_RELOAD ? "reload (trigger off the picture, or grip)" : "A",
+                         snapshot.valid[0] ? "valid" : "invalid", ray.x, ray.y, snapshot.held);
     }
     previous = snapshot.held;
 }

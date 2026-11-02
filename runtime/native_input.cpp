@@ -585,8 +585,8 @@ void hle_KPADRead(ppc::Ctx& c) {
     if(channel==0 && input_poll)input_poll(c);
     auto sample=source->consume();
     if(input_map)sample=input_map(c,sample);
-#ifdef UC_TRACE
-    if (sample.pressed) std::fprintf(stderr,"[input] pressed %08X aim %.3f %.3f\n",sample.pressed,sample.x,sample.y);
+#if defined(UC_TRACE) || defined(__ANDROID__)   // Quest: pairs with xr_android.cpp's [xr-input] lines (only on presses: a few lines a minute)
+    if (sample.pressed) std::fprintf(stderr,"[input] pressed %08X held %08X aim %.3f %.3f\n",sample.pressed,sample.held,sample.x,sample.y);
 #endif
     std::memset(c.mem+(buffer&0x3FFFFFFF),0,132);
     gx::note_write_range(buffer,132);
