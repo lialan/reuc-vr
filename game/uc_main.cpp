@@ -1,4 +1,5 @@
 #include <csignal>
+#include "host_backtrace.h"
 #include "path_print.h"
 #include "clock.h"
 #include "client_update_lock.h"
@@ -105,7 +106,6 @@
 #include "file_open.h"
 #include "host_process.h"
 #include "host_thread.h"
-#include <execinfo.h>
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
 #endif
@@ -123,7 +123,7 @@ uint32_t guest_writer() { // first translated function on the stack: the guest c
     const auto count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
     for (USHORT i = 0; i < count; ++i) if (const auto guest = uc::guest_function_for_host(frames[i])) return guest;
 #else
-    const int count = backtrace(frames, 32);
+    const int count = uc::host_backtrace(frames, 32);
     for (int i = 1; i < count; ++i) if (const auto guest = uc::guest_function_for_host(frames[i])) return guest;
 #endif
     return 0;

@@ -169,7 +169,7 @@ set(UC_SHADER_FILES ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shad
 add_custom_target(uc_smoke_shaders DEPENDS ${UC_SHADER_FILES})
 # DLSS 5 Neural Rendering: the support/failure/parameter logic above the NGX SDK (no SDK or GPU needed, tested with a fake backend).
 add_library(uc_dlss5 STATIC ngx_dlss5.cpp)
-target_include_directories(uc_dlss5 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(uc_dlss5 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/common)   # common: from_chars_compat.h (dlss5_settings.h)
 target_link_libraries(uc_dlss5 PUBLIC Vulkan::Vulkan)
 add_library(uc_prompt_icons STATIC prompt_icons.cpp pad_glyphs.cpp)
 target_include_directories(uc_prompt_icons PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -177,6 +177,9 @@ target_link_libraries(uc_prompt_icons PUBLIC uc_input_prompts uc_imgui)
 add_library(uc_prompt_picture STATIC prompt_picture.cpp)
 target_link_libraries(uc_prompt_picture PUBLIC uc_gx uc_prompt_icons)
 add_library(uc_vulkan STATIC vulkan_renderer.cpp png.cpp prompt_overlay.cpp menu_overlay.cpp blit_upscaler.cpp smaa_upscaler.cpp occlusion_pass.cpp motion_blur_pass.cpp bloom_pass.cpp rt_scene.cpp rt_denoiser.cpp rt_shadow_pass.cpp rt_reflection_pass.cpp rt_path_pass.cpp rr_inputs_pass.cpp shadow_map.cpp rcas_pass.cpp hdr_pass.cpp dlss5_pass.cpp pass_timer.cpp upscaler_probe.cpp)
+if(ANDROID)
+  target_sources(uc_vulkan PRIVATE vulkan_android_entry.cpp)
+endif()
 target_include_directories(uc_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/third_party/smaa)   # AreaTex.h, SearchTex.h
 target_link_libraries(uc_vulkan PUBLIC uc_gx SDL3::SDL3 Vulkan::Vulkan uc_imgui_vulkan uc_prompt_picture uc_dlss5 PRIVATE uc_public_release)
 if(UC_VENDOR_UPSCALERS)

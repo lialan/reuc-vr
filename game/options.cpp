@@ -1,4 +1,5 @@
 #include "options.h"
+#include "from_chars_compat.h"
 #include <charconv>
 #include <array>
 #include <algorithm>
@@ -143,7 +144,7 @@ std::variant<Options, std::string> parse_options(std::span<const std::string_vie
                 else return "invalid value for --upscale-mode";
             } else if (arg == "--sharpness") {
                 double sharpness = 0;
-                auto parsed = std::from_chars(value.data(), value.data() + value.size(), sharpness);
+                auto parsed = uc::from_chars(value.data(), value.data() + value.size(), sharpness);
                 if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !valid_sharpness(sharpness)) return "invalid value for --sharpness";
                 options.sharpness = sharpness; options.sharpening = true;
             } else {
@@ -196,7 +197,7 @@ std::variant<Options, std::string> parse_options(std::span<const std::string_vie
             }
             if(arg=="--render-scale") {
                 double scale=0;
-                auto parsed=std::from_chars(value.data(),value.data()+value.size(),scale);
+                auto parsed=uc::from_chars(value.data(),value.data()+value.size(),scale);
                 if(parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || !std::isfinite(scale) || scale<0.5 || scale>6) return "invalid value for " + std::string(arg);
                 options.render_scale=scale; continue;
             }

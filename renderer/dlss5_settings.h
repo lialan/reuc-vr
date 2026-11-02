@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include "from_chars_compat.h"
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -146,7 +147,7 @@ inline bool set_dlss5_field(Dlss5Settings& settings, std::string_view key, std::
         const char* end=text.data()+text.size();
         bool ok=!text.empty();
         if(ok && field->kind==Dlss5Kind::integer) { long long whole=0; const auto parsed=std::from_chars(text.data(),end,whole); ok=parsed.ec==std::errc{} && parsed.ptr==end; value=double(whole); }
-        else if(ok) { const auto parsed=std::from_chars(text.data(),end,value); ok=parsed.ec==std::errc{} && parsed.ptr==end; }
+        else if(ok) { const auto parsed=uc::from_chars(text.data(),end,value); ok=parsed.ec==std::errc{} && parsed.ptr==end; }
         if(!ok) { error="invalid dlss5 "+std::string(key)+" value "+std::string(text); return false; }
     }
     if(const auto problem=dlss5_value_error(*field,value); !problem.empty()) { error="dlss5 "+problem; return false; }

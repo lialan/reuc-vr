@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include <windows.h>
 #endif
+#include "vulkan_android_entry.h"
 #include "late_aim.h"
 #include "texture_replacement.h"
 #include "post_effects.h"
@@ -306,6 +307,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     device_info.queueCreateInfoCount = 1; device_info.pQueueCreateInfos = &queue_info;   // queue_info.queueCount: 3 with the interpolation swapchain
     device_info.enabledExtensionCount = uint32_t(device_extensions.size()); device_info.ppEnabledExtensionNames = device_extensions.data();
     vk_check(through_streamline ? streamline_->create_device(instance_, physical_, device_info, device) : vkCreateDevice(physical_, &device_info, nullptr, &device), "vkCreateDevice");
+    vk_android_load_device(device);   // Android: the 1.2/1.3 functions called directly come from this device (vulkan_android_entry.cpp)
     if (through_streamline) {
         base_present_=streamline_->present_functions(device);
         present_.present=base_present_.present;   // SR/RR also need Streamline's per-present tag recycling and garbage collection.

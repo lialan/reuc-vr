@@ -1,4 +1,5 @@
 #include "test_protocol.h"
+#include "from_chars_compat.h"
 #include <charconv>
 #include <cmath>
 #include <initializer_list>
@@ -37,7 +38,7 @@ struct Reader {
         }
         if (s.substr(p, 4) == "true") { p += 4; return {Value::Type::boolean, 0, true, {}, {}}; }
         if (s.substr(p, 5) == "false") { p += 5; return {Value::Type::boolean, 0, false, {}, {}}; }
-        double d = 0; auto r = std::from_chars(s.data() + p, s.data() + s.size(), d);
+        double d = 0; auto r = uc::from_chars(s.data() + p, s.data() + s.size(), d);
         if (r.ec != std::errc{} || !std::isfinite(d)) throw std::runtime_error("bad value");
         p = size_t(r.ptr - s.data());
         return {Value::Type::number, d, false, {}, {}};
