@@ -159,6 +159,20 @@ foreach(stage vert frag)
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/hdr.slang ${hdr_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/hdr.${stage}.spv
     DEPENDS shaders/hdr.slang VERBATIM)
 endforeach()
+# The headset's game shaders (STEREO): multiview, texture arrays, the per-draw eye transforms in binding 5.
+foreach(stage vert frag uber)
+  if(stage STREQUAL "vert")
+    set(stereo_args -entry vertexMain -stage vertex)
+  elseif(stage STREQUAL "frag")
+    set(stereo_args -entry fragmentMain -stage fragment)
+  else()
+    set(stereo_args -DUBER -entry fragmentMain -stage fragment)
+  endif()
+  add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.${stage}.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO ${stereo_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.${stage}.spv
+    DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+endforeach()
 # The headset's screen pass (xr_compositor.cpp): multiview, both eyes in one pass.
 foreach(stage vert frag)
   if(stage STREQUAL "vert")
@@ -187,7 +201,7 @@ if(UC_GLSLANG)
 elseif(UC_OPENXR)
   message(FATAL_ERROR "the headset build needs glslangValidator for HOTD4's overlay shaders (brew install glslang)")
 endif()
-set(UC_SHADER_FILES ${UC_XR_OVERLAY_SPV} ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+set(UC_SHADER_FILES ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv

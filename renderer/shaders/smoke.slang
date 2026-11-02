@@ -43,7 +43,14 @@ struct Projection { float4 rows[4]; uint palette; uint currentRow; uint indexed;
 // Last frame's matrices of this draw (gx::MotionTracker): kind 1 = previous palette + previous projection, kind 2 = camera only
 // (prevRows = clip_to_prev_clip applied to the current clip position).
 struct MotionBlock { float4 prevRows[4]; uint prevPalette; uint kind; uint2 unused; };
+#ifdef STEREO
+// The headset (STEREO): binding 5 holds each draw's two eye transforms (Vulkan clip to Vulkan clip, rows), HOTD4's per-draw reprojection
+// by draw class (xr/stereo_projection.c); projection.motion indexes it.
+struct StereoBlock { float4 rows[2][4]; };
+[[vk::binding(5, 0)]] StructuredBuffer<StereoBlock> stereoBlocks : register(t10);
+#else
 [[vk::binding(5, 0)]] StructuredBuffer<MotionBlock> motions : register(t10);
+#endif
 struct Output {
     float4 position : SV_Position;
     [[vk::location(0)]] float4 color : COLOR0;
@@ -122,7 +129,11 @@ float3 generateTexcoord(uint id, Input input) {
     float4 post = float4(stq, 1.0);
     return float3(dot(drawState.postRows[3 * id], post), dot(drawState.postRows[3 * id + 1], post), dot(drawState.postRows[3 * id + 2], post));
 }
+#ifdef STEREO
+Output vertexMain(Input input, uint view : SV_ViewID) {
+#else
 Output vertexMain(Input input) {
+#endif
     Output output;
     float4 objectPosition = float4(input.position, 1.0);
     uint row = projection.indexed != 0 ? input.matrixRow : projection.currentRow;   // validated on the CPU: row <= 61, rows loaded
@@ -143,7 +154,14 @@ Output vertexMain(Input input) {
     }
     output.position.xy += projection.jitter * 2.0 / projection.viewport.zw * output.position.w;
 #endif
-    output.position.xy += projection.shift * output.position.w;   // late aim: a clip-space translation, so a quad the game placed at the screen edge is clipped after the move, not before
+    output.position.xy += projection.shift * output.position.w;
+#ifdef STEREO
+    if (projection.motion != 0xFFFFFFFF) {
+        const float4 clip = output.position;
+        StereoBlock eye = stereoBlocks[projection.motion];
+        output.position = float4(dot(eye.rows[view][0], clip), dot(eye.rows[view][1], clip), dot(eye.rows[view][2], clip), dot(eye.rows[view][3], clip));
+    }
+#endif   // late aim: a clip-space translation, so a quad the game placed at the screen edge is clipped after the move, not before
     // View-space normal: the loaded normal matrix applied to the object normal; without a loaded matrix the object normal stays (position-only fixtures).
     uint normalRow = row & 31;
     uint4 loaded = loadedRows(projection.palette);
@@ -234,7 +252,12 @@ float4 albedoTexel(Output input) {
 }
 #endif
 float2 pixelOf(float4 clip) { return projection.viewport.xy + (clip.xy / clip.w * 0.5 + 0.5) * projection.viewport.zw; }
+#ifdef STEREO
+Targets fragmentMain(Output input, uint view : SV_ViewID) {
+    stereoLayer = float(view);
+#else
 Targets fragmentMain(Output input) {
+#endif
     Targets targets;
 #if defined(MOTION) && !defined(UC_LOGIC_COLOR_ONLY)
     targets.motion = float4(pixelOf(input.previousClip) - pixelOf(input.currentClip), 0.0, 0.0);

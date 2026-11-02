@@ -463,10 +463,9 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set, 0, nullptr);
     const VkViewport viewport{0, 0, float(width_), float(height_), 0, 1}; const VkRect2D scissor{{0, 0}, {width_, height_}};
     vkCmdSetViewport(command, 0, 1, &viewport); vkCmdSetScissor(command, 0, 1, &scissor);
-    // HOTD4's HUD class: guest clip space straight onto the screen plane (StereoScene::transforms with LG_STEREO_HUD).
-    const auto& matrices = scene_.transforms(xr::identity(), LG_STEREO_HUD);
+    // Each eye's layer covers that eye: the renderer drew it in the eye's space already.
     EyeConstants constants{};
-    std::memcpy(constants.columns, matrices.view_projection, sizeof constants.columns);
+    for (int eye = 0; eye < 2; ++eye) { const auto unit = xr::identity(); std::memcpy(constants.columns[eye], unit.data(), sizeof constants.columns[eye]); }
     vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof constants, &constants);
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());

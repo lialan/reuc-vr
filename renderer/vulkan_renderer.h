@@ -259,11 +259,13 @@ private:
     void start_workers();
     void stop_workers();
     void compile_worker();
-    void make_attachment(VkImage& image,VkDeviceMemory& memory,VkImageView& view,VkExtent2D extent,bool depth=false,VkFormat format=VK_FORMAT_UNDEFINED);
+    void make_attachment(VkImage& image,VkDeviceMemory& memory,VkImageView& view,VkExtent2D extent,bool depth=false,VkFormat format=VK_FORMAT_UNDEFINED,uint32_t layers=1);
     void collect();
     SDL_Window* window_ = nullptr;
     class XrCompositor* xr_ = nullptr;   // not owned
     bool xr_frame_ = false;   // this presented frame draws into the headset (begin_frame() said so)
+    uint32_t layers_ = 1;     // 2 with the headset: the EFB, its copies and the presented picture hold one layer per eye (multiview)
+    bool world_drawn_ = false;   // this frame drew the world already: full-screen 2D after it fills the eye (HOTD4's FILL), before it is the HUD screen
     PromptOverlay prompt_overlay_;
     MenuOverlay menu_overlay_;
     std::function<void()> menu_build_, menu_setup_;

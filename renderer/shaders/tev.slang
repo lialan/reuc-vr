@@ -25,7 +25,18 @@ struct DrawState {
     uint4 tevWords[17];   // pipeline key words 1..67 (only the ubershader reads them)
 };
 [[vk::binding(2,0)]] ConstantBuffer<DrawState> drawState : register(b0);
+#ifdef STEREO
+// The headset (STEREO): every image is an array; EFB copies hold one layer per eye, other textures one layer, which Vulkan's layer clamp
+// picks for either eye. stereoLayer is the fragment's view (set by fragmentMain).
+[[vk::binding(0,0)]] Texture2DArray<float4> images[8] : register(t0);
+static float stereoLayer = 0.0;
+#define UC_SAMPLE(i, uv) images[i].Sample(imageSamplers[i], float3(uv, stereoLayer))
+#define UC_DIMENSIONS(i) { uint layers; images[i].GetDimensions(w, h, layers); }
+#else
 [[vk::binding(0,0)]] Texture2D<float4> images[8] : register(t0);
+#define UC_SAMPLE(i, uv) images[i].Sample(imageSamplers[i], uv)
+#define UC_DIMENSIONS(i) images[i].GetDimensions(w, h)
+#endif
 [[vk::binding(1,0)]] SamplerState imageSamplers[8] : register(s0);
 TEV_CONST(0, stageCount);
 TEV_CONST(1, swapTables);
@@ -111,14 +122,14 @@ void loadTevKey() {
 
 float4 sampleImage(uint id, float2 uv) {
     switch (id) {
-    case 0: return images[0].Sample(imageSamplers[0], uv);
-    case 1: return images[1].Sample(imageSamplers[1], uv);
-    case 2: return images[2].Sample(imageSamplers[2], uv);
-    case 3: return images[3].Sample(imageSamplers[3], uv);
-    case 4: return images[4].Sample(imageSamplers[4], uv);
-    case 5: return images[5].Sample(imageSamplers[5], uv);
-    case 6: return images[6].Sample(imageSamplers[6], uv);
-    case 7: return images[7].Sample(imageSamplers[7], uv);
+    case 0: return UC_SAMPLE(0, uv);
+    case 1: return UC_SAMPLE(1, uv);
+    case 2: return UC_SAMPLE(2, uv);
+    case 3: return UC_SAMPLE(3, uv);
+    case 4: return UC_SAMPLE(4, uv);
+    case 5: return UC_SAMPLE(5, uv);
+    case 6: return UC_SAMPLE(6, uv);
+    case 7: return UC_SAMPLE(7, uv);
     }
     return float4(1.0);
 }
@@ -225,14 +236,14 @@ float combineAlpha(float a, float b, float c, float d, float3 colorA, float3 col
 float2 imageSize(uint id) {
     uint w = 1, h = 1;
     switch (id) {
-    case 0: images[0].GetDimensions(w, h); break;
-    case 1: images[1].GetDimensions(w, h); break;
-    case 2: images[2].GetDimensions(w, h); break;
-    case 3: images[3].GetDimensions(w, h); break;
-    case 4: images[4].GetDimensions(w, h); break;
-    case 5: images[5].GetDimensions(w, h); break;
-    case 6: images[6].GetDimensions(w, h); break;
-    case 7: images[7].GetDimensions(w, h); break;
+    case 0: UC_DIMENSIONS(0); break;
+    case 1: UC_DIMENSIONS(1); break;
+    case 2: UC_DIMENSIONS(2); break;
+    case 3: UC_DIMENSIONS(3); break;
+    case 4: UC_DIMENSIONS(4); break;
+    case 5: UC_DIMENSIONS(5); break;
+    case 6: UC_DIMENSIONS(6); break;
+    case 7: UC_DIMENSIONS(7); break;
     }
     return float2(w, h);
 }
@@ -303,7 +314,7 @@ void tevStage(inout float4 r[4], float2 uv[8], float4 vertexColor, float4 vertex
     r[(ae >> 22) & 3].a = alpha;
 }
 float4 evaluateTev(float2 uv[8], float4 color, float4 color1) {
-    if (stageCount == 0) return color * images[0].Sample(imageSamplers[0], uv[0]);
+    if (stageCount == 0) return color * UC_SAMPLE(0, uv[0]);
     float4 r[4];
     [unroll] for (uint i = 0; i < 4; ++i) r[i] = drawState.registers[i];
     int2 previousCoord = int2(0);

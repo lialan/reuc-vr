@@ -1,9 +1,10 @@
-// The game's finished picture on the headset's screen plane (xr_compositor.cpp), both eyes in one multiview pass. The quad is the game's clip
-// space -1..1; each eye's transform is HOTD4's HUD mapping (StereoScene::transforms, GL clip convention, column-major), converted to
-// Vulkan clip space afterwards as HOTD4's shader wrapper does: Y flipped, depth -w..w to 0..w.
+// The game's finished frame in the headset (xr_compositor.cpp), both eyes in one multiview pass. The picture holds one layer per eye, each
+// already drawn in its eye's space (the renderer's per-draw reprojection: world per eye, HUD on HOTD4's screen plane); the quad covers the
+// eye through the transform pushed for it (GL clip convention, column-major), converted to Vulkan clip space afterwards as HOTD4's shader
+// wrapper does: Y flipped, depth -w..w to 0..w.
 struct Eyes { float4 columns[2][4]; };
 [[vk::push_constant]] ConstantBuffer<Eyes> eyes;
-[[vk::binding(0, 0)]] Texture2D picture;
+[[vk::binding(0, 0)]] Texture2DArray picture;
 [[vk::binding(1, 0)]] SamplerState linear;
 
 struct VOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };
@@ -21,6 +22,6 @@ VOut vertexMain(uint id : SV_VertexID, uint view : SV_ViewID) {
 }
 
 [shader("fragment")]
-float4 fragmentMain(VOut i) : SV_Target0 {
-    return float4(picture.Sample(linear, i.uv).rgb, 1);
+float4 fragmentMain(VOut i, uint view : SV_ViewID) : SV_Target0 {
+    return float4(picture.Sample(linear, float3(i.uv, float(view))).rgb, 1);
 }
