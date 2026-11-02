@@ -218,6 +218,7 @@ private:
         uint32_t descriptor_capacity=0;
         uint64_t serial = 0;
         bool submitted = false, reported = false, initialized = false, copied = false, timed = false;
+        std::string timing_kind;   // UC_GPU_PACKETS: what this packet was (copy size, present, draws), for the per-kind GPU time
     };
     // A mesh uploaded once and drawn from every frame; freed once the guest dropped it (owner expired) and no submission still holds it.
     // Meshes live in a few large buffers (one vkAllocateMemory per slab, not per mesh): vertices then indices at the given offsets.

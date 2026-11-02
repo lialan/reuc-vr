@@ -565,6 +565,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         // The headset owns the display: an OpenXR activity never gets a native surface, so the window SDL keeps for events, focus and sizes
         // is an offscreen one; the renderer draws into the headset's swapchain.
         if(xr) SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER,"offscreen",SDL_HINT_OVERRIDE);
+        // The offscreen display is 1024x768: the game would render 4:3 (a narrower view, more of the world culled at the eyes' edges, and
+        // its menus laid out for another shape). The headset gets the game's own 16:9 picture, at 720p unless asked otherwise.
+        if(xr && !options.width && !options.height) { options.width=1280; options.height=720; }
 #endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();
@@ -1223,7 +1226,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 if(SDL_GetWindowSizeInPixels(window.get(),&width,&height)) input.extent(uint32_t(std::max(0,width)),uint32_t(std::max(0,height)));   // stick speed and gyro counts are in pixels
                 if(gamepad) gamepad->update(input,!host_keys.menu_open && !host_keys.paused && (SDL_GetWindowFlags(window.get())&SDL_WINDOW_INPUT_FOCUS)!=0);
 #ifdef UC_OPENXR
-                if(xr) uc::feed_xr_input(*xr,input);   // the headset controllers as the game's Wii Remote
+                if(xr && !controlled) uc::feed_xr_input(*xr,input);   // the headset controllers as the game's Wii Remote (not while the harness drives input: its pointer would be overridden)
 #endif
                 if(wiimote) {
                     wiimote->update(&input,!host_keys.menu_open && !host_keys.paused && (SDL_GetWindowFlags(window.get())&SDL_WINDOW_INPUT_FOCUS)!=0,options.wiimote);

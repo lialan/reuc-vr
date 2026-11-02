@@ -2,11 +2,12 @@
 from .platform_exe import DEFAULT_EXE, DEFAULT_EXE_NAME
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
 
-from .client import CHECKPOINTS, GUEST_CPU, Game, StepFailed, resolve_saves
+from .client import CHECKPOINTS, GUEST_CPU, SAVE_SOURCE, Game, StepFailed, resolve_saves
 from .transport import PipeTransport
 from .scenarios import SCENARIO_MOD_SETTINGS, SCENARIO_MODS, SCENARIO_PREPARE, SCENARIOS
 
@@ -52,8 +53,10 @@ def run_on_quest(name, args):
     run_dir.mkdir(parents=True, exist_ok=True)
     adb = ["adb", "-s", QUEST_SERIAL]
     game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", "1800", "--speed", str(args.speed)] + list(args.game_arg)
-    runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")]
-                              + [f"--arg={a}" for a in game_args], stdout=open(run_dir / "runner.log", "wb"), stderr=subprocess.STDOUT)
+    runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)
+                              + [f"--arg={a}" for a in game_args] + [f"--set={s}" for s in getattr(args, "quest_set", [])]
+                              + ([f"--saves={SAVE_SOURCE}"] if SAVE_SOURCE and Path(SAVE_SOURCE).is_dir() else []),   # the desktop runs' save snapshot: the menu route needs slot 1
+                              stdout=open(run_dir / "runner.log", "wb"), stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 300
         while b"uc-test-quest-cmd" not in subprocess.run(adb + ["shell", "cat /proc/net/unix"], capture_output=True).stdout:
@@ -94,6 +97,7 @@ def main(argv=None):
     run.add_argument("scenario", choices=sorted(SCENARIOS))
     run.add_argument("--speed", type=int, default=1, choices=range(1, 33), metavar="1..32")
     run.add_argument("--quest", action="store_true", help="run on the Quest 3 app over adb (scripts/quest/run.py; hold quest3-lock)")
+    run.add_argument("--quest-set", action="append", default=[], help="--quest: NAME=VALUE environment option for the app (env.txt; repeatable)")
     run.add_argument("--measure", type=float, default=0, help="seconds of FPS measurement (perf)")
     run.add_argument("--exe", help="game executable to launch instead of dist/uc.exe (e.g. an instrumented build staged next to dist/data)")
     run.add_argument("--repeat", type=int, default=1)

@@ -1026,7 +1026,22 @@ void VulkanRenderer::collect() {
         completed_.push_back(slot.serial); slot.reported = true;
         uint64_t stamps[2];
         if (slot.timed && vkGetQueryPoolResults(device, timing_pool_, uint32_t((&slot - slots_.data()) * 2), 2, sizeof stamps, stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] >= stamps[0])
-        { const uint64_t ns = uint64_t(double(stamps[1] - stamps[0]) * timestamp_period_); gpu_busy_ns_ += ns; if (ns > gpu_window_max_ns_) gpu_window_max_ns_ = ns; }
+        { const uint64_t ns = uint64_t(double(stamps[1] - stamps[0]) * timestamp_period_); gpu_busy_ns_ += ns; if (ns > gpu_window_max_ns_) gpu_window_max_ns_ = ns;
+          static const bool by_kind = std::getenv("UC_GPU_PACKETS") != nullptr;   // diagnostics: GPU time per second by packet kind
+          if (by_kind) {
+              static std::map<std::string, std::pair<uint64_t, uint64_t>> kinds; static auto since = std::chrono::steady_clock::now();
+              auto& k = kinds[slot.timing_kind]; ++k.first; k.second += ns;
+              if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
+                  std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> sorted(kinds.begin(), kinds.end());
+                  std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+                  uint64_t total = 0; for (const auto& [name, v] : sorted) total += v.second;
+                  std::fprintf(stderr, "[gpu-packets] 2 s: %.1f ms GPU\n", total / 1e6);
+                  for (size_t i = 0; i < sorted.size() && i < 14; ++i)
+                      std::fprintf(stderr, "[gpu-packets] %8.2f ms %5llu x  avg %.3f ms  %s\n", sorted[i].second.second / 1e6, (unsigned long long)sorted[i].second.first,
+                                   sorted[i].second.second / 1e6 / double(sorted[i].second.first), sorted[i].first.c_str());
+                  kinds.clear(); since = std::chrono::steady_clock::now();
+              }
+          } }
         if (slot.timed) pass_timer_.collect(uint32_t(&slot - slots_.data()));
         slot.timed = false;
     }
@@ -2248,6 +2263,24 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     vkCmdWriteTimestamp2(slot.command, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timing_pool_, first_query);
     pass_timer_.reset(slot.command, first_query / 2);
     slot.timed = true;
+    static const bool by_kind = std::getenv("UC_GPU_PACKETS") != nullptr;
+    if (by_kind) {
+        const size_t n = packet.draws.size();
+        const char* bucket = n == 0 ? "0" : n < 10 ? "1-9" : n < 50 ? "10-49" : n < 200 ? "50-199" : "200+";
+        if (n >= 200) {   // the vertex load of the big (scene) packets: indices drawn, per second
+            static uint64_t indices = 0, packets = 0; static auto since = std::chrono::steady_clock::now();
+            for (const auto& info : gpu_draws) indices += info.index_count;
+            ++packets;
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
+                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets)\n", double(indices) / double(packets), (unsigned long long)packets);
+                indices = packets = 0; since = std::chrono::steady_clock::now();
+            }
+        }
+        char kind[128];
+        if (packet.texture_copy) std::snprintf(kind, sizeof kind, "copy %ux%u draws %s%s", packet.texture_copy->source[2], packet.texture_copy->source[3], bucket, packet.present ? " +present" : "");
+        else std::snprintf(kind, sizeof kind, "%s draws %s", packet.present ? "present" : "no copy", bucket);
+        slot.timing_kind = kind;
+    }
     for (const auto& pooled : slot.textures) {
         Texture& texture=*pooled;
         if (texture.initialized) continue;
