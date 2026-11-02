@@ -27,7 +27,9 @@ static void test_alpha_test_bit() {   // pipelines whose draws cannot fail the G
     uc::PipelineKey k{}; k[0]=2u|(0u<<8)|(1u<<12)|(1u<<16); k[69]=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     CHECK((uc::without_logic_op(k)[0]>>16)==1u);       // the bit survives the logic-op conversion
     CHECK(uc::valid_pipeline_key(uc::without_logic_op(k),false));
-    k[0]|=1u<<17; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 16
+    k[0]|=1u<<17; CHECK(uc::valid_pipeline_key(k,true));    // bit 17: per-vertex texture matrices (the headset's bank vertex stage)
+    CHECK((uc::without_logic_op(k)[0]>>17&1)==1u);
+    k[0]|=1u<<18; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 17
 }
 int main() {
     test_without_logic_op();

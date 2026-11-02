@@ -25,6 +25,7 @@ def main():
     p.add_argument("--arg", action="append", default=[], help="a command-line option for the game (repeatable)")
     p.add_argument("--set", action="append", default=[], help="NAME=VALUE environment option (repeatable)")
     p.add_argument("--out", default=None)
+    p.add_argument("--file", action="append", default=[], help="LOCAL=NAME: copy a file into the private folder (e.g. a demo)")
     p.add_argument("--saves", default=None, help="a saves directory to copy into the run's saves/ (replacing it) before the start")
     p.add_argument("--no-install", action="store_true")
     p.add_argument("--guardian-pause", action="store_true", help="pause Guardian for scripted runs (restored after)")
@@ -74,6 +75,10 @@ def main():
         for name, lines in (("env.txt", args.set), ("args.txt", args.arg)):
             subprocess.run(["adb", "-s", SERIAL, "shell", f"run-as {PACKAGE} sh -c " + shlex.quote(f"cat > {shlex.quote(private + '/' + name)}")],
                            input=("\n".join(lines) + "\n").encode(), check=True, capture_output=True, timeout=30)
+        for spec in args.file:   # LOCAL=NAME: a file the run reads (a recorded demo), into the private folder
+            local, name = spec.split("=", 1)
+            subprocess.run(["adb", "-s", SERIAL, "shell", f"run-as {PACKAGE} sh -c " + shlex.quote(f"cat > {shlex.quote(private + '/' + name)}")],
+                           input=pathlib.Path(local).read_bytes(), check=True, capture_output=True, timeout=120)
         if args.saves:   # a save snapshot (the harness's pinned saves): the run's saves/ starts as an exact copy of it every time
             shell("run-as", PACKAGE, "rm", "-rf", private + "/saves")
             shell("run-as", PACKAGE, "mkdir", "-p", private + "/saves")

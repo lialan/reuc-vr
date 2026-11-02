@@ -449,7 +449,7 @@ private:
     bool uber_only_ = false;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     size_t pipeline_cache_loaded_ = 0;
-    VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
+    VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE, nobank_vertex_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
     std::filesystem::path cache_dir_;
     std::set<PipelineKey> known_keys_;        // keys already in the seed or recorded file
     std::vector<PipelineKey> warm_keys_;

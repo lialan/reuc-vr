@@ -417,7 +417,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     shaders_=shaders; cache_dir_=shaders_.parent_path();
     const std::string variant=layers_>1 ? "smoke.stereo." : motion_outputs_ ? "smoke.motion." : "smoke.";
     if (motion_outputs_) { shadow_vertex_module_=shader(device, shaders_ / "smoke.shadow.vert.spv"); shadow_map_.initialize(device,memory_); }
-    vertex_module_=shader(device, shaders_ / (variant+"vert.spv")); fragment_module_=shader(device, shaders_ / (variant+"frag.spv")); early_module_=shader(device, shaders_ / (variant+"early.frag.spv")); uber_module_=shader(device, shaders_ / (variant+"uber.spv"));
+    vertex_module_=shader(device, shaders_ / (variant+"vert.spv")); fragment_module_=shader(device, shaders_ / (variant+"frag.spv")); if (layers_>1 && !std::getenv("UC_NO_NOBANK_VS")) nobank_vertex_module_=shader(device, shaders_ / "smoke.stereo.nobank.vert.spv"); early_module_=shader(device, shaders_ / (variant+"early.frag.spv")); uber_module_=shader(device, shaders_ / (variant+"uber.spv"));
     load_pipeline_cache();
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
     gx::DrawPacket initial; initial.primitive=0x90; pipeline_for(pipeline_key(initial));
@@ -644,6 +644,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     key[0]=blend.mode|(blend.source<<2)|(blend.destination<<5)|(blend.logic<<8)|(uint32_t(blend.color_write)<<12)|(uint32_t(blend.alpha_write)<<13);
     key[0]|=uint32_t(draw.state->cull)<<14;
     key[0]|=uint32_t(gx::alpha_test_can_discard(draw.uniforms->pixel[0]))<<16;   // smoke.slang alphaTestActive (specialization constant 67)
+    key[0]|=uint32_t(gx::has_texture_matrix_index(*draw.state))<<17;   // as the bank binding (record), not draw.texture_bank (also set unused)   // per-vertex texture matrices: the headset's vertex stage with the bank code (else NO_BANK)
     const auto& material=draw.material;
     if (material.stages>16) throw std::invalid_argument("native TEV stage count exceeds16");
     key[1]=material.stages;
@@ -849,7 +850,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     mode.color_write=key[0]>>12&1; mode.alpha_write=key[0]>>13&1;
     // A pipeline whose alpha test cannot fail (key bit 16 clear) gets the early-Z variant: no discard, depth tested before shading.
     static const bool late_z=std::getenv("UC_NO_EARLY_Z")!=nullptr;   // diagnostics: every pipeline on the module with the alpha test
-    const VkShaderModule vertex=vertex_module_, fragment=uber ? uber_module_ : (((key[0]>>16)&1) || late_z || !early_module_) ? fragment_module_ : early_module_;
+    const VkShaderModule vertex=((key[0]>>17)&1) || !nobank_vertex_module_ ? vertex_module_ : nobank_vertex_module_, fragment=uber ? uber_module_ : (((key[0]>>16)&1) || late_z || !early_module_) ? fragment_module_ : early_module_;
     VkPipeline pipeline=VK_NULL_HANDLE;
     {
         if (!layout_) {
@@ -3004,15 +3005,18 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         uint64_t total=0;
         for (size_t i=0;i<frag_queries_.size();++i) { uint64_t n=0; for (uint32_t v=0;v<layers_;++v) n+=counts[i*layers_+v]; per.push_back({n,i}); total+=n; }
         std::sort(per.rbegin(),per.rend());
+        uint64_t bank_indices=0, plain_indices=0;
+        for (const uint32_t d:frag_queries_) (gpu_draws[d].bank!=kNoBank ? bank_indices : plain_indices)+=gpu_draws[d].index_count;
+        std::fprintf(stderr,"[frag-dump] indices: %llu with a texture bank, %llu without\n",(unsigned long long)bank_indices,(unsigned long long)plain_indices);
         const double screen=double(efb_extent_.width)*efb_extent_.height*0.75*layers_;   // the 640x360 scene region of every eye
         std::fprintf(stderr,"[frag-dump] packet %zu draws, %.2f M fragments (%.1f scene screens)%s%s\n",packet.draws.size(),total/1e6,total/screen,
                      packet.texture_copy ? " copy" : "",packet.present ? " present" : "");
         for (size_t k=0;k<per.size() && k<25;++k) {
             const size_t d=frag_queries_[per[k].second]; const auto& draw=packet.draws[d]; const auto& key=gpu_draws[d].key;
             const uint32_t alpha=draw.uniforms->pixel[0];
-            std::fprintf(stderr,"[frag-dump] %6.2f M %5.2f scr  draw %4zu callsite %08X blend %u  alpha-test %d  z test %u write %u cmp %u  tev %u  idx %u  reticle %d\n",
+            std::fprintf(stderr,"[frag-dump] %6.2f M %5.2f scr  draw %4zu callsite %08X blend %u  alpha-test %d  z test %u write %u cmp %u  tev %u  idx %u  reticle %d  bank %d\n",
                          per[k].first/1e6,per[k].first/screen,d,draw.callsite,unsigned(draw.blend.mode),int(!(((alpha>>16)&7)==7 && ((alpha>>19)&7)==7)),
-                         key[68]&1,(key[68]>>4)&1,(key[68]>>1)&7,unsigned(draw.uniforms->pixel[3]&15),gpu_draws[d].index_count,int(draw.reticle));
+                         key[68]&1,(key[68]>>4)&1,(key[68]>>1)&7,unsigned(draw.uniforms->pixel[3]&15),gpu_draws[d].index_count,int(draw.reticle),int(gpu_draws[d].bank!=kNoBank));
         }
     }
     timings_.submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count();
@@ -3126,11 +3130,11 @@ void VulkanRenderer::shutdown() {
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
-        for (auto module:{vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        for (auto module:{vertex_module_,nobank_vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
         for (auto& [hash,module]:folded_modules_) if (module) vkDestroyShaderModule(device,module,nullptr);
         folded_modules_.clear();
         shadow_vertex_module_=VK_NULL_HANDLE;
-        vertex_module_=fragment_module_=early_module_=uber_module_=VK_NULL_HANDLE;
+        vertex_module_=nobank_vertex_module_=fragment_module_=early_module_=uber_module_=VK_NULL_HANDLE;
         if (layout_) vkDestroyPipelineLayout(device, layout_, nullptr);
         if (texture_layout_) vkDestroyDescriptorSetLayout(device,texture_layout_,nullptr);
         for(auto& sampler:texture_samplers_) { if(sampler) vkDestroySampler(device,sampler,nullptr); sampler=VK_NULL_HANDLE; }

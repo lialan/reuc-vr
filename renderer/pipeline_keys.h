@@ -20,7 +20,7 @@ inline constexpr uint32_t kPipelineKeysHeader[3]={0x4B504355u,1u,uint32_t(sizeof
 // write. key[0] = mode | source<<2 | destination<<5 | logic<<8 | color_write<<12 | alpha_write<<13.
 inline PipelineKey without_logic_op(PipelineKey key) {
     if ((key[0]&3)!=2) return key;
-    const uint32_t writes=key[0]&((3u<<12)|(1u<<16)), logic=(key[0]>>8)&15;   // the write masks and the alpha-test bit stay
+    const uint32_t writes=key[0]&((3u<<12)|(3u<<16)), logic=(key[0]>>8)&15;   // the write masks, the alpha-test bit and the bank bit stay
     if (logic==0) key[0]=1u|(0u<<2)|(0u<<5)|(3u<<8)|writes;        // CLEAR: ZERO*src + ZERO*dst
     else if (logic==5) key[0]=1u|(0u<<2)|(1u<<5)|(3u<<8)|writes;   // NOOP: ZERO*src + ONE*dst
     else key[0]=0u|(1u<<2)|(0u<<5)|(3u<<8)|writes;                 // COPY and the rest: no blending
@@ -28,7 +28,7 @@ inline PipelineKey without_logic_op(PipelineKey key) {
 }
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>17)==0 && ((key[0]&3)!=2 || logic_ops);
+    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>18)==0 && ((key[0]&3)!=2 || logic_ops);
 }
 }  // namespace uc (pipeline keys)
 namespace gx {

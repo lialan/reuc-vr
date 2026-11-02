@@ -127,10 +127,13 @@ float3 generateTexcoord(uint id, Input input) {
     if ((gen & 4) == 0) value.z = 1.0;
     float4 row0 = drawState.texRows[3 * id], row1 = drawState.texRows[3 * id + 1], row2 = drawState.texRows[3 * id + 2];
     uint matrixId = (input.texMatrixIds[id / 4] >> ((id % 4) * 8)) & 255;   // 255: this vertex has no index for the texgen
+#ifndef NO_BANK   // NO_BANK: the variant for draws without per-vertex texture matrices (none in RBUE08's stage 1): the never-taken path
+                  // still cost the Quest vertex occupancy (its registers), about a fifth of the frame at 60 fps
     if (projection.bank != 0xFFFFFFFF && matrixId < 126) {
         uint at = 3 * matrixId;
         row0 = textureRow(projection.bank, at); row1 = textureRow(projection.bank, at + 1); row2 = textureRow(projection.bank, at + 2);
     }
+#endif
     float3 stq = float3(dot(row0, value), dot(row1, value), (gen & 2) != 0 ? dot(row2, value) : 1.0);
     if ((drawState.texPosts[id / 4][id % 4] & 256) != 0 && dot(stq, stq) > 0.0) stq = normalize(stq);
     float4 post = float4(stq, 1.0);
