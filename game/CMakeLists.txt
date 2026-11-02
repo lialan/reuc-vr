@@ -142,6 +142,10 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   # The lists of the optional backends are empty where those are off (macOS): copy_if_different needs at least one file.
   set(uc_post_build COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:uc>/data/shaders
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)
+  if(UC_FOLD_TEV)   # the headset's build-time specialized TEV modules (renderer/CMakeLists.txt)
+    add_dependencies(uc uc_folded_tev)
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_directory ${UC_FOLDED_DIR} $<TARGET_FILE_DIR:uc>/data/shaders/folded)
+  endif()
   if(UC_DIRECTX_SHADER_FILES)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_DIRECTX_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)
   endif()

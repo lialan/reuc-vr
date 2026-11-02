@@ -258,6 +258,8 @@ private:
     PipelineKey pipeline_key(const gx::DrawPacket& draw,bool alpha_pass=false) const;
     PipelineChoice pipeline_for(const PipelineKey& key);
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
+    VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early);   // tools/fold_tev_shaders.py's module for these constants, or null
+    std::mutex folded_mutex_; std::unordered_map<uint64_t,VkShaderModule> folded_modules_;
     void queue_pipeline(const PipelineKey& key,bool uber);   // pipelines_mutex_ held
     void load_pipeline_cache();
     void save_pipeline_cache();

@@ -818,6 +818,31 @@ VkPipeline VulkanRenderer::make_shadow_pipeline() {
     vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&create,nullptr,&pipeline),"shadow pipeline");
     return pipeline;
 }
+// The build-time specialized TEV fragment module for these constants and variant (1: early-Z), or null; loaded once, kept until shutdown.
+// Names: FNV-1a 64 of the 68 constants (little-endian words) and the variant byte, as tools/fold_tev_shaders.py writes them.
+VkShaderModule VulkanRenderer::folded_module(const std::array<uint32_t,68>& values,bool early) {
+    static const bool off=std::getenv("UC_NO_FOLDED_SHADERS")!=nullptr;   // diagnostics: the driver specializes every pipeline
+    if (off) return VK_NULL_HANDLE;
+    uint64_t hash=0xCBF29CE484222325ull;
+    const auto mix=[&](uint8_t byte) { hash^=byte; hash*=0x100000001B3ull; };
+    for (const uint32_t value:values) for (int shift=0;shift<32;shift+=8) mix(uint8_t(value>>shift));
+    mix(early ? 1 : 0);
+    std::lock_guard guard(folded_mutex_);
+    if (const auto found=folded_modules_.find(hash); found!=folded_modules_.end()) return found->second;
+    char file[32]; std::snprintf(file,sizeof file,"%016llx.spv",(unsigned long long)hash);
+    VkShaderModule module=VK_NULL_HANDLE;
+    std::ifstream in(shaders_/"folded"/file,std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(in)),{});
+    if (!code.empty() && code.size()%4==0) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; info.codeSize=code.size(); info.pCode=reinterpret_cast<const uint32_t*>(code.data());
+        if (vkCreateShaderModule(device,&info,nullptr,&module)!=VK_SUCCESS) module=VK_NULL_HANDLE;
+    }
+    folded_modules_.emplace(hash,module);   // a miss is remembered too
+    static std::atomic<uint32_t> hits{0},misses{0};
+    ++(module ? hits : misses);
+    if (((hits+misses)&63)==1) std::fprintf(stderr,"[pipeline] folded TEV modules: %u used, %u keys without one\n",hits.load(),misses.load());
+    return module;
+}
 VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     gx::BlendState mode;
     mode.mode=key[0]&3; mode.source=(key[0]>>2)&7; mode.destination=(key[0]>>5)&7; mode.logic=(key[0]>>8)&15;
@@ -852,6 +877,9 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkSpecializationInfo specialization{uint32_t(spec_entries.size()),spec_entries.data(),spec_values.size()*sizeof(uint32_t),spec_values.data()};
         VkSpecializationInfo uber_specialization{1,&alpha_entry,sizeof(uint32_t),&spec_values[67]};
         stages[1].pSpecializationInfo=uber ? &uber_specialization : &specialization;
+        // The headset: a module specialized at build time for exactly these constants (tools/fold_tev_shaders.py), when there is one. The
+        // driver's own specialization left most of the 600 KB module in (a one-stage quad ran 160-200 instructions a fragment).
+        if (!uber && layers_>1) if (const VkShaderModule folded=folded_module(spec_values,fragment==early_module_)) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
         static_assert(sizeof(gx::GpuMeshVertex)==108 && sizeof(gx::Projection)==64);
         VkVertexInputBindingDescription binding; std::array<VkVertexInputAttributeDescription,14> attributes;
         mesh_vertex_input(binding,attributes);
@@ -3099,6 +3127,8 @@ void VulkanRenderer::shutdown() {
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
         for (auto module:{vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        for (auto& [hash,module]:folded_modules_) if (module) vkDestroyShaderModule(device,module,nullptr);
+        folded_modules_.clear();
         shadow_vertex_module_=VK_NULL_HANDLE;
         vertex_module_=fragment_module_=early_module_=uber_module_=VK_NULL_HANDLE;
         if (layout_) vkDestroyPipelineLayout(device, layout_, nullptr);

@@ -205,6 +205,15 @@ foreach(stage vert frag)
 endforeach()
 # HOTD4 VR's overlay shaders (GLSL, unchanged): glslangValidator, as lindberghrecomp builds them.
 find_program(UC_GLSLANG glslangValidator)
+# The headset's TEV fragment modules specialized at build time for the known pipeline keys (tools/fold_tev_shaders.py): the Quest's driver
+# leaves most of the module in when it specializes. On by default where the headset is built (UC_OPENXR); needs spirv-opt (SPIRV-Tools).
+find_program(UC_SPIRV_OPT spirv-opt HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+if(UC_OPENXR AND UC_SPIRV_OPT)
+  set(UC_FOLD_TEV_DEFAULT ON)
+else()
+  set(UC_FOLD_TEV_DEFAULT OFF)
+endif()
+option(UC_FOLD_TEV "Build-time specialized TEV fragment modules for the headset" ${UC_FOLD_TEV_DEFAULT})
 set(UC_XR_OVERLAY_SPV)
 if(UC_GLSLANG)
   foreach(program gun beam panel)
@@ -227,6 +236,20 @@ set(UC_SHADER_FILES ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motio
   ${shader_dir}/rt_denoise.temporal.spv ${shader_dir}/rt_denoise.atrous.spv ${shader_dir}/rt_shadow.trace.spv ${shader_dir}/rt_shadow.composite.spv
   ${shader_dir}/rt_reflect.trace.spv ${shader_dir}/rt_reflect.composite.spv ${shader_dir}/rt_path.accumulate.spv ${shader_dir}/rt_path.list.spv ${shader_dir}/rt_path.trace.spv ${shader_dir}/rt_path.composite.spv ${shader_dir}/rr_inputs.spv ${shader_dir}/dlss5.prepare.spv ${shader_dir}/dlss5.resolve.spv CACHE INTERNAL "")
 add_custom_target(uc_smoke_shaders DEPENDS ${UC_SHADER_FILES})
+if(UC_FOLD_TEV)
+  if(NOT UC_SPIRV_OPT)
+    message(FATAL_ERROR "UC_FOLD_TEV needs spirv-opt")
+  endif()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(UC_FOLDED_DIR ${shader_dir}/folded CACHE INTERNAL "")
+  add_custom_command(OUTPUT ${shader_dir}/folded.stamp
+    COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/fold_tev_shaders.py --spirv-opt ${UC_SPIRV_OPT} --shaders ${shader_dir}
+            --out ${shader_dir}/folded ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed ${CMAKE_SOURCE_DIR}/project/pipeline_keys.quest
+    COMMAND ${CMAKE_COMMAND} -E touch ${shader_dir}/folded.stamp
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/fold_tev_shaders.py ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv
+    VERBATIM)
+  add_custom_target(uc_folded_tev DEPENDS ${shader_dir}/folded.stamp)
+endif()
 # DLSS 5 Neural Rendering: the support/failure/parameter logic above the NGX SDK (no SDK or GPU needed, tested with a fake backend).
 add_library(uc_dlss5 STATIC ngx_dlss5.cpp)
 target_include_directories(uc_dlss5 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/common)   # common: from_chars_compat.h (dlss5_settings.h)
