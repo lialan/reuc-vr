@@ -1,4 +1,5 @@
 #include "det_trace.h"
+#include "path_print.h"
 #include "fatal.h"
 #include "file_open.h"
 #include <cstdio>
@@ -22,7 +23,7 @@ uint64_t hash_chunk(const uint8_t* data, size_t size) {
 DetTrace::DetTrace(const std::filesystem::path& out, const uint8_t* mem, uint32_t frames) : mem_(mem), frames_(frames) {
     dump_path_ = out;
     file_ = uc_fopen(out, "wb");
-    if (!file_) fatal("cannot create the determinism trace %s", out.string().c_str());
+    if (!file_) fatal("cannot create the determinism trace " UC_PATH_FMT, UC_PATH_ARG(out));
 }
 
 DetTrace::~DetTrace() { if (file_) std::fclose(file_); }

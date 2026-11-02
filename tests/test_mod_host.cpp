@@ -258,8 +258,8 @@ static void mods_switch_on_and_off_live() {
     hook_registry().clear();
     const auto dir = fresh("host_live");
     for (const char* id : {"a", "b", "c"}) add_mod(dir, id, R"("touches_gameplay":true,"script":"scripts/main.lua")");
+    std::vector<std::string> dropped;   // before s: s's host still reports the mods it stops when s is destroyed
     Setup s(dir, {"a"});
-    std::vector<std::string> dropped;
     s.config.on_mod_dropped = [&](const std::string& id) { dropped.push_back(id); };
     s.make_host();
     s.host->start();
@@ -531,8 +531,8 @@ static void dropped_mods_are_reported() {
     const auto dir = fresh("host_dropped");
     add_mod(dir, "a", R"("script":"scripts/main.lua")");
     add_mod(dir, "b", R"("script":"scripts/main.lua")");
+    std::vector<std::string> dropped;   // before s, as above
     Setup s(dir, {"a", "b"});
-    std::vector<std::string> dropped;
     s.config.on_mod_dropped = [&](const std::string& id) { dropped.push_back(id); };
     s.make_host();
     s.host->start();

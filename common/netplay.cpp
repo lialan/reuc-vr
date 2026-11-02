@@ -115,10 +115,15 @@ Socket::Socket(const Endpoint& endpoint, std::stop_token stop, std::chrono::mill
     if (endpoint.host) {
         Handle listener(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
         if (listener.value == INVALID_SOCKET) socket_error("Cannot create listening socket");
-#ifdef _WIN32   // POSIX sockets are exclusive without SO_REUSEADDR
+#ifdef _WIN32
         const BOOL exclusive = TRUE;
         if (setsockopt(listener.value, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == SOCKET_ERROR)
             socket_error("Cannot reserve listening port");
+#else
+        // Windows binds over a previous session's TIME_WAIT connections; POSIX needs SO_REUSEADDR for that. It still refuses a second
+        // active listener on the same address and port (that takes SO_REUSEPORT), so the port stays exclusive as on Windows.
+        const int reuse = 1;
+        if (setsockopt(listener.value, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) socket_error("Cannot reserve listening port");
 #endif
         address.sin_addr.s_addr = htonl(endpoint.loopback ? INADDR_LOOPBACK : INADDR_ANY);
         if (bind(listener.value, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {

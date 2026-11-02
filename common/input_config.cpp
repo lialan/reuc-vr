@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 namespace uc {
@@ -218,10 +219,20 @@ void save_config(const std::filesystem::path& path,ConfigDocument& document) {
         throw;
     }
 #else
-    // One writer at a time: an flock on <config>.write-lock (released by the kernel when a writer dies, unlike a lock file alone).
+    // One writer at a time: an flock on <config>.write-lock (released by the kernel when a writer dies, unlike a lock file alone). The
+    // holder removes the file when done, as Windows' delete-on-close does. A writer that opened the file just before that removal would
+    // then lock an inode no longer at the path while a later writer locks a new one, so the lock only counts once the locked inode is
+    // still the one the path names; otherwise open again.
     auto lock_path=path; lock_path+=".write-lock";
-    Fd lock(::open(lock_path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600));
-    if(lock.value<0 || flock(lock.value,LOCK_EX|LOCK_NB)!=0)io_error("writer lock unavailable; another writer may be active");
+    Fd lock(-1);
+    for(int attempt=0;; ++attempt) {
+        if(lock.value>=0)::close(lock.value);
+        lock.value=::open(lock_path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);
+        if(lock.value<0 || flock(lock.value,LOCK_EX|LOCK_NB)!=0)io_error("writer lock unavailable; another writer may be active");
+        struct stat held{}, named{};
+        if(fstat(lock.value,&held)==0 && ::stat(lock_path.c_str(),&named)==0 && held.st_dev==named.st_dev && held.st_ino==named.st_ino)break;
+        if(attempt==8)io_error("writer lock unavailable; another writer may be active");
+    }
     if(read_file(path)!=document.original_bytes)throw std::runtime_error("config: file changed since loading; reload before saving");
     static std::atomic<uint64_t> serial=0;
     const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -231,7 +242,12 @@ void save_config(const std::filesystem::path& path,ConfigDocument& document) {
         Fd file(::open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0644));
         if(file.value<0)io_error("cannot create temporary file");
         created=true;
-        if(::write(file.value,bytes.data(),bytes.size())!=ssize_t(bytes.size()))io_error("cannot write temporary file");
+        for(size_t done=0; done<bytes.size();) {
+            const ssize_t n=::write(file.value,bytes.data()+done,bytes.size()-done);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0) { if(n==0)errno=EIO; io_error("cannot write temporary file"); }
+            done+=size_t(n);
+        }
         if(flush_file(file.value)!=0)io_error("cannot flush temporary file");
         // rename(2) replaces the file atomically: readers see the old configuration or the new one.
         if(std::rename(temporary.c_str(),path.c_str())!=0)io_error("cannot replace file");
@@ -242,7 +258,7 @@ void save_config(const std::filesystem::path& path,ConfigDocument& document) {
             throw std::runtime_error("config: save failed and temporary file cleanup failed");
         throw;
     }
-    ::unlink(lock_path.c_str());
+    ::unlink(lock_path.c_str());   // still holding the flock: a writer that opened this inode meanwhile sees it is gone and opens again
 #endif
     document.original_bytes=bytes;
 }

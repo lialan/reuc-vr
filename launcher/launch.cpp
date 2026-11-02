@@ -139,6 +139,10 @@ std::string query_features(const std::filesystem::path& executable,const std::fi
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions,1,output_text.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0600);
     posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0);
+#if defined(__APPLE__) || defined(__GLIBC__)
+    const std::string directory_text=exe.parent_path().string();   // the child starts in the game's folder, as on Windows
+    posix_spawn_file_actions_addchdir_np(&actions,directory_text.c_str());
+#endif
     pid_t child=0;
     std::string text;
     if(posix_spawn(&child,exe_text.c_str(),&actions,nullptr,argv.data(),environ)==0) {

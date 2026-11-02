@@ -72,6 +72,8 @@ inline VkColorComponentFlags gbuffer_write_mask(const PipelineKey& key) {
 }
 
 // Whether a draw writes the RT material-record and albedo attachments: the G-buffer's draws, except logic-op ones (the op would apply to the record index).
+// A key that without_logic_op converted (no logicOp on the device) is a blend key and so writes them; that only matters with ray tracing,
+// which no device without logicOp (Metal) exposes today.
 inline bool rt_material_write(const PipelineKey& key) {
     return gbuffer_write_mask(key) && (key[0]&3)!=2;
 }

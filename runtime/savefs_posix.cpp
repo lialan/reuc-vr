@@ -27,7 +27,7 @@ int error(int value) {
     switch (value) {
     case ENOENT: case ENOTDIR: return -106;
     case EEXIST: return -105;
-    case EACCES: case EPERM: case EBUSY: case ELOOP: case ETXTBSY: case EROFS: return -102;
+    case EACCES: case EPERM: case EISDIR: case EBUSY: case ELOOP: case ETXTBSY: case EROFS: return -102;
     case ENOSPC: case EDQUOT: return -108;
     case ENOTEMPTY: return -115;
     case EINVAL: case EBADF: case ENAMETOOLONG: return -101;

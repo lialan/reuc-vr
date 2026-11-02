@@ -1,4 +1,5 @@
 #include "prompt_picture.h"
+#include "path_print.h"
 #include "prompt_icons.h"
 #include "pad_glyphs.h"
 #include "wide_view.h"
@@ -166,7 +167,7 @@ void load_prompt_font(std::vector<char>& font_bytes) {
         if(files.empty())throw std::runtime_error("system fonts directory unavailable");
         std::ifstream file(files.front(),std::ios::binary);
         font_bytes.assign(std::istreambuf_iterator<char>(file),{});
-        if(font_bytes.empty() || font_bytes.size()>INT_MAX)throw std::runtime_error("prompt font unavailable: "+files.front().string());
+        if(font_bytes.empty() || font_bytes.size()>INT_MAX)throw std::runtime_error("prompt font unavailable: "+uc::path_utf8(files.front()));
         ImFontConfig font_config;font_config.FontDataOwnedByAtlas=false;
         if(!ImGui::GetIO().Fonts->AddFontFromMemoryTTF(font_bytes.data(),int(font_bytes.size()),20,&font_config))throw std::runtime_error("native prompt font initialization failed");
 }

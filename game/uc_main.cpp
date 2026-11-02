@@ -1,3 +1,5 @@
+#include <csignal>
+#include "path_print.h"
 #include "clock.h"
 #include "client_update_lock.h"
 #include "cpu_topology.h"
@@ -555,6 +557,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         const bool monitor_window=!options.width && !options.height;
         if(!options.width) options.width=uint32_t(mode->w);
         if(!options.height) options.height=uint32_t(mode->h);
+        // On a Retina display SDL reports the desktop in points, so the default internal resolution follows the point size (about 1.4x 720p
+        // on a 1512x982-point MacBook rather than 2.7x for its pixels) and the swapchain, sized in pixels, upscales it. That is deliberate:
+        // the GPU cost stays at what a 1080p monitor gets. --render-scale raises it to native density.
         if(!options.render_scale) options.render_scale=uc::monitor_render_scale(uint32_t(mode->w),uint32_t(mode->h));
         std::fprintf(stderr,"Monitor: %dx%d %.3g Hz;720p multiplier %.4gx\n",mode->w,mode->h,mode->refresh_rate,options.render_scale);
         int window_width=int(options.width),window_height=int(options.height);
@@ -1314,7 +1319,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         const bool failed=std::ferror(out)!=0;
         const int closed=std::fclose(out);
         if(failed || closed!=0) throw std::runtime_error("cannot write audio audit report");
-        std::fprintf(stderr,"audio gap report: %s\n",path.string().c_str());
+        std::fprintf(stderr,"audio gap report: " UC_PATH_FMT "\n",UC_PATH_ARG(path));
     }
     uc::audio_hle_shutdown();
     uc::game_input_shutdown();
@@ -1331,7 +1336,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     if (options.gx_gaps) {
         std::error_code error; fs::create_directories(exe_dir() / "debug", error);
         const auto path = exe_dir() / "debug" / ("gx-gaps-" + std::to_string(uc::host_process_id()) + ".txt");
-        if (std::FILE* out = uc::uc_fopen(path, "w")) { uc::gx_gap_audit_report(out); std::fclose(out); std::fprintf(stderr, "gx gap report: %s\n", path.string().c_str()); }
+        if (std::FILE* out = uc::uc_fopen(path, "w")) { uc::gx_gap_audit_report(out); std::fclose(out); std::fprintf(stderr, "gx gap report: " UC_PATH_FMT "\n", UC_PATH_ARG(path)); }
     }
     uc::trace_dump_all(stderr, 24);
     print_stats();
@@ -1342,6 +1347,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
 int wmain(int argc, wchar_t** argv) {
 #else
 int main(int argc, char** argv) {
+#endif
+#ifndef _WIN32
+    // A reader that went away (a closed terminal, a dead harness, a dropped netplay peer) is an error return on Windows; on POSIX it
+    // would raise SIGPIPE and kill the game with no report. Every write site already handles the EPIPE return.
+    std::signal(SIGPIPE, SIG_IGN);
 #endif
     uc::Options startup_options;
     std::optional<uc::DiagnosticLog> diagnostics;

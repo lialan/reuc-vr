@@ -1,4 +1,5 @@
 #include "crash_report.h"
+#include "path_print.h"
 #include "dispatch.h"
 #include "trace.h"
 #include <array>
@@ -212,11 +213,11 @@ bool crash_report_write(std::string_view reason, const void* host_context) noexc
         catch (...) { std::fprintf(out, "\nruntime state unavailable\n"); }
     }
     auto bundle = g_directory / name; bundle.replace_extension(".dump");
-    if (g_bundle) std::fprintf(out, "\nbundle: %s\n", bundle.string().c_str());
+    if (g_bundle) std::fprintf(out, "\nbundle: " UC_PATH_FMT "\n", UC_PATH_ARG(bundle));
     std::fclose(out);
-    std::fprintf(stderr, "crash report: %s\n", (g_directory / name).string().c_str());
+    std::fprintf(stderr, "crash report: " UC_PATH_FMT "\n", UC_PATH_ARG(g_directory / name));
     if (g_bundle) {
-        try { g_bundle(bundle); std::fprintf(stderr, "crash bundle: %s\n", bundle.string().c_str()); }
+        try { g_bundle(bundle); std::fprintf(stderr, "crash bundle: " UC_PATH_FMT "\n", UC_PATH_ARG(bundle)); }
         catch (...) { std::fprintf(stderr, "crash bundle failed\n"); }   // the report is already on disk
     }
     return true;

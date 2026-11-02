@@ -1,4 +1,5 @@
 #include "ui_fonts.h"
+#include "path_print.h"
 #include <imgui.h>
 #include <cstdio>
 #include <filesystem>
@@ -17,8 +18,8 @@ Fonts load_fonts(ImFontAtlas& atlas) {
     for(const auto& file:sans_files) {
         std::ifstream source(file,std::ios::binary);
         std::vector<char> data(std::istreambuf_iterator<char>(source),{});
-        std::fprintf(stderr,"[ui-font] %s bytes=%zu%s\n",file.filename().string().c_str(),data.size(),data.empty() ? " (missing)" : "");
-        if(data.empty()) {if(fonts.bytes.empty())throw std::runtime_error("UI font unavailable: "+file.string());continue;}
+        std::fprintf(stderr,"[ui-font] " UC_PATH_FMT " bytes=%zu%s\n",UC_PATH_ARG(file.filename()),data.size(),data.empty() ? " (missing)" : "");
+        if(data.empty()) {if(fonts.bytes.empty())throw std::runtime_error("UI font unavailable: "+uc::path_utf8(file));continue;}
         if(data.size()>64*1024*1024)throw std::runtime_error("UI font too large");
         ImFontConfig config;config.FontDataOwnedByAtlas=false;config.MergeMode=!fonts.bytes.empty();
         fonts.bytes.push_back(std::move(data));auto& bytes=fonts.bytes.back();
@@ -27,8 +28,8 @@ Fonts load_fonts(ImFontAtlas& atlas) {
     fonts.sans=atlas.Fonts[0];
     std::ifstream serif_source(serif_files.front(),std::ios::binary);
     std::vector<char> serif_data(std::istreambuf_iterator<char>(serif_source),{});
-    std::fprintf(stderr,"[ui-font] %s bytes=%zu%s\n",serif_files.front().filename().string().c_str(),serif_data.size(),serif_data.empty() ? " (missing)" : "");
-    if(serif_data.empty())throw std::runtime_error("UI serif font unavailable: "+serif_files.front().string());
+    std::fprintf(stderr,"[ui-font] " UC_PATH_FMT " bytes=%zu%s\n",UC_PATH_ARG(serif_files.front().filename()),serif_data.size(),serif_data.empty() ? " (missing)" : "");
+    if(serif_data.empty())throw std::runtime_error("UI serif font unavailable: "+uc::path_utf8(serif_files.front()));
     const size_t fallback_count=fonts.bytes.size();fonts.bytes.push_back(std::move(serif_data));
     ImFontConfig serif_config;serif_config.FontDataOwnedByAtlas=false;
     fonts.serif=atlas.AddFontFromMemoryTTF(fonts.bytes.back().data(),int(fonts.bytes.back().size()),22,&serif_config);

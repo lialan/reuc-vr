@@ -3,6 +3,7 @@
 #include "diagnostic_log.h"
 #include "exe_path.h"
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,7 @@ std::atomic<unsigned> sequence{0};
 bool write_all(int fd, const char* data, size_t size) {
     while (size) {
         const ssize_t written = ::write(fd, data, size);
+        if (written < 0 && errno == EINTR) continue;
         if (written <= 0) return false;
         data += written; size -= size_t(written);
     }
@@ -86,6 +88,7 @@ struct DiagnosticLog::Impl {
                 std::string pending;
                 for (;;) {
                     const ssize_t count = ::read(read, bytes, sizeof(bytes));
+                    if (count < 0 && errno == EINTR) continue;
                     if (count <= 0) break;
                     pending.append(bytes, size_t(count));
                     size_t first = 0;

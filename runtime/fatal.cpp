@@ -66,7 +66,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
 }
 #else
 // SIGSEGV/SIGBUS (a stray access: macOS reports some as SIGBUS), SIGILL, SIGFPE, SIGTRAP (__builtin_trap). The handler runs on the alternate
-// stack crash_guard_thread installs, so a stack overflow is reported too. SA_RESETHAND: a fault inside the handler ends the process.
+// stack crash_guard_thread installs, so a stack overflow is reported too. No SA_RESETHAND: a second thread that faults while the first
+// writes the report must reach crash_report_write, which holds it until that report is done (as the Windows filter does). A fault
+// inside the handler still ends the process: the signal stays blocked while its handler runs (no SA_NODEFER).
 static void crash_signal(int signal, siginfo_t* info, void* context) {
     const uintptr_t pc = host_context_pc(context);
     const bool access = signal == SIGSEGV || signal == SIGBUS;
@@ -111,7 +113,7 @@ void install_crash_handlers() {
 #else
     struct sigaction action{};
     action.sa_sigaction = crash_signal;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     for (int signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(signal, &action, nullptr);
 #endif

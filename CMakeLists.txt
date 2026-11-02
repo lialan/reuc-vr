@@ -21,8 +21,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND UC_MSVC_FRONTEND)
   add_compile_options(/clang:-march=x86-64-v3)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
   # NEON is part of the arm64 baseline; the CPU target adds the newer instructions (fp16, dot product, LSE atomics, RCPC).
-  set(UC_TARGET_CPU "apple-m1" CACHE STRING "-mcpu for arm64 builds (apple-m1 runs on every Apple Silicon Mac)")
-  add_compile_options(-mcpu=${UC_TARGET_CPU})
+  # apple-m1 runs on every Apple Silicon Mac. Other arm64 targets (Android, Linux) pick their own CPU: there is no safe default above
+  # the baseline (an M1-only instruction would be SIGILL on an older core).
+  if(APPLE)
+    set(UC_TARGET_CPU "apple-m1" CACHE STRING "-mcpu for arm64 builds")
+  else()
+    set(UC_TARGET_CPU "" CACHE STRING "-mcpu for arm64 builds (e.g. cortex-a78 for a Quest 3 build); empty = the arm64 baseline")
+  endif()
+  if(UC_TARGET_CPU)
+    add_compile_options(-mcpu=${UC_TARGET_CPU})
+  endif()
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wno-deprecated-declarations)   # "unsafe CRT function" (getenv, fopen), winsock and std::filesystem::u8path notes in the tools and third-party code are noise

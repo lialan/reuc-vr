@@ -2,6 +2,7 @@
 // (commands in) and -evt.sock (events out), each taking one client, carrying the same JSON lines (scripts/uctest/transport.py).
 // accept and read wait in poll() with a short timeout, so the destructor can stop both threads (closing a socket does not wake them on macOS).
 #include "test_pipe.h"
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -45,7 +46,8 @@ bool wait_readable(int fd, const std::atomic<bool>& stop) {
     }
     return false;
 }
-struct Sockets { int cmd_listen = -1, evt_listen = -1, cmd = -1, evt = -1; std::string cmd_path, evt_path; };
+// cmd/evt are set by the reader/writer threads and read by the destructor, hence atomic.
+struct Sockets { int cmd_listen = -1, evt_listen = -1; std::atomic<int> cmd{-1}, evt{-1}; std::string cmd_path, evt_path; };
 Sockets& sockets(void* p) { return *static_cast<Sockets*>(p); }
 }  // namespace
 
@@ -73,10 +75,13 @@ TestPipes::~TestPipes() {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
-    stop_ = true; out_cv_.notify_all();
-    reader_.join(); writer_.join();
     auto& s = sockets(cmd_);
-    for (int fd : {s.cmd, s.evt, s.cmd_listen, s.evt_listen}) if (fd >= 0) close(fd);
+    { std::lock_guard g(out_mutex_); stop_ = true; }   // under the lock: the writer cannot miss the wake-up between its check and its wait
+    out_cv_.notify_all();
+    // A writer blocked in send() on a full buffer (the harness stopped reading) only returns once the socket is shut down.
+    for (int fd : {s.cmd.load(), s.evt.load()}) if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    reader_.join(); writer_.join();
+    for (int fd : {s.cmd.load(), s.evt.load(), s.cmd_listen, s.evt_listen}) if (fd >= 0) close(fd);
     unlink(s.cmd_path.c_str()); unlink(s.evt_path.c_str());
     delete &s;
 }
