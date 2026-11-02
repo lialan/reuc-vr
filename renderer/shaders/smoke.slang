@@ -50,8 +50,10 @@ struct MotionBlock { float4 prevRows[4]; uint prevPalette; uint kind; uint2 unus
 #ifdef STEREO
 // The headset (STEREO): binding 5 holds each draw's two eye transforms (Vulkan clip to Vulkan clip, rows), HOTD4's per-draw reprojection
 // by draw class (xr/stereo_projection.c); projection.motion indexes it.
+// A uniform buffer bound at the draw's own block: the shader core holds it as constants. Read from a storage buffer, every vertex
+// fetched the same 128 bytes through memory (the Quest's scene pass: 23 -> 16 ms without that fetch).
 struct StereoBlock { float4 rows[2][4]; };
-[[vk::binding(5, 0)]] StructuredBuffer<StereoBlock> stereoBlocks : register(t10);
+[[vk::binding(5, 0)]] ConstantBuffer<StereoBlock> eyeBlock : register(b10);
 #else
 [[vk::binding(5, 0)]] StructuredBuffer<MotionBlock> motions : register(t10);
 #endif
@@ -161,10 +163,10 @@ Output vertexMain(Input input) {
 #endif
     output.position.xy += projection.shift * output.position.w;
 #ifdef STEREO
-    if (projection.motion != 0xFFFFFFFF) {
+    {   // every stereo draw has its block (the renderer writes one per draw): the canonical multiview form, the view's matrix from a
+        // uniform buffer, unconditionally, so the driver can shade the rest of the vertex once for both eyes
         const float4 clip = output.position;
-        StereoBlock eye = stereoBlocks[projection.motion];
-        output.position = float4(dot(eye.rows[view][0], clip), dot(eye.rows[view][1], clip), dot(eye.rows[view][2], clip), dot(eye.rows[view][3], clip));
+        output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
     }
 #endif   // late aim: a clip-space translation, so a quad the game placed at the screen edge is clipped after the move, not before
     // View-space normal: the loaded normal matrix applied to the object normal; without a loaded matrix the object normal stays (position-only fixtures).

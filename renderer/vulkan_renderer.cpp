@@ -37,6 +37,7 @@ namespace uc {
 namespace {
 // Per-draw uniform block: the GX draw state followed by the pipeline key words the ubershader reads (key[1..67], padded to 17 vec4).
 constexpr size_t kTevWords=68, kDrawUniformBytes=sizeof(gx::DrawUniform)+kTevWords*sizeof(uint32_t);
+constexpr size_t kStereoBlockBytes=128;   // smoke.slang StereoBlock: two eyes x four rows
 const std::shared_ptr<const gx::TexturePixels>& draw_texture(const gx::DrawPacket& draw,size_t map) { return map ? draw.texture_maps[map-1] : draw.texture; }
 void vk_check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: VkResult " + std::to_string(result));
@@ -397,6 +398,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     VkPhysicalDeviceProperties limits{}; vkGetPhysicalDeviceProperties(physical_,&limits);
     const auto alignment=size_t(limits.limits.minUniformBufferOffsetAlignment);
     uniform_stride_=(kDrawUniformBytes+alignment-1)/alignment*alignment;
+    stereo_stride_=(kStereoBlockBytes+alignment-1)/alignment*alignment;   // the headset's eye blocks, one uniform-buffer binding each
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pool_info.queueFamilyIndex = family_;
     vk_check(vkCreateCommandPool(device, &pool_info, nullptr, &pool_), "command pool");
     VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; allocation.commandPool = pool_; allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; allocation.commandBufferCount = uint32_t(slots_.size());
@@ -439,7 +441,7 @@ constexpr uint32_t kNoBank=UINT32_MAX;
 // bank: texture bank index, kNoBank = the texgen's own matrix. motion (kNoMotion = none), jitter (target pixels) and viewport (target pixels)
 // are read by the upscaling variant only.
 constexpr uint32_t kNoMotion=UINT32_MAX;
-constexpr size_t kStereoBlockBytes=128;   // smoke.slang StereoBlock: two eyes x four rows
+
 constexpr VkFormat kMotionFormat=VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkFormat kGBufferFormat=VK_FORMAT_R16G16B16A16_UNORM;   // gbuffer.h
 constexpr float kShadowDistance=30.f;   // how far from the camera the shadow map reaches, in view units (metres)
@@ -827,7 +829,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     {
         if (!layout_) {
         VkPushConstantRange projection{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof(DrawPush))};
-        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};
+        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};   // 5: the headset's eye block (uniform) or motion blocks
         VkDescriptorSetLayoutCreateInfo texture_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; texture_layout.bindingCount=6; texture_layout.pBindings=texture_bindings;
         vk_check(vkCreateDescriptorSetLayout(device,&texture_layout,nullptr,&texture_layout_),"texture descriptor layout");
         create_samplers();
@@ -2123,8 +2125,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (size_t i=0;i<banks.size();++i) std::memcpy(static_cast<gx::TextureBank*>(slot.banks.mapped)+i,banks[i],sizeof(gx::TextureBank));
     }
     {   // bound even when no draw reads it
-        const VkDeviceSize motion_bytes=layers_>1 ? VkDeviceSize(std::max<size_t>(packet.draws.size(),1))*kStereoBlockBytes : VkDeviceSize(std::max<size_t>(motion_blocks.size(),1))*sizeof(MotionBlock);
-        if (slot.motions.size < motion_bytes) { destroy_buffer(slot.motions); slot.motions = make_buffer(motion_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        const VkDeviceSize motion_bytes=layers_>1 ? VkDeviceSize(std::max<size_t>(packet.draws.size(),1))*stereo_stride_ : VkDeviceSize(std::max<size_t>(motion_blocks.size(),1))*sizeof(MotionBlock);
+        if (slot.motions.size < motion_bytes) { destroy_buffer(slot.motions); slot.motions = make_buffer(motion_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT); }
         if (!motion_blocks.empty()) std::memcpy(slot.motions.mapped, motion_blocks.data(), motion_blocks.size()*sizeof(MotionBlock));
     }
     if (!records.empty()) {   // the frame's record and light arrays: grow-only per frame-in-flight slot
@@ -2152,7 +2154,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if(count>slot.descriptor_capacity) {
             if(slot.texture_pool) vkDestroyDescriptorPool(device,slot.texture_pool,nullptr);
             slot.texture_pool=VK_NULL_HANDLE; slot.descriptor_capacity=0; slot.texture_sets.clear();
-            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,count*3}};
+            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,layers_>1 ? count*2 : count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,layers_>1 ? count*2 : count*3}};
             VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=count; pool.poolSizeCount=4; pool.pPoolSizes=sizes;
             vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.texture_pool),"texture descriptor pool");
             std::vector<VkDescriptorSetLayout> layouts(count,texture_layout_);
@@ -2226,6 +2228,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             VkDescriptorBufferInfo palette{slot.palettes.buffer,0,VK_WHOLE_SIZE};
             VkDescriptorBufferInfo bank{slot.banks.buffer,0,VK_WHOLE_SIZE};
             VkDescriptorBufferInfo motion{slot.motions.buffer,0,VK_WHOLE_SIZE};
+            if (layers_>1) motion={slot.motions.buffer,VkDeviceSize(i)*stereo_stride_,kStereoBlockBytes};   // this draw's eye block
             VkWriteDescriptorSet writes[6]{};
             for (uint32_t binding=0;binding<6;++binding) { writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=slot.texture_sets[i]; writes[binding].dstBinding=binding; writes[binding].descriptorCount=1; }
             writes[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[0].descriptorCount=8; writes[0].pImageInfo=image.data();
@@ -2233,7 +2236,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             writes[2].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[2].pBufferInfo=&uniform;
             writes[3].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[3].pBufferInfo=&palette;
             writes[4].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[4].pBufferInfo=&bank;
-            writes[5].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
+            writes[5].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
             vkUpdateDescriptorSets(device,6,writes,0,nullptr);
         }
     }
@@ -2657,7 +2660,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // The aim reticle (and its wake) marks a place in the world: it stays on HOTD4's world-locked screen when the HUD follows the head.
                 if (kind==LG_STEREO_HUD && (draw.reticle || draw.late_aim || draw.wake)) kind=xr::LG_STEREO_HUD_AIM;
                 const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
-                float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*kStereoBlockBytes);
+                float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*stereo_stride_);
                 for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
                     const float* m=matrices.view_projection[eye];
                     const auto gl=[&](int r,int c){return double(m[c*4+r]);};

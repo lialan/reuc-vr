@@ -370,6 +370,7 @@ private:
     uint64_t bloom_generation_=0; // BloomPass::generation() the HDR pass's descriptor sets were last reset for
     BloomLayer bloom_layer(VkOffset2D origin, VkExtent2D size) const;   // the glow for an HDR encode of this EFB rectangle; empty unless this frame's glow is valid
     static constexpr uint32_t kFragQueries=16384; VkQueryPool frag_pool_=VK_NULL_HANDLE; bool frag_dump_=false; std::vector<uint32_t> frag_queries_;   // UC_FRAG_DUMP
+    size_t stereo_stride_=128;   // bytes between the headset's eye blocks (minUniformBufferOffsetAlignment)
     bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
