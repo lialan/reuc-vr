@@ -30,7 +30,7 @@ Two consequences:
 
 | Tool | Notes |
 |---|---|
-| Windows 10 / 11, 64-bit | The port is Windows-only |
+| Windows 10 / 11, 64-bit | For macOS (Apple Silicon) see [Building on macOS](building-macos.md) |
 | **Visual Studio Build Tools** (or Visual Studio) with the **"Desktop development with C++"** workload | MSVC runtime, Windows SDK, resource compiler |
 | **LLVM** with `clang-cl` | The project is built with `clang-cl` |
 | **CMake** 3.25 or newer | |

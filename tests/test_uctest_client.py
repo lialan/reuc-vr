@@ -22,7 +22,7 @@ class ClientTest(unittest.TestCase):
     def test_session_logs_select_own_process_and_keep_legacy_fallback(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()   # macOS: the temporary folder lies behind the /var -> /private/var link
             g = Game(exe=str(root / "uc.exe"), launch=False)
             g.process = SimpleNamespace(pid=123)
             self.assertEqual(g.log_path("mods.log"), root / "debug" / "mods.log")

@@ -20,7 +20,11 @@ static fs::path fresh(const std::u8string& name) {
 static void make_zip(const fs::path& path, const std::map<std::string, std::string>& entries) {
     mz_zip_archive zip{};
     FILE* file = nullptr;
+#ifdef _WIN32
     _wfopen_s(&file, path.c_str(), L"wb");
+#else
+    file = std::fopen(path.c_str(), "wb");
+#endif
     CHECK(file && mz_zip_writer_init_cfile(&zip, file, 0));
     for (const auto& [name, data] : entries) CHECK(mz_zip_writer_add_mem(&zip, name.c_str(), data.data(), data.size(), MZ_BEST_SPEED));
     CHECK(mz_zip_writer_finalize_archive(&zip));

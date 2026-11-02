@@ -1,5 +1,5 @@
 add_executable(gen_e2e_dols gen_e2e_dols.cpp)
-target_include_directories(gen_e2e_dols PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_SOURCE_DIR}/runtime)
+target_include_directories(gen_e2e_dols PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_SOURCE_DIR}/runtime ${CMAKE_SOURCE_DIR}/common)
 
 set(E2E_PROGRAMS loop calls jt0 jt1 jt2 jt9 indirect float ps datawords badbctr illegal_exec secondary fallthrough outside crflow)
 foreach(p ${E2E_PROGRAMS})
@@ -36,5 +36,7 @@ add_test(NAME translator_two_cfgs
   COMMAND ${CMAKE_COMMAND} -DTRANSLATOR=$<TARGET_FILE:translator> -DDOL=${CMAKE_CURRENT_BINARY_DIR}/gen_jt1/jt1.dol
           -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cfgs -P ${CMAKE_CURRENT_SOURCE_DIR}/../test_cfg_merge.cmake)
 
-add_test(NAME translator_publish_atomic
-  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/../test_translation_publish.py $<TARGET_FILE:translator> ${CMAKE_CURRENT_BINARY_DIR}/gen_jt1/jt1.dol ${CMAKE_CURRENT_BINARY_DIR}/publish)
+if(WIN32)
+  add_test(NAME translator_publish_atomic
+    COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/../test_translation_publish.py $<TARGET_FILE:translator> ${CMAKE_CURRENT_BINARY_DIR}/gen_jt1/jt1.dol ${CMAKE_CURRENT_BINARY_DIR}/publish)
+endif()

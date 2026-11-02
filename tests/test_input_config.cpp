@@ -5,7 +5,13 @@
 #include <chrono>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 using namespace uc;
 template<class F> static void rejects(F f) {
     bool caught=false; try {f();} catch(const std::exception&) {caught=true;} CHECK(caught);
@@ -56,19 +62,33 @@ int main() {
     CHECK(load_config(path).properties["unrelated"]==123);
     auto invalid=saved; invalid.input[size_t(Action::fire)]={{BindingKind::physical,{PhysicalKind::key,0},{}}};
     rejects([&]{save_config(path,invalid);}); CHECK(load_config(path).input==saved.input);
+#ifdef _WIN32
     auto lock_path=path; lock_path+=L".write-lock";
     std::ofstream writer_lock(lock_path); writer_lock<<"other writer"; writer_lock.close();
     rejects([&]{save_config(path,saved);}); CHECK(load_config(path).properties["unrelated"]==123);
+#else
+    {   // another writer holds the lock (an flock: a lock file a crashed writer left behind does not block)
+        auto lock_path=path; lock_path+=".write-lock";
+        const int other=::open(lock_path.c_str(),O_RDWR|O_CREAT,0600); CHECK(other>=0 && flock(other,LOCK_EX|LOCK_NB)==0);
+        rejects([&]{save_config(path,saved);}); CHECK(load_config(path).properties["unrelated"]==123);
+        flock(other,LOCK_UN); ::close(other);
+        std::ofstream(lock_path)<<"left by a crashed writer";
+        save_config(path,saved); CHECK(load_config(path).properties["unrelated"]==123);
+    }
+#endif
     auto modifiers=parse_config(R"({"input":{"version":1,"bindings":{"fire":[{"kind":"mouse","code":3,"modifiers":[{"kind":"key","code":224}]}]}}})");
     CHECK(parse_config(serialize_config(modifiers)).input==modifiers.input);
     auto rollback_path=path.parent_path()/"rollback.json";
     auto rollback=load_config(rollback_path);save_config(rollback_path,rollback);
+    rollback.properties["new_value"]=7;
+#ifdef _WIN32   // a reader without delete sharing blocks the replace (Windows share modes; POSIX replaces an open file)
     auto reader=CreateFileW(rollback_path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
     CHECK(reader!=INVALID_HANDLE_VALUE);
-    rollback.properties["new_value"]=7;
     rejects([&]{save_config(rollback_path,rollback);});
     CHECK(!load_config(rollback_path).properties.contains("new_value"));
-    CloseHandle(reader);save_config(rollback_path,rollback);
+    CloseHandle(reader);
+#endif
+    save_config(rollback_path,rollback);
     CHECK(load_config(rollback_path).properties["new_value"]==7);
     std::ofstream(path)<<"{bad";
     rejects([&]{load_config(path);}); rejects([&]{save_config(path,saved);});

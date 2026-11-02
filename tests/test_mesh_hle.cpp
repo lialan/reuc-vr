@@ -109,7 +109,7 @@ int main() {
         CHECK(uc::gx_stats().geometry_hits==restore_hits+1);
         CHECK(packet->draws[0].mesh==retained_mesh);
 
-        const uint32_t restored_position=_byteswap_ulong(std::bit_cast<uint32_t>(77.f));
+        const uint32_t restored_position=uc_bswap32(std::bit_cast<uint32_t>(77.f));
         std::memcpy(ppc::hp(c,0x80003000),&restored_position,sizeof restored_position);
         auto restore_misses=uc::gx_stats().geometry_misses;
         uc::gx_restore(*saved_gx);

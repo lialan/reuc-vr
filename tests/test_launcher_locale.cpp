@@ -4,9 +4,10 @@
 #include <set>
 #include <string>
 #include <cstdio>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
+#endif
 int main() {
     using namespace uc::launcher;
     CHECK(languages().size()==13);
@@ -16,10 +17,18 @@ int main() {
     CHECK(resolve_language("zh-CN")=="zh-Hans");
     CHECK(resolve_language("ja-JP")=="ja");
     CHECK(resolve_language("ar-SA")=="en");
+#ifdef _WIN32
     ULONG count=0,length=4096;std::wstring preferred(length,L'\0');
     CHECK(GetUserPreferredUILanguages(MUI_LANGUAGE_NAME,&count,preferred.data(),&length));
     std::wstring_view first(preferred.c_str());
     CHECK(system_language()==resolve_language(std::string(first.begin(),first.end())));
+#else
+    {   // the preferred UI language comes from SDL there: it resolves to one of the supported languages
+        const auto system=system_language(); bool known=false;
+        for(const auto& language:languages()) known|=system==language.code;
+        CHECK(known);
+    }
+#endif
     std::printf("system launcher language: %s\n",system_language().c_str());
     auto document=uc::parse_config(R"({"launcher":{"future":42},"graphics":{"future":7}})");
     CHECK(config_language(document)=="system");

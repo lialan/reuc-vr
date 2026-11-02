@@ -2,7 +2,9 @@
 #include "settings_menu.h"
 #include "localization.h"
 #include "vulkan_renderer.h"
+#ifdef _WIN32
 #include <intrin.h>
+#endif
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_internal.h>

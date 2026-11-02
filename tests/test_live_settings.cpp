@@ -5,12 +5,10 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "host_process.h"
 namespace fs=std::filesystem;
 int main() {
-    const auto path=fs::temp_directory_path()/("uc-live-settings-"+std::to_string(GetCurrentProcessId())+".json");
+    const auto path=fs::temp_directory_path()/("uc-live-settings-"+std::to_string(uc::host_process_id())+".json");
     { std::ofstream(path,std::ios::binary) << R"({"game":"C:/Games/Test/game","graphics":{"render_scale":0,"bloom":true,"upscaler":"dlss","upscale_mode":"quality","frame_generation":true,"frame_generation_multiplier":3}})"; }
     std::vector<std::string> calls;
     uc::SettingsTargets targets;

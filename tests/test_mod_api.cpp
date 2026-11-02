@@ -133,7 +133,7 @@ static void schema_consistency() {
             if (m["kind"] == "function") {
                 CHECK(member->call);
                 std::vector<std::string> names;
-                for (const auto& a : m["args"]) names.push_back(a["name"]);
+                if (m.contains("args")) for (const auto& a : m["args"]) names.push_back(a["name"]);   // const operator[] of a missing key is undefined
                 CHECK(member->arg_names == names);
             } else {
                 const std::string access = m["access"];

@@ -6,9 +6,7 @@
 #include <string>
 #include <variant>
 #include <vector>
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "host_process.h"
 using namespace uc;
 namespace fs=std::filesystem;
 namespace {
@@ -56,7 +54,7 @@ std::unique_ptr<Dlss5Runtime> open(const fs::path& directory, std::string& reaso
 void reset() { stats=Stats{}; config=Config{}; }
 }
 int main() {
-    const auto directory=fs::temp_directory_path()/("uc-ngx-dlss5-"+std::to_string(GetCurrentProcessId()));
+    const auto directory=fs::temp_directory_path()/("uc-ngx-dlss5-"+std::to_string(uc::host_process_id()));
     fs::remove_all(directory); fs::create_directories(directory);
     const auto missing=directory/"empty"; fs::create_directories(missing);
     { std::ofstream(directory/kDlss5Runtime,std::ios::binary) << "x"; }   // only its presence matters to the check; the fake stands in for NGX
