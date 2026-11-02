@@ -1,6 +1,10 @@
 #include "tev.slang"
 #include "gbuffer.slang"
 TEV_CONST(66, destinationAlphaPass);
+// Whether this pipeline's draws can fail the GX alpha test (pipeline key word 0 bit 16, every variant including the ubershader). A shader that
+// may discard turns off early depth rejection on tilers (Adreno LRZ / early-Z): with the test compiled out, hidden fragments are never shaded.
+// Defaults to 1 (the test runs) wherever the pipeline does not set it.
+[[vk::constant_id(67)]] const uint alphaTestActive = 1;
 
 struct Input {
     [[vk::location(0)]] float3 position : POSITION;
@@ -294,12 +298,14 @@ float4 shadeFragment(Output input) {
     }
 #endif
     float4 result=evaluateTev(uv,rasterColor0,rasterColor1);
-    uint alpha=uint(round(saturate(result.a)*255.0)), word=drawState.pixel.x;
-    bool first=alphaCompare(alpha,word&255,(word>>16)&7);
-    bool second=alphaCompare(alpha,(word>>8)&255,(word>>19)&7);
-    uint operation=(word>>22)&3;
-    bool pass=operation==0 ? first&&second : operation==1 ? first||second : operation==2 ? first!=second : first==second;
-    if(!pass) discard;
+    if(alphaTestActive!=0) {
+        uint alpha=uint(round(saturate(result.a)*255.0)), word=drawState.pixel.x;
+        bool first=alphaCompare(alpha,word&255,(word>>16)&7);
+        bool second=alphaCompare(alpha,(word>>8)&255,(word>>19)&7);
+        uint operation=(word>>22)&3;
+        bool pass=operation==0 ? first&&second : operation==1 ? first||second : operation==2 ? first!=second : first==second;
+        if(!pass) discard;
+    }
     result.rgb=applyFog(result.rgb,input.position.z);
     if(destinationAlphaPass!=0) result.a=float(drawState.pixel.z&255)/255.0;
     return result;

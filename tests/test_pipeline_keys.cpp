@@ -15,8 +15,23 @@ static void test_without_logic_op() {   // a GPU without logicOp (MoltenVK) draw
     k[0]=1u|(4u<<2)|(5u<<5)|(3u<<8)|writes;   // an ordinary blend is left alone
     CHECK(uc::without_logic_op(k)==k);
 }
+static void test_alpha_test_bit() {   // pipelines whose draws cannot fail the GX alpha test compile their discard out (early depth rejection)
+    const auto word=[](uint32_t first,uint32_t second,uint32_t combine) { return (first<<16)|(second<<19)|(combine<<22)|0x8040u; };
+    CHECK(!gx::alpha_test_can_discard(word(7,7,0)));   // ALWAYS and ALWAYS: every fragment passes
+    CHECK(!gx::alpha_test_can_discard(word(7,7,1)));
+    CHECK(!gx::alpha_test_can_discard(word(7,7,3)));
+    CHECK(gx::alpha_test_can_discard(word(7,7,2)));    // XOR of two passes rejects everything
+    CHECK(gx::alpha_test_can_discard(word(6,7,0)));    // GEQUAL: a real test
+    CHECK(gx::alpha_test_can_discard(word(7,4,1)));
+    CHECK(gx::alpha_test_can_discard(word(0,0,0)));    // NEVER
+    uc::PipelineKey k{}; k[0]=2u|(0u<<8)|(1u<<12)|(1u<<16); k[69]=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    CHECK((uc::without_logic_op(k)[0]>>16)==1u);       // the bit survives the logic-op conversion
+    CHECK(uc::valid_pipeline_key(uc::without_logic_op(k),false));
+    k[0]|=1u<<17; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 16
+}
 int main() {
     test_without_logic_op();
+    test_alpha_test_bit();
     const auto path=std::filesystem::temp_directory_path()/"uc_test_pipeline_keys.bin";
     std::filesystem::remove(path);
     CHECK(uc::load_pipeline_keys(path).empty());

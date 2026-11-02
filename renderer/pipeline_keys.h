@@ -20,7 +20,7 @@ inline constexpr uint32_t kPipelineKeysHeader[3]={0x4B504355u,1u,uint32_t(sizeof
 // write. key[0] = mode | source<<2 | destination<<5 | logic<<8 | color_write<<12 | alpha_write<<13.
 inline PipelineKey without_logic_op(PipelineKey key) {
     if ((key[0]&3)!=2) return key;
-    const uint32_t writes=key[0]&(3u<<12), logic=(key[0]>>8)&15;
+    const uint32_t writes=key[0]&((3u<<12)|(1u<<16)), logic=(key[0]>>8)&15;   // the write masks and the alpha-test bit stay
     if (logic==0) key[0]=1u|(0u<<2)|(0u<<5)|(3u<<8)|writes;        // CLEAR: ZERO*src + ZERO*dst
     else if (logic==5) key[0]=1u|(0u<<2)|(1u<<5)|(3u<<8)|writes;   // NOOP: ZERO*src + ONE*dst
     else key[0]=0u|(1u<<2)|(0u<<5)|(3u<<8)|writes;                 // COPY and the rest: no blending
@@ -28,8 +28,19 @@ inline PipelineKey without_logic_op(PipelineKey key) {
 }
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>16)==0 && ((key[0]&3)!=2 || logic_ops);
+    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>17)==0 && ((key[0]&3)!=2 || logic_ops);
 }
+}  // namespace uc (pipeline keys)
+namespace gx {
+// Whether a GX alpha compare word (the draw's pixel[0]: references in bits 0-15, compare ops in 16-18 and 19-21, the combining op in 22-23) can
+// reject a fragment. Both compares ALWAYS (7) pass every fragment unless combined by XOR (2: true != true fails every one). A pipeline whose draws
+// cannot reject compiles its discard out (key word 0 bit 16), which keeps early depth rejection on for it.
+inline bool alpha_test_can_discard(uint32_t word) {
+    const uint32_t first=(word>>16)&7, second=(word>>19)&7, combine=(word>>22)&3;
+    return !(first==7 && second==7 && combine!=2);
+}
+}  // namespace gx
+namespace uc {
 
 // Cull mode and the depth test, write and compare op are dynamic state (Vulkan 1.3), set from the draw's full key; a pipeline only keeps
 // whether the draw writes depth (the motion and G-buffer masks follow it). Pipelines, the seed's closure and the recorded file use this form.

@@ -636,6 +636,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     if(draw.state->cull>3) throw std::invalid_argument("invalid native cull mode");
     key[0]=blend.mode|(blend.source<<2)|(blend.destination<<5)|(blend.logic<<8)|(uint32_t(blend.color_write)<<12)|(uint32_t(blend.alpha_write)<<13);
     key[0]|=uint32_t(draw.state->cull)<<14;
+    key[0]|=uint32_t(gx::alpha_test_can_discard(draw.uniforms->pixel[0]))<<16;   // smoke.slang alphaTestActive (specialization constant 67)
     const auto& material=draw.material;
     if (material.stages>16) throw std::invalid_argument("native TEV stage count exceeds16");
     key[1]=material.stages;
@@ -831,10 +832,17 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex; stages[0].pName = "vertexMain";
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fragment; stages[1].pName = "fragmentMain";
-        std::array<VkSpecializationMapEntry,67> spec_entries{};
+        // Constants 0..66: the TEV words (key words 1..67); 67: whether the draws can fail the alpha test (key word 0 bit 16). The ubershader
+        // reads the TEV words from the draw, so it gets only constant 67.
+        std::array<uint32_t,68> spec_values{};
+        std::copy(key.begin()+1,key.begin()+68,spec_values.begin());
+        spec_values[67]=(key[0]>>16)&1;
+        std::array<VkSpecializationMapEntry,68> spec_entries{};
         for(uint32_t i=0;i<spec_entries.size();++i) spec_entries[i]={i,i*uint32_t(sizeof(uint32_t)),sizeof(uint32_t)};
-        VkSpecializationInfo specialization{uint32_t(spec_entries.size()),spec_entries.data(),67*sizeof(uint32_t),key.data()+1};
-        if (!uber) stages[1].pSpecializationInfo=&specialization;
+        const VkSpecializationMapEntry alpha_entry{67,0,sizeof(uint32_t)};
+        VkSpecializationInfo specialization{uint32_t(spec_entries.size()),spec_entries.data(),spec_values.size()*sizeof(uint32_t),spec_values.data()};
+        VkSpecializationInfo uber_specialization{1,&alpha_entry,sizeof(uint32_t),&spec_values[67]};
+        stages[1].pSpecializationInfo=uber ? &uber_specialization : &specialization;
         static_assert(sizeof(gx::GpuMeshVertex)==108 && sizeof(gx::Projection)==64);
         VkVertexInputBindingDescription binding; std::array<VkVertexInputAttributeDescription,14> attributes;
         mesh_vertex_input(binding,attributes);
@@ -2280,6 +2288,50 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (packet.texture_copy) std::snprintf(kind, sizeof kind, "copy %ux%u draws %s%s", packet.texture_copy->source[2], packet.texture_copy->source[3], bucket, packet.present ? " +present" : "");
         else std::snprintf(kind, sizeof kind, "%s draws %s", packet.present ? "present" : "no copy", bucket);
         slot.timing_kind = kind;
+        // An estimate of the fragments this packet shades: each draw's clip-space box (clamped to its viewport) times the viewport's pixels,
+        // times the layers (both eyes). Exact for full-screen quads, an upper bound for meshes; per kind, per 2 s.
+        static std::map<std::string, double> megapixels; static auto since = std::chrono::steady_clock::now();
+        double area = 0;
+        for (const auto& draw : packet.draws) {
+            const auto box = gx::draw_bounds_ndc(draw);
+            if (!box) continue;
+            const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
+            const double w = std::clamp((*box)[2], -1.f, 1.f) - std::clamp((*box)[0], -1.f, 1.f), h = std::clamp((*box)[3], -1.f, 1.f) - std::clamp((*box)[1], -1.f, 1.f);
+            area += std::max(0.0, w) * std::max(0.0, h) / 4 * double(v[2]) * double(v[3]) * (double(efb_extent_.width) / 640) * (double(efb_extent_.height) / 480) * layers_;
+        }
+        megapixels[kind] += area / 1e6;
+        // UC_GPU_DRAWS_DUMP=N: the Nth big (scene) packet's largest draws by that estimate, with what decides their cost on a tiler
+        static const long dump_at = std::getenv("UC_GPU_DRAWS_DUMP") ? std::atol(std::getenv("UC_GPU_DRAWS_DUMP")) : -1;
+        static long big_packets = 0;
+        if (packet.draws.size() >= 200 && ++big_packets == dump_at) {
+            std::vector<std::pair<double, size_t>> areas;
+            for (size_t d = 0; d < packet.draws.size(); ++d) {
+                const auto& draw = packet.draws[d];
+                const auto box = gx::draw_bounds_ndc(draw);
+                if (!box) continue;
+                const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
+                const double w = std::clamp((*box)[2], -1.f, 1.f) - std::clamp((*box)[0], -1.f, 1.f), h = std::clamp((*box)[3], -1.f, 1.f) - std::clamp((*box)[1], -1.f, 1.f);
+                areas.push_back({std::max(0.0, w) * std::max(0.0, h) / 4 * double(v[2]) * double(v[3]) / (640.0 * 360), d});   // in screens (640x360)
+            }
+            std::sort(areas.rbegin(), areas.rend());
+            double total = 0; for (const auto& a : areas) total += a.first;
+            std::fprintf(stderr, "[gpu-draws] scene packet %ld: %zu draws, %.1f screens of box area\n", big_packets, packet.draws.size(), total);
+            for (size_t i = 0; i < areas.size() && i < 40; ++i) {
+                const auto& draw = packet.draws[areas[i].second];
+                const uint32_t alpha = draw.uniforms->pixel[0];
+                const bool alpha_test = !(((alpha >> 16) & 7) == 7 && ((alpha >> 19) & 7) == 7);
+                const gx::DrawSummary s = areas[i].second < summary.draws.size() ? summary.draws[areas[i].second] : gx::DrawSummary{};
+                std::fprintf(stderr, "[gpu-draws] %5.2f screens  callsite %08X  persp %d  blend %u  alpha-test %d  z test %d write %d  verts %zu  tev stages %u\n",
+                             areas[i].first, draw.callsite, int(s.perspective), unsigned(draw.blend.mode), int(alpha_test), int(s.z_test), int(s.z_write),
+                             draw.mesh ? draw.mesh->indices.size() : draw.indices.size(), unsigned(draw.uniforms->pixel[3] & 15));
+            }
+        }
+        if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
+            std::vector<std::pair<std::string, double>> sorted(megapixels.begin(), megapixels.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (size_t i = 0; i < sorted.size() && i < 8; ++i) std::fprintf(stderr, "[gpu-packets] est. %8.1f Mpx / 2 s  %s\n", sorted[i].second, sorted[i].first.c_str());
+            megapixels.clear(); since = std::chrono::steady_clock::now();
+        }
     }
     for (const auto& pooled : slot.textures) {
         Texture& texture=*pooled;
