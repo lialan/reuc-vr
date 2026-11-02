@@ -18,7 +18,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#if defined(__ANDROID__)
+#include <unwind.h>
+#else
 #include <execinfo.h>
+#endif
 #include <pthread.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -126,7 +130,18 @@ void write_context_frames(std::FILE* out, const void* host_context) {
     return RtlCaptureStackBackTrace(2, ULONG(capacity), frames, nullptr);
 #else
     std::array<void*, 80> all{};
+#if defined(__ANDROID__)   // bionic has no backtrace(); the unwinder walks the same frames
+    struct Walk { void** frames; int count, capacity; } walk{all.data(), 0, int(all.size())};
+    _Unwind_Backtrace([](_Unwind_Context* context, void* arg) {
+        auto& w = *static_cast<Walk*>(arg);
+        if (w.count >= w.capacity) return _URC_END_OF_STACK;
+        if (const uintptr_t ip = _Unwind_GetIP(context)) w.frames[w.count++] = reinterpret_cast<void*>(ip);
+        return _URC_NO_REASON;
+    }, &walk);
+    const int count = walk.count;
+#else
     const int count = backtrace(all.data(), int(all.size()));
+#endif
     unsigned kept = 0;
     for (int i = 2; i < count && kept < capacity; ++i) frames[kept++] = all[size_t(i)];
     return kept;

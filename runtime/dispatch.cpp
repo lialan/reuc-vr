@@ -4,6 +4,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#elif defined(__ANDROID__)
+#include <unwind.h>
 #else
 #include <libunwind.h>
 #endif
@@ -37,6 +39,9 @@ static uintptr_t host_function_start(const void* pc) {
     }
     if (!entry) return 0;
     return uintptr_t(image + entry->BeginAddress);
+#elif defined(__ANDROID__)
+    // The NDK has no public libunwind API; the unwinder's own lookup finds the function whose unwind entry (DWARF CFI) covers pc.
+    return reinterpret_cast<uintptr_t>(_Unwind_FindEnclosingFunction(const_cast<void*>(pc)));
 #else
     // libunwind: a cursor moved to pc finds the unwind entry (compact unwind on macOS, DWARF CFI elsewhere) that covers it.
     unw_context_t context;

@@ -94,9 +94,15 @@ int main() {
 #ifdef _WIN32
     CHECK(CreateHardLinkW((root/"title/data/alias.bin").c_str(),(root/"title/data/new.bin").c_str(),nullptr));
 #else
-    std::error_code linked; std::filesystem::create_hard_link(root/"title/data/new.bin",root/"title/data/alias.bin",linked); CHECK(!linked);
+    std::error_code linked; std::filesystem::create_hard_link(root/"title/data/new.bin",root/"title/data/alias.bin",linked);
+#ifdef __ANDROID__
+    // SELinux refuses link(2) to the shell and to apps in their own storage, so the case this checks cannot arise there.
+    if (linked) std::fprintf(stderr,"hard links refused here (%s): link check skipped\n",linked.message().c_str());
+#else
+    CHECK(!linked);
 #endif
-    CHECK(fs.open("/title/data/alias.bin",3)==-102);
+#endif
+    if (std::filesystem::exists(root/"title/data/alias.bin")) CHECK(fs.open("/title/data/alias.bin",3)==-102);
     CHECK(fs.create_file("/.BACKUPS/escape")==-102);
     CHECK(fs.remove("/title/data")==-115);
     const auto outside=root.parent_path()/("uc-save-outside-"+suffix);

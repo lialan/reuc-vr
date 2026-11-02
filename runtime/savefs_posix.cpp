@@ -70,7 +70,13 @@ int file_info(int fd, struct stat& st) {
 }
 // Opens a directory without following a link; -102 for a link or a file in its place.
 int open_directory(const fs::path& path) {
+#ifdef O_PATH
+    // Linux/Android: a pin only needs the directory to be searchable (Android's /data is --x for apps and the shell); O_PATH with
+    // O_DIRECTORY|O_NOFOLLOW still refuses a link (ENOTDIR) and the fd still serves as an *at() base.
+    const int fd=::open(path.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+#else
     const int fd=::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+#endif
     if (fd >= 0) return fd;
     const int failure=errno;
     struct stat st{};
