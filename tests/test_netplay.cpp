@@ -3,9 +3,8 @@
 #include <future>
 #include <thread>
 #define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "socket_compat.h"
+#include "host_process.h"
 using namespace std::chrono_literals;
 using uc::net::Endpoint;
 using uc::net::Socket;
@@ -40,7 +39,7 @@ int main() {
     CHECK(uc::net::valid_address("127.0.0.1"));
     CHECK(!uc::net::valid_address("999.2.3.4"));
     CHECK(!uc::net::valid_address("127.0.0.1 --bad"));
-    const auto port=uint16_t(30000+GetCurrentProcessId()%20000);
+    const auto port=uint16_t(30000+uc::host_process_id()%20000);
     uc::net::Endpoint host{true,"127.0.0.1",port},client{false,"127.0.0.1",port};
     auto peer=std::async(std::launch::async,[&] {
         uc::net::Socket s(host,{},5s);

@@ -1,6 +1,6 @@
 #include "check.h"
 #include "netplay_saves.h"
-#include <windows.h>
+#include "host_process.h"
 #include <fstream>
 #include <array>
 #include <future>
@@ -13,11 +13,11 @@ static std::vector<uint8_t> header(const std::string& name,uint32_t size=0) {
     return out;
 }
 static void run() {
-    const auto base=fs::temp_directory_path()/("uc-net-save-test-"+std::to_string(GetCurrentProcessId()));
+    const auto base=fs::temp_directory_path()/("uc-net-save-test-"+std::to_string(uc::host_process_id()));
     CHECK(!fs::exists(base));fs::create_directories(base/"host"/"empty");fs::create_directory(base/"client");
     const std::string payload(70000,'x');
     {std::ofstream(base/"host"/"progress",std::ios::binary)<<payload;std::ofstream(base/"client"/"personal")<<"untouched";}
-    uint16_t port=uint16_t(32000+GetCurrentProcessId()%20000);
+    uint16_t port=uint16_t(32000+uc::host_process_id()%20000);
     const auto connect=[&](auto send,auto receive) {
         const auto current=port++;
         auto host=std::async(std::launch::async,[&] {uc::net::Socket socket({true,"127.0.0.1",current},{},std::chrono::seconds(3));send(socket);});

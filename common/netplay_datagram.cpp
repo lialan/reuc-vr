@@ -1,8 +1,7 @@
 #include "netplay_datagram.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "socket_compat.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -10,10 +9,14 @@ namespace uc::net {
 namespace {
 constexpr std::array<uint8_t, 4> header{'U', 'C', 'D', 1};
 constexpr size_t payload_offset = header.size() + 16;
+#ifdef _WIN32
 struct Winsock {
     Winsock() { WSADATA data{}; if (const int error = WSAStartup(MAKEWORD(2, 2), &data)) throw std::runtime_error("Cannot initialize networking (Winsock " + std::to_string(error) + ")"); }
     ~Winsock() { WSACleanup(); }
 };
+#else
+struct Winsock {};   // BSD sockets need no start-up
+#endif
 struct Handle {
     SOCKET value = INVALID_SOCKET;
     ~Handle() { if (value != INVALID_SOCKET) closesocket(value); }
@@ -44,9 +47,11 @@ Datagram::Datagram(const Endpoint& endpoint, std::array<uint8_t, 16> session, st
     if (!endpoint.port) throw std::runtime_error("Network port must be nonzero");
     impl_->socket.value = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl_->socket.value == INVALID_SOCKET) socket_error("Cannot create datagram socket");
+#ifdef _WIN32   // POSIX sockets are exclusive without SO_REUSEADDR
     const BOOL exclusive = TRUE;
     if (setsockopt(impl_->socket.value, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == SOCKET_ERROR)
         socket_error("Cannot reserve datagram port");
+#endif
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(endpoint.loopback ? INADDR_LOOPBACK : INADDR_ANY);
@@ -89,7 +94,7 @@ std::optional<std::vector<uint8_t>> Datagram::take() {
         check_stop(impl_->stop);
         std::array<uint8_t, payload_offset + max_datagram_payload> wire{};
         sockaddr_in source{};
-        int source_size = sizeof(source);
+        uc_socklen source_size = sizeof(source);
         const int received = recvfrom(impl_->socket.value, reinterpret_cast<char*>(wire.data()), static_cast<int>(wire.size()), 0,
                                       reinterpret_cast<sockaddr*>(&source), &source_size);
         if (received == SOCKET_ERROR) {

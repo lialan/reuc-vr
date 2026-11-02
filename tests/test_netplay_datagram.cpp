@@ -2,8 +2,8 @@
 #include "netplay_datagram.h"
 #include <thread>
 #define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <windows.h>
+#include "socket_compat.h"
+#include "host_process.h"
 using namespace std::chrono_literals;
 using uc::net::Datagram;
 std::vector<uint8_t> receive(Datagram& channel) {
@@ -15,7 +15,7 @@ std::vector<uint8_t> receive(Datagram& channel) {
     CHECK(false); return {};
 }
 int main() {
-    const auto port=uint16_t(30000+GetCurrentProcessId()%20000);
+    const auto port=uint16_t(30000+uc::host_process_id()%20000);
     const uc::net::Endpoint host{true,"127.0.0.1",port},client{false,"127.0.0.1",port};
     std::array<uint8_t,16> token{}; token[0]=42; token[15]=71;
     std::stop_source stop;

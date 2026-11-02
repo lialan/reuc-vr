@@ -1,8 +1,7 @@
 #include "netplay.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "socket_compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,11 +14,15 @@ namespace uc::net {
 namespace {
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
+#ifdef _WIN32
 struct Winsock {
     Winsock() { WSADATA data{}; if (const int error = WSAStartup(MAKEWORD(2, 2), &data)) throw std::runtime_error("Cannot initialize networking (Winsock " + std::to_string(error) + ")"); }
     ~Winsock() { WSACleanup(); }
 };
 void initialize() { static Winsock winsock; }
+#else
+void initialize() {}
+#endif
 struct PortConflict : std::runtime_error { PortConflict():std::runtime_error("Listening port is already in use"){} };
 [[noreturn]] void socket_error(const char* operation, int error = WSAGetLastError()) {
     throw std::runtime_error(std::string(operation) + " (Winsock " + std::to_string(error) + ")");
@@ -49,11 +52,11 @@ void wait_socket(SOCKET socket, bool writing, Clock::time_point deadline, std::s
         const auto remaining = deadline - Clock::now();
         if (remaining <= Clock::duration::zero()) throw std::runtime_error("Network operation timed out");
         const auto delay = std::min(std::chrono::duration_cast<std::chrono::microseconds>(remaining), 25000us);
-        timeval timeout{0, static_cast<long>(delay.count())};
+        timeval timeout{0, static_cast<decltype(timeval::tv_usec)>(delay.count())};
         fd_set wanted, errors;
         FD_ZERO(&wanted); FD_SET(socket, &wanted);
         FD_ZERO(&errors); FD_SET(socket, &errors);
-        const int result = select(0, writing ? nullptr : &wanted, writing ? &wanted : nullptr, &errors, &timeout);
+        const int result = select(int(socket) + 1, writing ? nullptr : &wanted, writing ? &wanted : nullptr, &errors, &timeout);   // Winsock ignores the count
         if (result == SOCKET_ERROR) socket_error("Cannot wait for network socket");
         if (result > 0) { check_stop(stop); return; }
     }
@@ -63,7 +66,7 @@ void transfer(SOCKET socket, uint8_t* bytes, size_t size, bool writing, Clock::t
     while (size) {
         check_stop(stop);
         wait_socket(socket, writing, deadline, stop);
-        const int amount = writing ? ::send(socket, reinterpret_cast<const char*>(bytes), static_cast<int>(size), 0)
+        const int amount = writing ? ::send(socket, reinterpret_cast<const char*>(bytes), static_cast<int>(size), UC_SEND_FLAGS)
                                    : recv(socket, reinterpret_cast<char*>(bytes), static_cast<int>(size), 0);
         if (amount == SOCKET_ERROR) {
             if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
@@ -112,9 +115,11 @@ Socket::Socket(const Endpoint& endpoint, std::stop_token stop, std::chrono::mill
     if (endpoint.host) {
         Handle listener(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
         if (listener.value == INVALID_SOCKET) socket_error("Cannot create listening socket");
+#ifdef _WIN32   // POSIX sockets are exclusive without SO_REUSEADDR
         const BOOL exclusive = TRUE;
         if (setsockopt(listener.value, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == SOCKET_ERROR)
             socket_error("Cannot reserve listening port");
+#endif
         address.sin_addr.s_addr = htonl(endpoint.loopback ? INADDR_LOOPBACK : INADDR_ANY);
         if (bind(listener.value, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
             const int error=WSAGetLastError();
@@ -141,7 +146,7 @@ Socket::Socket(const Endpoint& endpoint, std::stop_token stop, std::chrono::mill
                 error = WSAGetLastError();
                 if (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS) {
                     wait_socket(candidate.value, true, deadline, stop);
-                    int length = sizeof(error);
+                    uc_socklen length = sizeof(error);
                     if (getsockopt(candidate.value, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &length) == SOCKET_ERROR)
                         socket_error("Cannot inspect connection result");
                 }
@@ -154,6 +159,7 @@ Socket::Socket(const Endpoint& endpoint, std::stop_token stop, std::chrono::mill
     }
     nonblocking(impl_->socket.value);
     const BOOL no_delay = TRUE;
+    uc_socket_no_sigpipe(impl_->socket.value);
     if (setsockopt(impl_->socket.value, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay)) == SOCKET_ERROR)
         socket_error("Cannot configure peer connection");
 }

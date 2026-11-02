@@ -1,11 +1,11 @@
 #include "check.h"
 #include "netplay_stream.h"
-#include <windows.h>
+#include "host_process.h"
 #include <future>
 #include <thread>
 using namespace std::chrono_literals;
 static void run() {
-    const auto port=uint16_t(30000+GetCurrentProcessId()%20000);
+    const auto port=uint16_t(30000+uc::host_process_id()%20000);
     auto server=std::async(std::launch::async,[&] {
         std::stop_source stop;
         uc::net::Socket socket({true,"127.0.0.1",port},stop.get_token(),5s);

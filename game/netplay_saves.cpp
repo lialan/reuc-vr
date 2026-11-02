@@ -1,5 +1,6 @@
 #include "netplay_saves.h"
 #include "savefs.h"
+#include "host_process.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -39,9 +40,15 @@ struct NetSaves::Impl {
         SaveFs check(parent);bool directory=false;require(check.attributes("/",directory)==0 && directory);
         static std::atomic<unsigned> sequence{0};
         for(unsigned attempt=0;attempt<100;++attempt) {
-            const auto candidate=parent/(".netplay-session-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+"-"+std::to_string(sequence.fetch_add(1)));
+            const auto candidate=parent/(".netplay-session-"+std::to_string(host_process_id())+"-"+std::to_string(host_tick_ms())+"-"+std::to_string(sequence.fetch_add(1)));
+#ifdef _WIN32
             if(CreateDirectoryW(candidate.c_str(),nullptr)) {path=candidate;return;}
             if(GetLastError()!=ERROR_ALREADY_EXISTS)throw std::runtime_error("Cannot create temporary network saves");
+#else
+            std::error_code error;   // create_directory: true when this call made it, false (no error) when it existed
+            if(std::filesystem::create_directory(candidate,error)) {path=candidate;return;}
+            if(error)throw std::runtime_error("Cannot create temporary network saves");
+#endif
         }
         throw std::runtime_error("Cannot allocate temporary network saves");
     }
