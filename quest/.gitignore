@@ -1,0 +1,8 @@
+.gradle/
+build/
+reuc/build/
+local.properties
+# staged by scripts/build-quest.sh
+reuc/src/main/libs/
+reuc/src/main/assets/
+reuc/src/main/sdl-java/

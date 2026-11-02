@@ -15,6 +15,7 @@
 #include <mach-o/dyld.h>
 #include <vector>
 #else
+#include <cstdlib>
 #include <unistd.h>
 #endif
 
@@ -35,6 +36,11 @@ inline std::filesystem::path executable_path() {
     auto resolved = std::filesystem::weakly_canonical(std::filesystem::path(path.data()), error);
     return error ? std::filesystem::path(path.data()) : resolved;
 #else
+#ifdef __ANDROID__
+    // An app's process is app_process64: android_main.cpp names the folder that holds the game's own files (shaders, config.json,
+    // logs) as the executable's place.
+    if (const char* app = std::getenv("UC_EXE_PATH"); app && *app) return app;
+#endif
     std::error_code error;
     auto resolved = std::filesystem::read_symlink("/proc/self/exe", error);
     return error ? std::filesystem::path() : resolved;

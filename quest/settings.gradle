@@ -1,0 +1,2 @@
+// The Quest app: quest/reuc, built by scripts/build-quest.sh (as gse-recomp's quest/<game> modules).
+include ':reuc'
