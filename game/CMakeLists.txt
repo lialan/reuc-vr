@@ -114,7 +114,7 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   endif()
   if(ANDROID)
     # Android: the game is libmain.so, started by SDL's Java side through SDL_main (android_main.cpp); uc_main.cpp's main is renamed.
-    add_library(uc SHARED uc_main.cpp audio_output.cpp det_trace.cpp frame_log.cpp settings_menu.cpp ${uc_platform_sources} android_main.cpp)
+    add_library(uc SHARED uc_main.cpp audio_output.cpp det_trace.cpp frame_log.cpp settings_menu.cpp ${uc_platform_sources} android_main.cpp xr_android.cpp)
     set_target_properties(uc PROPERTIES OUTPUT_NAME main)
     set_source_files_properties(uc_main.cpp PROPERTIES COMPILE_DEFINITIONS main=uc_game_main)
     target_link_libraries(uc PRIVATE android log)

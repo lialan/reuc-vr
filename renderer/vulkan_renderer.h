@@ -56,6 +56,10 @@ public:
     ~VulkanRenderer();
     VulkanRenderer(const VulkanRenderer&) = delete;
     VulkanRenderer& operator=(const VulkanRenderer&) = delete;
+    // The headset output (xr_compositor.h): before initialize(); the instance and device then come from the OpenXR runtime and every
+    // presented frame goes to the headset instead of the window's swapchain.
+    void use_xr(class XrCompositor* xr) { xr_ = xr; }
+    bool xr_active() const { return xr_ != nullptr; }
     void initialize(SDL_Window* window, bool validation, const std::filesystem::path& shaders, double render_scale = 0.5, double render_aspect = 16.0/9, bool exclusive_fullscreen = false);
     // Suppressing display preserves guest-frame rendering, copies, clears and completion.
     bool render(const gx::FramePacket& packet, bool display = true,uint64_t submission_serial=0);
@@ -258,6 +262,8 @@ private:
     void make_attachment(VkImage& image,VkDeviceMemory& memory,VkImageView& view,VkExtent2D extent,bool depth=false,VkFormat format=VK_FORMAT_UNDEFINED);
     void collect();
     SDL_Window* window_ = nullptr;
+    class XrCompositor* xr_ = nullptr;   // not owned
+    bool xr_frame_ = false;   // this presented frame draws into the headset (begin_frame() said so)
     PromptOverlay prompt_overlay_;
     MenuOverlay menu_overlay_;
     std::function<void()> menu_build_, menu_setup_;

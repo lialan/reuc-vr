@@ -1,4 +1,8 @@
 #include <csignal>
+#include "xr_android.h"
+#ifdef UC_OPENXR
+#include "xr_compositor.h"
+#endif
 #include "host_backtrace.h"
 #include "path_print.h"
 #include "clock.h"
@@ -472,6 +476,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     std::unique_ptr<SDL_Window, decltype(&SDL_DestroyWindow)> window(nullptr, SDL_DestroyWindow);
     std::optional<uc::GameRenderer> renderer_storage; renderer_storage.emplace(options.renderer_backend);
     uc::GameRenderer& renderer=*renderer_storage;   // restart_renderer() replaces it in the same storage, so this reference stays valid
+#ifdef UC_OPENXR
+    // The headset (Quest): one OpenXR instance for the process; every renderer (restart_renderer) draws into it.
+    const std::unique_ptr<uc::XrCompositor> xr=options.headless ? nullptr : uc::make_android_xr();
+    if(xr) std::fprintf(stderr,"[xr] headset output on\n");
+#endif
     double render_aspect=16.0/9;
     // Native ultrawide (renderer/ultrawide.h): the packets are scaled for the shape of the output, whatever shape the EFB was created in.
     int view_width=0,view_height=0;   // the last output size the factors were made for (a change of the interface position remakes them)
@@ -497,6 +506,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         renderer.configure_upscaling(options.upscaler, options.upscale_mode, options.sharpening, options.sharpness, options.frame_generation, options.frame_generation_multiplier);
         renderer.set_hdr(options.hdr);   // before the first swapchain: it picks HDR10 or SDR
         renderer.allow_dlss5(options.dlss5_enabled);
+#ifdef UC_OPENXR
+        renderer.use_xr(xr.get());
+#endif
         renderer.initialize(window.get(), options.validation, exe_dir() / "data" / "shaders", options.render_scale,render_aspect,options.window_mode==uc::WindowMode::exclusive);
         std::fprintf(stderr,"[startup] renderer initialized after %.1f ms; setting effects\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-renderer_start).count());
         renderer.set_prompt_style(options.prompt_style);
@@ -549,6 +561,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         if (options.width > INT32_MAX || options.height > INT32_MAX) throw std::invalid_argument("window extent exceeds integer limits");
         SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,"0",SDL_HINT_OVERRIDE);
         SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE,"1",SDL_HINT_OVERRIDE);
+#ifdef UC_OPENXR
+        // The headset owns the display: an OpenXR activity never gets a native surface, so the window SDL keeps for events, focus and sizes
+        // is an offscreen one; the renderer draws into the headset's swapchain.
+        if(xr) SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER,"offscreen",SDL_HINT_OVERRIDE);
+#endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();
         const auto* mode=display ? SDL_GetDesktopDisplayMode(display) : nullptr;
@@ -569,7 +586,10 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             const auto extent=uc::windowed_extent(options.render_scale,aspect,uint32_t(std::max(0,usable.w)),uint32_t(std::max(0,usable.h)));
             window_width=int(extent.width); window_height=int(extent.height);
         }
-        const SDL_WindowFlags graphics_window=options.renderer_backend==uc::RendererBackend::vulkan ? SDL_WINDOW_VULKAN : 0;
+        SDL_WindowFlags graphics_window=options.renderer_backend==uc::RendererBackend::vulkan ? SDL_WINDOW_VULKAN : 0;
+#ifdef UC_OPENXR
+        if(xr) graphics_window=0;   // no surface of its own
+#endif
         window.reset(SDL_CreateWindow("Resident Evil: The Umbrella Chronicles", window_width, window_height, graphics_window | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | kHighDensity));
         if (!window) throw std::runtime_error(SDL_GetError());
         // Enter fullscreen only after the compile overlay closes and Vulkan is ready to present.

@@ -4,6 +4,9 @@
 #include <windows.h>
 #endif
 #include "vulkan_android_entry.h"
+#ifdef UC_OPENXR
+#include "xr_compositor.h"
+#endif
 #include "late_aim.h"
 #include "texture_replacement.h"
 #include "post_effects.h"
@@ -82,9 +85,12 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (!window) throw std::invalid_argument("Vulkan requires an SDL window");
     uint32_t version = 0; vk_check(vkEnumerateInstanceVersion(&version), "vkEnumerateInstanceVersion");
     if (version < VK_API_VERSION_1_3) throw std::runtime_error("Vulkan 1.3 loader required");
-    Uint32 count = 0; const char* const* required = SDL_Vulkan_GetInstanceExtensions(&count);
-    if (!required) throw std::runtime_error(SDL_GetError());
-    std::vector<const char*> extensions(required, required + count);
+    std::vector<const char*> extensions;
+    if (!xr_) {   // the headset needs no window surface: OpenXR adds what it needs to the instance
+        Uint32 count = 0; const char* const* required = SDL_Vulkan_GetInstanceExtensions(&count);
+        if (!required) throw std::runtime_error(SDL_GetError());
+        extensions.assign(required, required + count);
+    }
     uint32_t available_count = 0; vk_check(vkEnumerateInstanceExtensionProperties(nullptr, &available_count, nullptr), "instance extension count");
     std::vector<VkExtensionProperties> available(available_count);
     vk_check(vkEnumerateInstanceExtensionProperties(nullptr, &available_count, available.data()), "instance extensions");
@@ -149,6 +155,10 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
             instance_info.enabledExtensionCount = uint32_t(extensions.size()); instance_info.ppEnabledExtensionNames = extensions.data();
         }
     }
+#ifdef UC_OPENXR
+    if (xr_) vk_check(xr_->create_instance(instance_info, instance_), "OpenXR vkCreateInstance");
+    else
+#endif
     vk_check(streamline_ ? streamline_->create_instance(instance_info, instance_) : vkCreateInstance(&instance_info, nullptr, &instance_), "vkCreateInstance");
     if (validation) {
         auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(instance_, "vkCreateDebugUtilsMessengerEXT"));
@@ -159,11 +169,20 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         void* hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
         if (!hwnd) throw std::runtime_error("window has no native handle");
         vk_check(streamline_->create_surface(instance_, hwnd, surface_), "Streamline surface");
-    } else if (!SDL_Vulkan_CreateSurface(window, instance_, nullptr, &surface_)) throw std::runtime_error(SDL_GetError());
+    } else if (!xr_ && !SDL_Vulkan_CreateSurface(window, instance_, nullptr, &surface_)) throw std::runtime_error(SDL_GetError());
     const auto enumerate = [&](uint32_t* count, VkPhysicalDevice* devices) { return streamline_ ? streamline_->enumerate_physical_devices(instance_, count, devices) : vkEnumeratePhysicalDevices(instance_, count, devices); };
     uint32_t n = 0; vk_check(enumerate(&n, nullptr), "physical device count");
     std::vector<VkPhysicalDevice> physical(n); vk_check(enumerate(&n, physical.data()), "physical devices");
     const char* chosen_maintenance = nullptr; int score = -1;
+#ifdef UC_OPENXR
+    if (xr_) {   // the GPU the runtime drives the headset with, its first graphics queue family
+        physical_ = xr_->physical_device(instance_);
+        uint32_t family_count = 0; vkGetPhysicalDeviceQueueFamilyProperties(physical_, &family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(family_count); vkGetPhysicalDeviceQueueFamilyProperties(physical_, &family_count, families.data());
+        for (uint32_t family = 0; family < family_count; ++family) if (families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) { family_ = family; break; }
+        physical.clear();
+    }
+#endif
     for (auto candidate : physical) {
         VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(candidate, &properties);
         if (properties.apiVersion < VK_API_VERSION_1_3) continue;
@@ -244,7 +263,10 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     features12.shaderFloat16=supported12.shaderFloat16;
     bool features12_chained = features12.timelineSemaphore || features12.shaderFloat16;
     if (features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; }
-    std::vector<const char*> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> device_extensions;
+    if (!xr_) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);   // the headset's swapchain is the runtime's
+    VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    if (xr_) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
     if(chosen_maintenance)device_extensions.push_back(chosen_maintenance);
     {   // FidelityFX resolves these entry points by their extension names, including after a live switch.
         uint32_t n = 0; vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
@@ -306,6 +328,10 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     { VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(physical_,&properties); anisotropy_limit_=properties.limits.maxSamplerAnisotropy; }
     device_info.queueCreateInfoCount = 1; device_info.pQueueCreateInfos = &queue_info;   // queue_info.queueCount: 3 with the interpolation swapchain
     device_info.enabledExtensionCount = uint32_t(device_extensions.size()); device_info.ppEnabledExtensionNames = device_extensions.data();
+#ifdef UC_OPENXR
+    if (xr_) vk_check(xr_->create_device(physical_, device_info, device), "OpenXR vkCreateDevice");
+    else
+#endif
     vk_check(through_streamline ? streamline_->create_device(instance_, physical_, device_info, device) : vkCreateDevice(physical_, &device_info, nullptr, &device), "vkCreateDevice");
     vk_android_load_device(device);   // Android: the 1.2/1.3 functions called directly come from this device (vulkan_android_entry.cpp)
     if (through_streamline) {
@@ -352,8 +378,17 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
     gx::DrawPacket initial; initial.primitive=0x90; pipeline_for(pipeline_key(initial));
     start_workers();
+#ifdef UC_OPENXR
+    if (xr_) {   // the headset: the session and its swapchain; the game's picture keeps its own size (the screen plane scales it)
+        xr_->attach(instance_, physical_, device, family_, shaders_);
+        const auto picture=manual_render_extent(configured_scale_,render_aspect_);
+        resize(picture.width, picture.height);
+    } else
+#endif
+    {
     int width, height; if (!SDL_GetWindowSizeInPixels(window, &width, &height)) throw std::runtime_error(SDL_GetError());
     resize(uint32_t(std::max(0, width)), uint32_t(std::max(0, height)));
+    }
     if (requested_.width && requested_.height) rebuild();
 }
 // Push constants of every draw: clip matrix plus where to find this draw's matrices (see smoke.slang).
@@ -1609,6 +1644,8 @@ void VulkanRenderer::make_attachment(VkImage& target,VkDeviceMemory& memory,VkIm
 void VulkanRenderer::rebuild() {
     if (fsr_presentation_) fsr_g_->release_context();
     if (swapchain_ && !fsr_presentation_ && !streamline_swapchain()) retire_for_resize(); else retire_images(true);
+    if (xr_) extent_ = requested_;   // the headset: no window swapchain, the game's picture at its own size
+    else {
     VkSurfaceCapabilitiesKHR capabilities; vk_check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &capabilities), "surface capabilities");
     VkImageUsageFlags swapchain_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if ((capabilities.supportedUsageFlags & swapchain_usage) != swapchain_usage) throw std::runtime_error("swapchain lacks transfer/color attachment support");
@@ -1679,6 +1716,7 @@ void VulkanRenderer::rebuild() {
         }
     }
     if (hdr_active_) hdr_pass_.initialize(device, shaders_);
+    }
     const auto scale=device_render_scale(configured_scale_,max_image_dimension_,render_aspect_);
     const auto visible=manual_render_extent(scale,render_aspect_);
     const VkExtent2D internal{visible.width,uint32_t(std::llround(960*scale))};
@@ -1796,10 +1834,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     const auto& display_source=packet.display_source;
     if(packet.present && (!display_source[2] || !display_source[3] || display_source[0]>=640 || display_source[2]>640-display_source[0] || display_source[1]>=480 || display_source[3]>480-display_source[1])) throw std::invalid_argument("invalid native display source rectangle");
-    if (const auto now = std::chrono::steady_clock::now(); uc::rebuild_due(resized_, swapchain_ != VK_NULL_HANDLE, now, last_rebuild_)) {
+    const bool has_output = swapchain_ != VK_NULL_HANDLE || (xr_ && efb_);   // the headset has no window swapchain: its output is the XR swapchain
+    if (const auto now = std::chrono::steady_clock::now(); uc::rebuild_due(resized_, has_output, now, last_rebuild_)) {
         last_rebuild_ = now; rebuild();        if (resized_) return false;
     }
-    if (!swapchain_) return false;   // while a resize storm postpones the rebuild the old swapchain keeps presenting
+    if (!swapchain_ && !(xr_ && efb_)) return false;   // while a resize storm postpones the rebuild the old swapchain keeps presenting
     const bool overlay_frame=packet.overlay_only;
     const bool layer_on=reticle_layer_active();   // the reticle quads leave the game's frame and are drawn over a held copy of it (reticle_layer_ready)
     if (overlay_frame && !reticle_layer_ready()) return false;
@@ -1969,6 +2008,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (summary.draws[d].perspective) scene_projection_=draw.transforms->projection;
             if (summary.draws[d].perspective && summary.draws[d].z_write && !frame_projection_) {   // the world's projection: the first depth-writing perspective draw (the weapon comes later with its own)
                 frame_projection_=draw.transforms->projection;
+#ifdef UC_OPENXR
+                if (xr_) xr_->observe(draw.transforms->projection);   // HOTD4's lens tally: the screen plane matches the game's field of view
+#endif
                 // The map uses last frame's dominant light (stable by its hysteresis), so the casters can be drawn as the scene packets arrive.
                 if (effects_.shadows!=EffectLevel::off && dominant_light_ && dominant_light_->kind==gx::LightKind::directional)
                     shadow_fit_=fit_shadow(*frame_projection_,*dominant_light_,kShadowDistance,shadow_preset(effects_.shadows).resolution);
@@ -2110,6 +2152,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     uint32_t image_index = 0;
     bool suboptimal=false;
     PresentImage* present_image=nullptr;
+#ifdef UC_OPENXR
+    if (xr_ && packet.present && display && !hold) xr_frame_ = xr_->begin_frame();   // waits for the headset's frame (xrWaitFrame)
+    else
+#endif
     if (packet.present && display && !hold) {
         const bool legacy_retirement=!present_fences_ && !retired_.empty();
         if(legacy_retirement && !retirement_acquired_) {
@@ -2549,6 +2595,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         // scene pass applies this clear to them.
         if (packet.present && upscaler_ && !scene_only) scene_clear_={true,packet.display_source,packet.clear_color,packet.clear_depth};
     }
+#ifdef UC_OPENXR
+    if (xr_ && xr_frame_) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+#endif
     if(present_image) {
         const auto present_layout=fsr_presentation_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : streamline_swapchain() ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         if (hdr_active_) {   // the slot image stays SDR (captures, readback); the swapchain gets its HDR10 encoding
@@ -2595,6 +2644,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     for (auto& texture : slot.textures) texture->initialized=true;
     if (packet.present && !overlay_frame) { frame_start_=true; ++frame_index_; scene_restore_copy_.reset(); dlss5_scene_.ready=false; frame_reticle_.clear(); }
     slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display; slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
+#ifdef UC_OPENXR
+    if (xr_ && xr_->frame_open()) { xr_->end_frame(xr_frame_); if (xr_frame_) ++presentations_; xr_frame_ = false; }
+#endif
     if (!present_image) return true;
     VkSwapchainPresentFenceInfoKHR present_fence{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR}; present_fence.swapchainCount = 1; present_fence.pFences = &present_image->fence;
     // With DLSS-G Streamline presents (and paces) the frames itself and never signals a present fence: its swapchain images are not tracked here.
@@ -2711,6 +2763,9 @@ void VulkanRenderer::shutdown() {
             if (surface_) { streamline_->destroy_surface(instance_, surface_); surface_ = VK_NULL_HANDLE; }
             streamline_->shutdown();
         }
+#ifdef UC_OPENXR
+        if (xr_) xr_->detach();   // the session and its swapchain views belong to this device
+#endif
         vkDestroyDevice(device, nullptr); device = VK_NULL_HANDLE;
         layout_ = VK_NULL_HANDLE; pool_ = VK_NULL_HANDLE;
     }

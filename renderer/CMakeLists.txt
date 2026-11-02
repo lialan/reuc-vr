@@ -159,7 +159,19 @@ foreach(stage vert frag)
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/hdr.slang ${hdr_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/hdr.${stage}.spv
     DEPENDS shaders/hdr.slang VERBATIM)
 endforeach()
-set(UC_SHADER_FILES ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+# The headset's screen pass (xr_compositor.cpp): multiview, both eyes in one pass.
+foreach(stage vert frag)
+  if(stage STREQUAL "vert")
+    set(xr_args -entry vertexMain -stage vertex)
+  else()
+    set(xr_args -entry fragmentMain -stage fragment)
+  endif()
+  add_custom_command(OUTPUT ${shader_dir}/xr_screen.${stage}.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/xr_screen.slang ${xr_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/xr_screen.${stage}.spv
+    DEPENDS shaders/xr_screen.slang VERBATIM)
+endforeach()
+set(UC_SHADER_FILES ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv
@@ -179,6 +191,18 @@ target_link_libraries(uc_prompt_picture PUBLIC uc_gx uc_prompt_icons)
 add_library(uc_vulkan STATIC vulkan_renderer.cpp png.cpp prompt_overlay.cpp menu_overlay.cpp blit_upscaler.cpp smaa_upscaler.cpp occlusion_pass.cpp motion_blur_pass.cpp bloom_pass.cpp rt_scene.cpp rt_denoiser.cpp rt_shadow_pass.cpp rt_reflection_pass.cpp rt_path_pass.cpp rr_inputs_pass.cpp shadow_map.cpp rcas_pass.cpp hdr_pass.cpp dlss5_pass.cpp pass_timer.cpp upscaler_probe.cpp)
 if(ANDROID)
   target_sources(uc_vulkan PRIVATE vulkan_android_entry.cpp)
+endif()
+# The headset output (HOTD4 VR's OpenXR host and camera policy): with the Khronos OpenXR loader (UC_OPENXR_DIR, the unpacked AAR).
+if(UC_OPENXR)
+  set(OpenXR_DIR ${UC_OPENXR_DIR})   # a <Package>_DIR is used as it is: the NDK toolchain limits searches to its sysroot
+  find_package(OpenXR REQUIRED CONFIG)
+  add_library(uc_xr STATIC ${PROJECT_SOURCE_DIR}/xr/stereo_projection.c ${PROJECT_SOURCE_DIR}/xr/stereo_scene.cpp ${PROJECT_SOURCE_DIR}/xr/xr_actions.c
+    ${PROJECT_SOURCE_DIR}/xr/xr_controls.c ${PROJECT_SOURCE_DIR}/xr/xr_menu.c ${PROJECT_SOURCE_DIR}/xr/xr_panel.c ${PROJECT_SOURCE_DIR}/xr/xr_settings.c
+    ${PROJECT_SOURCE_DIR}/xr/xr_overlay_geometry.c ${PROJECT_SOURCE_DIR}/xr/display_cadence.c xr_compositor.cpp)
+  target_include_directories(uc_xr PUBLIC ${PROJECT_SOURCE_DIR}/xr ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(uc_xr PUBLIC OpenXR::openxr_loader Vulkan::Vulkan uc_gx)
+  target_link_libraries(uc_vulkan PUBLIC uc_xr)
+  target_compile_definitions(uc_vulkan PUBLIC UC_OPENXR=1)
 endif()
 target_include_directories(uc_vulkan PRIVATE ${CMAKE_SOURCE_DIR}/third_party/smaa)   # AreaTex.h, SearchTex.h
 target_link_libraries(uc_vulkan PUBLIC uc_gx SDL3::SDL3 Vulkan::Vulkan uc_imgui_vulkan uc_prompt_picture uc_dlss5 PRIVATE uc_public_release)

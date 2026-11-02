@@ -19,6 +19,7 @@ public:
         default: throw std::invalid_argument("unknown renderer backend");
         }
     }
+    void use_xr(class XrCompositor* xr) { if(vulkan_) vulkan_->use_xr(xr); }   // the headset output (Vulkan only), before initialize()
     void initialize(SDL_Window* window,bool validation,const std::filesystem::path& shaders,double scale,double aspect,bool exclusive) {
         if(vulkan_) vulkan_->initialize(window,validation,shaders,scale,aspect,exclusive);
         else { native_->initialize(window,validation,shaders,scale,aspect,exclusive); native_->set_controls(controls_); }
