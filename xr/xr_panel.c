@@ -10,8 +10,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[XP_COUNT] = {
         "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show stats", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
-        "Foveation", "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
-        "Arcade Service button (next)", "Reset game", "Close" };
+        "Foveation", "Recentre view", "Reset game", "Close" };
     for (int i = 0; i < XP_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     snprintf(it[XP_SIGHT].value, 40, "%s", sight[cfg->sight]);
     snprintf(it[XP_LASER].value, 40, "%s", laser[cfg->laser]);
@@ -33,7 +32,6 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     else snprintf(it[XP_RES].value, 40, "%s (on restart)", res);
     static const char *const foveation[] = { "Off", "Low", "Medium", "High" };
     snprintf(it[XP_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 3 : cfg->foveation]);
-    snprintf(it[XP_COINS].value, 40, "%s", cfg->auto_coins ? "Automatic" : "By menu");
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }
 
@@ -59,11 +57,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
         while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
         cfg->width=sizes[k%5][0];cfg->resolution=sizes[k%5][1];break;}
     case XP_FOVEATION:cfg->foveation=(cfg->foveation+1)%4;effects|=XP_FOVEATION_CHANGED;break;
-    case XP_COINS:cfg->auto_coins=!cfg->auto_coins;break;
-    case XP_COIN:p->coin=1;break;
     case XP_RECENTRE:effects|=XP_RECENTER;break;
-    case XP_TEST:p->test_frames=12;break;
-    case XP_SERVICE:p->service_frames=12;break;
     case XP_RESET:if(!armed)p->reset_armed=1;else effects|=XP_RESTART;break;
     case XP_CLOSE:p->open=0;break;
     default:return 0;

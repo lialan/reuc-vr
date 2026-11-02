@@ -7,7 +7,12 @@
 // Per presented game frame (VulkanRenderer::render): begin_frame() (xrWaitFrame/xrBeginFrame/xrLocateViews, acquire), record() into that
 // frame's command buffer, the queue submit, end_frame(). begin_frame() false: nothing is drawn, end_frame(false) still closes the frame.
 #include "../xr/stereo_scene.hpp"
+#include "../xr/controller_input.hpp"
+#include "../xr/settings_panel.hpp"
 #include "../xr/xr_actions.h"
+#include "../xr/xr_settings.h"
+#include "xr_overlay.h"
+#include <functional>
 #include "gx_transforms.h"
 #include <vulkan/vulkan.h>
 #ifdef __ANDROID__
@@ -31,6 +36,8 @@ struct XrConfig {
     bool anchor_head = true;          // yaw-only recentring on the head at start, on focus and on the system recentre
     bool sustained_cpu = true, cpu_boost = false, enable_input = true;
     xr::StereoSettings stereo{};      // scale (game units per metre), screen distance, HUD pitch
+    LgXrSettings settings = LG_XR_SETTINGS_DEFAULT;   // vr.cfg: the settings panel edits and saves it (HOTD4's panel)
+    std::function<void()> restart;    // the panel's "Reset game" (the activity's restartGame)
 };
 void xr_check(XrResult result, const char* what);
 // GL-convention column-major clip transform (HOTD4's matrices) from this renderer's Vulkan-ready row-major projection (gx::make_projection):
@@ -59,6 +66,10 @@ public:
     XrSessionState session_state() const { return session_state_; }
     // The game's projection of a perspective draw, every frame (HOTD4's lens tally: the screen plane matches the game's field of view).
     void observe(const gx::Projection& projection);
+    // The game thread: the latest controller state (HOTD4's cabinet bits and aim rays), false when nothing new arrived.
+    bool consume(xr::ControllerSnapshot& snapshot) { return controls_.consume(snapshot); }
+    // The aim's coordinate range: ray x/y are pixels of a kAimWidth x kAimHeight picture of the screen plane.
+    static constexpr int kAimWidth = 1280, kAimHeight = 720;
     xr::StereoScene& scene() { return scene_; }
     bool input(LgXrActionSample& sample);
     void rumble(int hand, float amplitude, int milliseconds);
@@ -117,5 +128,10 @@ private:
     std::vector<Bound> bound_;
     xr::StereoScene scene_;
     bool lens_seen_ = false;
+    xr::ControllerInput controls_;
+    xr::SettingsPanel panel_;
+    XrOverlay overlay_;
+    void controller_frame(bool tracked);
+    VkImage overlay_depth_image_ = VK_NULL_HANDLE;
 };
 }  // namespace uc

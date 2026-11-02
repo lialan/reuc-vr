@@ -4,6 +4,9 @@
 #ifdef UC_OPENXR
 #include "xr_compositor.h"
 #include "xr_settings.h"
+#include "cabinet_buttons.h"
+#include "native_input.h"
+#include <chrono>
 #include <SDL3/SDL.h>
 #include <jni.h>
 #include <cstdio>
@@ -26,9 +29,38 @@ std::unique_ptr<XrCompositor> make_android_xr() {
     if (!activity) throw std::runtime_error("OpenXR: no activity");
     jobject held = env->NewGlobalRef(activity);   // OpenXR keeps it for the process: never released
     env->DeleteLocalRef(activity);
+    config.settings = settings;
+    config.restart = [vm, held] {   // the panel's "Reset game": UmbrellaChroniclesVR.restartGame() (HOTD4's Restart flow)
+        JNIEnv* thread_env = nullptr;
+        if (vm->AttachCurrentThread(&thread_env, nullptr) != JNI_OK || !thread_env) return;
+        jclass cls = thread_env->GetObjectClass(held);
+        if (jmethodID restart = thread_env->GetMethodID(cls, "restartGame", "()V")) thread_env->CallVoidMethod(held, restart);
+        thread_env->DeleteLocalRef(cls);
+    };
     std::fprintf(stderr, "[xr] vr.cfg: eye %dx%d, %d Hz, foveation %d, screen %.2f m, scale %.2f, aim %.1f m\n", settings.width, settings.resolution,
                  settings.refresh, settings.foveation, settings.screen, settings.scale, settings.aim);
     return std::make_unique<XrCompositor>(config, XrPlatform{vm, held});
+}
+
+void feed_xr_input(XrCompositor& xr, NativeInput& input) {
+    xr::ControllerSnapshot snapshot;
+    if (!xr.consume(snapshot)) return;
+    const auto now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    // The aim: where the gun's ray meets the screen plane, as the IR pointer (-1..1, y down). Off the screen the pointer stays put, as a
+    // remote pointing away from the sensor bar does.
+    const auto& ray = snapshot.ray[0];
+    if (snapshot.valid[0] && ray.x >= 0 && ray.y >= 0 && ray.x < XrCompositor::kAimWidth && ray.y < XrCompositor::kAimHeight)
+        input.host_wii_pointer(2.f * (ray.x + .5f) / XrCompositor::kAimWidth - 1, 2.f * (ray.y + .5f) / XrCompositor::kAimHeight - 1, now);
+    // HOTD4's cabinet buttons as the remote's, by role (the original game's Wii layout, input_bindings.cpp default_wii_bindings):
+    // trigger = B (fire), reload = 1, action (gun hand A/X) = A, fire mode (gun hand B/Y) = + (next weapon), start (stick click) = Home (pause).
+    struct Map { unsigned cabinet; uint16_t wii; };
+    static constexpr Map kMap[] = {{CAB_P1_TRIGGER, 7}, {CAB_P1_RELOAD, 6}, {CAB_P1_ACTION, 8}, {CAB_P1_FIREMODE, 4}, {CAB_P1_START, 10}};
+    static unsigned previous = 0;
+    for (const auto& m : kMap) {
+        const bool down = (snapshot.held & m.cabinet) != 0, was = (previous & m.cabinet) != 0;
+        if (down != was) input.host_button(PhysicalInput{PhysicalKind::wii_button, m.wii}, down);
+    }
+    previous = snapshot.held;
 }
 }  // namespace uc
 #endif

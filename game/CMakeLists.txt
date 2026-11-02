@@ -118,6 +118,7 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
     set_target_properties(uc PROPERTIES OUTPUT_NAME main)
     set_source_files_properties(uc_main.cpp PROPERTIES COMPILE_DEFINITIONS main=uc_game_main)
     target_link_libraries(uc PRIVATE android log)
+    target_include_directories(uc PRIVATE ${CMAKE_SOURCE_DIR}/runtime)
   else()
     add_executable(uc uc_main.cpp audio_output.cpp det_trace.cpp frame_log.cpp settings_menu.cpp ${uc_platform_sources})
   endif()

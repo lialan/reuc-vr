@@ -171,7 +171,23 @@ foreach(stage vert frag)
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/xr_screen.slang ${xr_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/xr_screen.${stage}.spv
     DEPENDS shaders/xr_screen.slang VERBATIM)
 endforeach()
-set(UC_SHADER_FILES ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+# HOTD4 VR's overlay shaders (GLSL, unchanged): glslangValidator, as lindberghrecomp builds them.
+find_program(UC_GLSLANG glslangValidator)
+set(UC_XR_OVERLAY_SPV)
+if(UC_GLSLANG)
+  foreach(program gun beam panel)
+    foreach(stage vert frag)
+      add_custom_command(OUTPUT ${shader_dir}/xr_overlay_${program}.${stage}.spv
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+        COMMAND ${UC_GLSLANG} -V --target-env vulkan1.3 -o ${shader_dir}/xr_overlay_${program}.${stage}.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/xr_overlay_${program}.${stage}
+        DEPENDS shaders/xr_overlay_${program}.${stage} VERBATIM)
+      list(APPEND UC_XR_OVERLAY_SPV ${shader_dir}/xr_overlay_${program}.${stage}.spv)
+    endforeach()
+  endforeach()
+elseif(UC_OPENXR)
+  message(FATAL_ERROR "the headset build needs glslangValidator for HOTD4's overlay shaders (brew install glslang)")
+endif()
+set(UC_SHADER_FILES ${UC_XR_OVERLAY_SPV} ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv
@@ -198,7 +214,8 @@ if(UC_OPENXR)
   find_package(OpenXR REQUIRED CONFIG)
   add_library(uc_xr STATIC ${PROJECT_SOURCE_DIR}/xr/stereo_projection.c ${PROJECT_SOURCE_DIR}/xr/stereo_scene.cpp ${PROJECT_SOURCE_DIR}/xr/xr_actions.c
     ${PROJECT_SOURCE_DIR}/xr/xr_controls.c ${PROJECT_SOURCE_DIR}/xr/xr_menu.c ${PROJECT_SOURCE_DIR}/xr/xr_panel.c ${PROJECT_SOURCE_DIR}/xr/xr_settings.c
-    ${PROJECT_SOURCE_DIR}/xr/xr_overlay_geometry.c ${PROJECT_SOURCE_DIR}/xr/display_cadence.c xr_compositor.cpp)
+    ${PROJECT_SOURCE_DIR}/xr/xr_overlay_geometry.c ${PROJECT_SOURCE_DIR}/xr/display_cadence.c ${PROJECT_SOURCE_DIR}/xr/host_stats.c
+    ${PROJECT_SOURCE_DIR}/xr/controller_input.cpp ${PROJECT_SOURCE_DIR}/xr/settings_panel.cpp xr_compositor.cpp xr_overlay.cpp)
   target_include_directories(uc_xr PUBLIC ${PROJECT_SOURCE_DIR}/xr ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(uc_xr PUBLIC OpenXR::openxr_loader Vulkan::Vulkan uc_gx)
   target_link_libraries(uc_vulkan PUBLIC uc_xr)

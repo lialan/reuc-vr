@@ -55,7 +55,18 @@ xr::Matrix gl_from_vulkan(const gx::Projection& r) {
     return m;
 }
 
-XrCompositor::XrCompositor(XrConfig config, XrPlatform platform) : config_(config), scene_(config.stereo) {
+namespace {
+xr::ControllerSettings controller_settings(const LgXrSettings& s) {
+    // HOTD4's controller_settings(): its profile's gun (TP9), aim on the 15 m plane, the panel's choices.
+    xr::ControllerSettings result{XrCompositor::kAimWidth, XrCompositor::kAimHeight, bool(s.dual), bool(s.auto_coins), bool(s.left_handed), false, s.aim};
+    result.show_gun = s.show_gun; result.laser = s.laser; result.sight = s.sight; result.gun_model = XO_GUN_TP9;
+    return result;
+}
+}  // namespace
+
+XrCompositor::XrCompositor(XrConfig config, XrPlatform platform)
+    : config_(config), scene_(config.stereo), controls_(controller_settings(config.settings)),
+      panel_(config.settings.width, config.settings.resolution, "Umbrella Chronicles VR") {   // the running eye size ("(on restart)" in the panel)
     try {
 #ifdef __ANDROID__
         if (!platform.java_vm || !platform.activity) throw std::invalid_argument("Android OpenXR requires JavaVM and Activity");
@@ -241,6 +252,8 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
             views_array_.push_back(created);
         }
         create_screen_pass(shaders);
+        overlay_.initialize(physical, device_, render_format_, width_, height_, shaders);
+        overlay_depth_image_ = overlay_.depth_image();
         std::fprintf(stderr, "[vulkan-xr] stereo swapchain %ux%u x2, %u images, format %d rendered as %d\n", width_, height_, count, int(format), int(render_format_));
     } catch (...) { detach(); throw; }
 }
@@ -276,6 +289,7 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount = 2; dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask = 0b11; rendering.colorAttachmentCount = 1; rendering.pColorAttachmentFormats = &render_format_;
+    rendering.depthAttachmentFormat = XrOverlay::kDepthFormat;   // the eye pass also draws the overlay (depth-tested guns)
     VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext = &rendering;
     pipeline.stageCount = 2; pipeline.pStages = stages; pipeline.pVertexInputState = &vertices; pipeline.pInputAssemblyState = &assembly; pipeline.pViewportState = &viewport;
     pipeline.pRasterizationState = &raster; pipeline.pMultisampleState = &multisample; pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic; pipeline.layout = layout_;
@@ -361,6 +375,7 @@ bool XrCompositor::begin_frame() {
         eyes[i].tangents = {std::tan(-v.fov.angleLeft), std::tan(v.fov.angleRight), std::tan(-v.fov.angleDown), std::tan(v.fov.angleUp)};
     }
     scene_.publish(eyes);
+    controller_frame(true);
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     xr_check(xrAcquireSwapchainImage(swapchain_, &acquire, &image_), "acquire OpenXR eye array"); acquired_ = true;
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout = XR_INFINITE_DURATION;
@@ -368,6 +383,30 @@ bool XrCompositor::begin_frame() {
     xr_check(xrWaitSwapchainImage(swapchain_, &ready), "wait OpenXR eye array");
     xr_time(2, t2, std::chrono::steady_clock::now());
     return true;
+}
+
+// HOTD4's per-frame controller step (lindberghrecomp vulkan_guest.cpp State::frame and panel_input): sample the actions, run the settings
+// panel (which runs ControllerInput), apply what the panel changed, send the haptics.
+void XrCompositor::controller_frame(bool tracked) {
+    LgXrActionSample input{}; xr::ControllerSample sample;
+    const bool focused = tracked && this->input(input);
+    for (unsigned h = 0; h < 2; ++h) {
+        sample.valid[h] = input.valid[h];
+        sample.pose[h].position = {input.pose[h].position.x, input.pose[h].position.y, input.pose[h].position.z};
+        sample.pose[h].orientation = {input.pose[h].orientation.x, input.pose[h].orientation.y, input.pose[h].orientation.z, input.pose[h].orientation.w};
+        sample.buttons.trigger[h] = input.trigger[h] > .55f; sample.buttons.grip[h] = input.grip[h] > .6f;
+        sample.buttons.lower[h] = input.lower[h]; sample.buttons.upper[h] = input.upper[h]; sample.buttons.stick[h] = input.stick[h];
+    }
+    sample.menu = input.menu;
+    auto& settings = config_.settings;
+    const unsigned effects = panel_.update(settings, scene_, controls_, focused ? sample : xr::ControllerSample{}, frame_.predictedDisplayTime, focused, refresh_rates_);
+    if (effects & XP_SAVE) xr_settings_save(&settings);
+    if (effects & XP_RATE_CHANGED) request_refresh(float(settings.refresh));
+    if (effects & XP_FOVEATION_CHANGED) set_foveation(settings.foveation);
+    if (effects & XP_RECENTER) recenter();
+    if ((effects & XP_RESTART) && config_.restart) config_.restart();
+    const auto& haptics = panel_.haptics();
+    for (int h = 0; h < 2; ++h) if (haptics[h].milliseconds) rumble(h, haptics[h].amplitude, haptics[h].milliseconds);
 }
 
 void XrCompositor::observe(const gx::Projection& projection) {
@@ -399,13 +438,26 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     };
     barrier(layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    overlay_.upload(command, panel_.take_panel(), panel_.take_label());
     // The eye array arrives from xrWaitSwapchainImage in COLOR_ATTACHMENT_OPTIMAL and is released in it (XR_KHR_vulkan_enable2). Cleared,
     // not loaded: nothing of the previous frame stays (HOTD4: CLEAR instead of LOAD saved 1.8 ms on Quest).
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; color.imageView = views_array_.at(image_);
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color.clearValue.color = {{0, 0, 0, 1}};
+    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depth.imageView = overlay_.depth_view();
+    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.clearValue.depthStencil = {1, 0};
+    {   // transient depth: its contents never matter between frames
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT; b.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.dstStageMask = b.srcStageMask; b.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = overlay_depth_image_; b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.imageMemoryBarrierCount = 1; dependency.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(command, &dependency);
+    }
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea.extent = {width_, height_}; rendering.layerCount = 1; rendering.viewMask = 0b11;
-    rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &color;
+    rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &color; rendering.pDepthAttachment = &depth;
     vkCmdBeginRendering(command, &rendering);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set, 0, nullptr);
@@ -417,6 +469,7 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     std::memcpy(constants.columns, matrices.view_projection, sizeof constants.columns);
     vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof constants, &constants);
     vkCmdDraw(command, 6, 1, 0, 0);
+    overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());
     vkCmdEndRendering(command);
     barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -475,6 +528,7 @@ void XrCompositor::request_refresh(float hz) {
 void XrCompositor::detach() {
     if (device_) vkDeviceWaitIdle(device_);   // session shutdown, not frame submission
     if (device_) {
+        overlay_.shutdown();
         for (auto view : views_array_) vkDestroyImageView(device_, view, nullptr);
         if (pool_) vkDestroyDescriptorPool(device_, pool_, nullptr);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);

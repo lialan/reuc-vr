@@ -5,7 +5,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_RES,XP_FOVEATION,XP_COINS,XP_COIN,XP_RECENTRE,XP_TEST,XP_SERVICE,XP_RESET,XP_CLOSE,XP_COUNT };
+enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_RES,XP_FOVEATION,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
+/* Umbrella Chronicles: HOTD4's arcade rows (Coins, Insert a coin, Arcade Test, Arcade Service) are left out - a Wii game has no coin
+ * slot or cabinet buttons. Every other row is HOTD4's, in its order. */
 enum { XP_SAVE=1,XP_CROSSHAIR_CHANGED=2,XP_SCREEN_CHANGED=4,XP_HUD_CHANGED=8,XP_RATE_CHANGED=16,XP_RECENTER=32,XP_RESTART=64,XP_HAND_CHANGED=128,XP_FOVEATION_CHANGED=256 };
 typedef struct {
     int open,hover,dirty;float c[3],right[3],up[3],n[3],hw,hh;
