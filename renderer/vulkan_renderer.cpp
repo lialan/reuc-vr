@@ -364,6 +364,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     VkPhysicalDeviceFeatures core{}; vkGetPhysicalDeviceFeatures(physical_,&core);
     logic_ops_=core.logicOp;
     VkPhysicalDeviceFeatures enabled{}; enabled.logicOp=logic_ops_; enabled.independentBlend=motion_outputs_; enabled.shaderInt16=core.shaderInt16; device_info.pEnabledFeatures=&enabled;
+    enabled.occlusionQueryPrecise=core.occlusionQueryPrecise;   // UC_FRAG_DUMP: exact fragment counts per draw
     enabled.samplerAnisotropy=core.samplerAnisotropy; anisotropy_supported_=core.samplerAnisotropy; enabled.textureCompressionBC=core.textureCompressionBC;
     enabled.shaderStorageImageExtendedFormats=core.shaderStorageImageExtendedFormats;   // r8/rg8/rg16f storage images of GTAO, SMAA and motion blur
     { VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(physical_,&properties); anisotropy_limit_=properties.limits.maxSamplerAnisotropy; }
@@ -414,7 +415,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     shaders_=shaders; cache_dir_=shaders_.parent_path();
     const std::string variant=layers_>1 ? "smoke.stereo." : motion_outputs_ ? "smoke.motion." : "smoke.";
     if (motion_outputs_) { shadow_vertex_module_=shader(device, shaders_ / "smoke.shadow.vert.spv"); shadow_map_.initialize(device,memory_); }
-    vertex_module_=shader(device, shaders_ / (variant+"vert.spv")); fragment_module_=shader(device, shaders_ / (variant+"frag.spv")); uber_module_=shader(device, shaders_ / (variant+"uber.spv"));
+    vertex_module_=shader(device, shaders_ / (variant+"vert.spv")); fragment_module_=shader(device, shaders_ / (variant+"frag.spv")); early_module_=shader(device, shaders_ / (variant+"early.frag.spv")); uber_module_=shader(device, shaders_ / (variant+"uber.spv"));
     load_pipeline_cache();
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
     gx::DrawPacket initial; initial.primitive=0x90; pipeline_for(pipeline_key(initial));
@@ -819,7 +820,9 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     gx::BlendState mode;
     mode.mode=key[0]&3; mode.source=(key[0]>>2)&7; mode.destination=(key[0]>>5)&7; mode.logic=(key[0]>>8)&15;
     mode.color_write=key[0]>>12&1; mode.alpha_write=key[0]>>13&1;
-    const VkShaderModule vertex=vertex_module_, fragment=uber ? uber_module_ : fragment_module_;
+    // A pipeline whose alpha test cannot fail (key bit 16 clear) gets the early-Z variant: no discard, depth tested before shading.
+    static const bool late_z=std::getenv("UC_NO_EARLY_Z")!=nullptr;   // diagnostics: every pipeline on the module with the alpha test
+    const VkShaderModule vertex=vertex_module_, fragment=uber ? uber_module_ : (((key[0]>>16)&1) || late_z || !early_module_) ? fragment_module_ : early_module_;
     VkPipeline pipeline=VK_NULL_HANDLE;
     {
         if (!layout_) {
@@ -2278,6 +2281,19 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     vkCmdWriteTimestamp2(slot.command, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timing_pool_, first_query);
     pass_timer_.reset(slot.command, first_query / 2);
     slot.timed = true;
+    {   // UC_FRAG_DUMP=N: from the Nth scene packet (200+ draws) to that frame's present, every draw counted with an exact occlusion
+        // query (fragments passing the depth test: shaded), printed per packet after a wait for the GPU. Diagnostics only.
+        static const long dump_at = std::getenv("UC_FRAG_DUMP") ? std::atol(std::getenv("UC_FRAG_DUMP")) : -1;
+        static long big = 0; static bool dumping = false;
+        if (dump_at > 0 && !dumping && packet.draws.size() >= 200 && ++big == dump_at) dumping = true;
+        frag_dump_ = dumping;
+        if (dumping && packet.present) dumping = false;   // this packet is the last
+        if (frag_dump_) {
+            if (!frag_pool_) { VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; info.queryType = VK_QUERY_TYPE_OCCLUSION; info.queryCount = kFragQueries; vk_check(vkCreateQueryPool(device, &info, nullptr, &frag_pool_), "fragment query pool"); }
+            vkCmdResetQueryPool(slot.command, frag_pool_, 0, kFragQueries);
+            frag_queries_.clear();
+        }
+    }
     static const bool by_kind = std::getenv("UC_GPU_PACKETS") != nullptr;
     if (by_kind) {
         const size_t n = packet.draws.size();
@@ -2640,6 +2656,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 push.motion=uint32_t(d);
             }
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
+            const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
+            if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
             vkCmdDrawIndexed(slot.command, info.index_count, 1, info.first_index, info.first_vertex, 0);
             const auto depth=draw.uniforms->pixel[1]&31;
             if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0)) {
@@ -2651,6 +2669,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (alpha.uber) { push.alpha_pass=1; vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push); }
                 vkCmdDrawIndexed(slot.command,info.index_count,1,info.first_index,info.first_vertex,0);
             }
+            if (counted) { vkCmdEndQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_)); frag_queries_.push_back(uint32_t(d)); }
         }
     }
     vkCmdEndRendering(slot.command);
@@ -2934,6 +2953,25 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     if (packet.present && !overlay_frame && upscaler_kind_==UpscalerKind::dlss && streamline_ && streamline_->active()) streamline_->marker(Streamline::Marker::render_submit_end);
     const auto submit_start = std::chrono::steady_clock::now();
     vk_check(vkQueueSubmit2(queue_, 1, &submit, slot.fence), "submit frame");
+    if (frag_dump_ && !frag_queries_.empty()) {
+        vk_check(vkQueueWaitIdle(queue_), "fragment dump wait");
+        std::vector<uint64_t> counts(frag_queries_.size()*layers_);
+        vkGetQueryPoolResults(device, frag_pool_, 0, uint32_t(counts.size()), counts.size()*sizeof(uint64_t), counts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT);
+        std::vector<std::pair<uint64_t,size_t>> per;   // fragments (all eyes), index into frag_queries_
+        uint64_t total=0;
+        for (size_t i=0;i<frag_queries_.size();++i) { uint64_t n=0; for (uint32_t v=0;v<layers_;++v) n+=counts[i*layers_+v]; per.push_back({n,i}); total+=n; }
+        std::sort(per.rbegin(),per.rend());
+        const double screen=double(efb_extent_.width)*efb_extent_.height*0.75*layers_;   // the 640x360 scene region of every eye
+        std::fprintf(stderr,"[frag-dump] packet %zu draws, %.2f M fragments (%.1f scene screens)%s%s\n",packet.draws.size(),total/1e6,total/screen,
+                     packet.texture_copy ? " copy" : "",packet.present ? " present" : "");
+        for (size_t k=0;k<per.size() && k<25;++k) {
+            const size_t d=frag_queries_[per[k].second]; const auto& draw=packet.draws[d]; const auto& key=gpu_draws[d].key;
+            const uint32_t alpha=draw.uniforms->pixel[0];
+            std::fprintf(stderr,"[frag-dump] %6.2f M %5.2f scr  draw %4zu callsite %08X blend %u  alpha-test %d  z test %u write %u cmp %u  tev %u  idx %u  reticle %d\n",
+                         per[k].first/1e6,per[k].first/screen,d,draw.callsite,unsigned(draw.blend.mode),int(!(((alpha>>16)&7)==7 && ((alpha>>19)&7)==7)),
+                         key[68]&1,(key[68]>>4)&1,(key[68]>>1)&7,unsigned(draw.uniforms->pixel[3]&15),gpu_draws[d].index_count,int(draw.reticle));
+        }
+    }
     timings_.submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count();
     if(copy_target) {
         copy_target->initialized=true;
@@ -3045,9 +3083,9 @@ void VulkanRenderer::shutdown() {
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
-        for (auto module:{vertex_module_,fragment_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        for (auto module:{vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
         shadow_vertex_module_=VK_NULL_HANDLE;
-        vertex_module_=fragment_module_=uber_module_=VK_NULL_HANDLE;
+        vertex_module_=fragment_module_=early_module_=uber_module_=VK_NULL_HANDLE;
         if (layout_) vkDestroyPipelineLayout(device, layout_, nullptr);
         if (texture_layout_) vkDestroyDescriptorSetLayout(device,texture_layout_,nullptr);
         for(auto& sampler:texture_samplers_) { if(sampler) vkDestroySampler(device,sampler,nullptr); sampler=VK_NULL_HANDLE; }

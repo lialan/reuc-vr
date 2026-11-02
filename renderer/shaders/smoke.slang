@@ -256,6 +256,12 @@ float4 albedoTexel(Output input) {
 }
 #endif
 float2 pixelOf(float4 clip) { return projection.viewport.xy + (clip.xy / clip.w * 0.5 + 0.5) * projection.viewport.zw; }
+// EARLY_Z: the variant for pipelines whose alpha test always passes (pipeline key bit 16 clear): no discard in the code at all and the
+// depth test declared before shading. A specialization constant alone left the discard in the SPIR-V, and Adreno then tested depth after
+// shading (the Quest shaded about six times the fragments that survive). Nothing differs in the result: the shader writes no depth.
+#ifdef EARLY_Z
+[earlydepthstencil]
+#endif
 #ifdef STEREO
 Targets fragmentMain(Output input, uint view : SV_ViewID) {
     stereoLayer = float(view);
@@ -298,6 +304,7 @@ float4 shadeFragment(Output input) {
     }
 #endif
     float4 result=evaluateTev(uv,rasterColor0,rasterColor1);
+#ifndef EARLY_Z
     if(alphaTestActive!=0) {
         uint alpha=uint(round(saturate(result.a)*255.0)), word=drawState.pixel.x;
         bool first=alphaCompare(alpha,word&255,(word>>16)&7);
@@ -306,6 +313,7 @@ float4 shadeFragment(Output input) {
         bool pass=operation==0 ? first&&second : operation==1 ? first||second : operation==2 ? first!=second : first==second;
         if(!pass) discard;
     }
+#endif
     result.rgb=applyFog(result.rgb,input.position.z);
     if(destinationAlphaPass!=0) result.a=float(drawState.pixel.z&255)/255.0;
     return result;

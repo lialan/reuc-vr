@@ -369,6 +369,7 @@ private:
     VkExtent2D bloom_region_{};   // the part of the EFB the glow covers, in EFB pixels (set when the bloom is recorded)
     uint64_t bloom_generation_=0; // BloomPass::generation() the HDR pass's descriptor sets were last reset for
     BloomLayer bloom_layer(VkOffset2D origin, VkExtent2D size) const;   // the glow for an HDR encode of this EFB rectangle; empty unless this frame's glow is valid
+    static constexpr uint32_t kFragQueries=16384; VkQueryPool frag_pool_=VK_NULL_HANDLE; bool frag_dump_=false; std::vector<uint32_t> frag_queries_;   // UC_FRAG_DUMP
     bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
@@ -445,7 +446,7 @@ private:
     bool uber_only_ = false;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     size_t pipeline_cache_loaded_ = 0;
-    VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE;
+    VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
     std::filesystem::path cache_dir_;
     std::set<PipelineKey> known_keys_;        // keys already in the seed or recorded file
     std::vector<PipelineKey> warm_keys_;

@@ -42,6 +42,21 @@ foreach(stage vert frag)
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -target spirv -profile spirv_1_5 -entry ${entry} -stage ${shader_stage} -fvk-use-entrypoint-name -o ${shader_dir}/smoke.${stage}.spv
     DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 endforeach()
+# Early-Z variants: the specialized fragment shader without the alpha test (pipelines that cannot discard), early fragment tests declared.
+foreach(family "" motion stereo)
+  if(family STREQUAL "")
+    set(early_name smoke.early.frag.spv)
+    set(early_defs "")
+  else()
+    set(early_name smoke.${family}.early.frag.spv)
+    string(TOUPPER ${family} early_upper)
+    set(early_defs -D${early_upper})
+  endif()
+  add_custom_command(OUTPUT ${shader_dir}/${early_name}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DEARLY_Z ${early_defs} -target spirv -profile spirv_1_5 -entry fragmentMain -stage fragment -fvk-use-entrypoint-name -o ${shader_dir}/${early_name}
+    DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+endforeach()
 # Ubershader: the fragment shader with its TEV state read from the draw uniforms; used while a specialized pipeline compiles.
 add_custom_command(OUTPUT ${shader_dir}/smoke.uber.spv
   COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
@@ -201,7 +216,7 @@ if(UC_GLSLANG)
 elseif(UC_OPENXR)
   message(FATAL_ERROR "the headset build needs glslangValidator for HOTD4's overlay shaders (brew install glslang)")
 endif()
-set(UC_SHADER_FILES ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+set(UC_SHADER_FILES ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motion.early.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv
