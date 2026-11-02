@@ -250,7 +250,22 @@ static void test_dump_contexts() {   // crash bundle: every live thread with its
     s.run(m);
 }
 
+// Guest call depth becomes host stack depth: a guest thread gets the scheduler's 8 MiB host stack (std::thread would give 512 KB on macOS).
+[[gnu::noinline]] static int deep_frames(int frames) {
+    volatile char page[64 * 1024];
+    page[0] = char(frames);
+    page[sizeof(page) - 1] = char(frames);
+    return frames == 0 ? page[0] : deep_frames(frames - 1) + page[sizeof(page) - 1];
+}
+static void test_guest_thread_deep_stack() {
+    Sched s(nullptr); int result = -1;
+    Thread* m = s.create(0, 16, [&](ppc::Ctx&) { result = deep_frames(112); });   // 7 MiB
+    s.run(m);
+    CHECK(result == 112 * 113 / 2);
+}
+
 int main() {
+    test_guest_thread_deep_stack();
     test_dump_contexts();
     test_priorities_and_join(); test_round_robin(); test_wake_order(); test_wake_preempts();
     test_busy_wait_sees_events(); test_events_wait_for_interrupts(); test_external_wakes_idle();

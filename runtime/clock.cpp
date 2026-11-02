@@ -1,16 +1,42 @@
 #include "clock.h"
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach_time.h>
+#else
+#include <ctime>
+#endif
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
 
 namespace uc {
 namespace {
+// The host's monotonic counter and its frequency: QueryPerformanceCounter on Windows, mach_absolute_time on macOS (24 MHz on Apple Silicon,
+// read from the commpage without a system call), CLOCK_MONOTONIC in nanoseconds elsewhere.
+uint64_t counter_frequency() {
+#ifdef _WIN32
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); return uint64_t(f.QuadPart);
+#elif defined(__APPLE__)
+    mach_timebase_info_data_t tb{}; mach_timebase_info(&tb);   // nanoseconds per tick = numer / denom
+    return uint64_t(1'000'000'000ull * tb.denom / tb.numer);   // exact for the timebases Apple ships (125/3 on Apple Silicon, 1/1 on Intel)
+#else
+    return 1'000'000'000ull;
+#endif
+}
+uint64_t counter() {
+#ifdef _WIN32
+    LARGE_INTEGER q; QueryPerformanceCounter(&q); return uint64_t(q.QuadPart);
+#elif defined(__APPLE__)
+    return mach_absolute_time();
+#else
+    timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts); return uint64_t(ts.tv_sec) * 1'000'000'000ull + uint64_t(ts.tv_nsec);
+#endif
+}
 uint64_t real_ticks() {
-    static const uint64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return uint64_t(f.QuadPart); }();
-    LARGE_INTEGER q; QueryPerformanceCounter(&q);
-    uint64_t c = uint64_t(q.QuadPart);
+    static const uint64_t freq = counter_frequency();
+    const uint64_t c = counter();
     return (c / freq) * kTimebaseHz + (c % freq) * kTimebaseHz / freq;   // (c % freq) * hz < 2^64 for any real counter frequency
 }
 // Seqlock: speed changes are rare, now_ticks is hot.

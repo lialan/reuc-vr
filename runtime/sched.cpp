@@ -8,20 +8,19 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "host_thread.h"
 
 namespace uc {
 
 namespace {
 struct Tramp { Sched* s; Thread* t; };
-DWORD WINAPI tramp(LPVOID p) {
+void tramp(void* p) {
     std::unique_ptr<Tramp> tp(static_cast<Tramp*>(p));
     uc::crash_guard_thread();
     uc::mark_guest_thread();
     tp->s->thread_main(tp->t);
-    return 0;
 }
 }  // namespace
 
@@ -204,9 +203,7 @@ void Sched::join_hosts() {
     std::vector<void*> handles;
     { std::lock_guard lock(baton_m_); handles.swap(handles_); }
     for (void* handle : handles) {
-        DWORD result = WaitForSingleObject(static_cast<HANDLE>(handle), 5000);
-        if (result != WAIT_OBJECT_0) fatal("guest host thread failed to stop: wait result %lu", result);
-        if (!CloseHandle(static_cast<HANDLE>(handle))) fatal("cannot close joined guest thread: Windows error %lu", GetLastError());
+        if (!host_thread_join(HostThread{handle}, 5000)) fatal("guest host thread failed to stop within 5 s");
     }
     for (auto& thread : threads_) if (thread->started) thread->state = Thread::State::Dead;
     running_ = nullptr;
@@ -531,7 +528,7 @@ void Sched::reschedule(Thread* self) {
     }
 }
 
-uint64_t Sched::thread_cycles() { ULONG64 cycles = 0; QueryThreadCycleTime(GetCurrentThread(), &cycles); return cycles; }
+uint64_t Sched::thread_cycles() { return host_thread_cpu_time(); }
 
 uint64_t Sched::steady_ns() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
@@ -562,10 +559,10 @@ void Sched::handoff(Thread* self, Thread* next) {
 void Sched::start_host(Thread* t) {
     t->started = true;
     t->host_alive = true;
-    HANDLE h = CreateThread(nullptr, host_stack_, tramp, new Tramp{this, t}, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (!h) fatal("cannot create a host thread for guest thread %d", t->id);
-    if (pin_cpu_ >= 0) SetThreadAffinityMask(h, DWORD_PTR(1) << pin_cpu_);
-    handles_.push_back(h);
+    const HostThread h = host_thread_start(tramp, new Tramp{this, t}, host_stack_);
+    if (!h.handle) fatal("cannot create a host thread for guest thread %d", t->id);
+    if (pin_cpu_ >= 0) host_thread_pin(h, pin_cpu_);
+    handles_.push_back(h.handle);
 }
 
 void Sched::thread_main(Thread* t) {
