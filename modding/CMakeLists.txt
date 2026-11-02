@@ -74,7 +74,10 @@ add_library(uc_mods STATIC manifest.cpp mod_paths.cpp mod_zip.cpp registry.cpp o
 # stb_vorbis (public domain, v1.22): the decoder is built as C without its file API; its warnings are not ours.
 set_source_files_properties(third_party/stb_vorbis.c PROPERTIES COMPILE_DEFINITIONS STB_VORBIS_NO_STDIO COMPILE_OPTIONS -w)
 target_include_directories(uc_mods PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(uc_mods PUBLIC nlohmann_json::nlohmann_json uc_miniz uc_lua uc_quickjs uc_runtime bcrypt)
+target_link_libraries(uc_mods PUBLIC nlohmann_json::nlohmann_json uc_miniz uc_lua uc_quickjs uc_runtime)
+if(WIN32)
+  target_link_libraries(uc_mods PUBLIC bcrypt)
+endif()
 
 # The ImGui side (Mods tab, mod tabs, widgets): kept apart so the core library and its tests do not need ImGui.
 add_library(uc_mod_menu STATIC menu_ui.cpp)

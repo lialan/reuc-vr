@@ -73,9 +73,9 @@ void ret1(Ctx& c, PS v) { c.f[1] = v.p0; c.ps1[1] = v.p1; }
 // The stack frames of the translated bodies are dead after the return, but the game reads stale stack slots (uninitialised locals), so the natives that
 // replace functions with a frame write the same bytes the instruction sequence would (no write barrier: nothing on the stack feeds the GPU).
 SDK_INLINE bool in_ram(uint32_t ea, uint32_t size) { return (ea >= 0x80000000u && ea + size <= 0x81800000u) || (ea >= 0x90000000u && ea + size <= 0x94000000u); }
-SDK_INLINE void put32(uint8_t* p, uint32_t v) { v = _byteswap_ulong(v); std::memcpy(p, &v, 4); }
+SDK_INLINE void put32(uint8_t* p, uint32_t v) { v = uc_bswap32(v); std::memcpy(p, &v, 4); }
 SDK_INLINE void put_f32(uint8_t* p, double v) { const float f = float(v); uint32_t b; std::memcpy(&b, &f, 4); put32(p, b); }   // stfs / one half of psq_st
-SDK_INLINE void put_f64(uint8_t* p, double v) { uint64_t b; std::memcpy(&b, &v, 8); b = _byteswap_uint64(b); std::memcpy(p, &b, 8); }   // stfd
+SDK_INLINE void put_f64(uint8_t* p, double v) { uint64_t b; std::memcpy(&b, &v, 8); b = uc_bswap64(b); std::memcpy(p, &b, 8); }   // stfd
 }  // namespace
 
 // void PSMTXIdentity(Mtx m)                          r3
@@ -383,7 +383,7 @@ void collision_loop_continue(ppc::Ctx& c) {
                 last = f;
                 const float back = float(last);
                 uint32_t out; std::memcpy(&out, &back, 4);
-                const uint32_t word = _byteswap_ulong(out);
+                const uint32_t word = uc_bswap32(out);
                 std::memcpy(ppc::hp(c, at[i] + 4 * k), &word, 4);
             }
         }

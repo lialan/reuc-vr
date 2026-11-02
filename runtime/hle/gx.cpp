@@ -207,7 +207,7 @@ uint32_t read32(uint32_t address) {
     const uint32_t physical = address & 0x3FFFFFFF;
     if (((0x1101u >> (address >> 28)) & 1) && size_t(physical) + 4 <= memory.mem1.size()) {
         uint32_t raw; std::memcpy(&raw, memory.mem1.data() + physical, 4);
-        return _byteswap_ulong(raw);
+        return uc_bswap32(raw);
     }
     auto bytes = memory.read(address, 4);
     uint32_t value = 0;

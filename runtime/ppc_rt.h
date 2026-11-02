@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <cstring>
-#include <intrin.h>
+#include "host_compat.h"
 #include "gx_write_watch.h"
 
 #define PPC_INLINE __attribute__((always_inline)) inline
@@ -53,11 +53,11 @@ PPC_INLINE bool stack_base(int a) { return a == 1; }
 
 PPC_INLINE uint32_t rd32(Ctx& c, uint32_t ea) {
     if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 4);
-    uint32_t v; std::memcpy(&v, hp(c, ea), 4); return _byteswap_ulong(v);
+    uint32_t v; std::memcpy(&v, hp(c, ea), 4); return uc_bswap32(v);
 }
 PPC_INLINE uint32_t rd16(Ctx& c, uint32_t ea) {
     if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 2);
-    uint16_t v; std::memcpy(&v, hp(c, ea), 2); return _byteswap_ushort(v);
+    uint16_t v; std::memcpy(&v, hp(c, ea), 2); return uc_bswap16(v);
 }
 PPC_INLINE uint32_t rd8(Ctx& c, uint32_t ea) {
     if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 1);
@@ -65,35 +65,35 @@ PPC_INLINE uint32_t rd8(Ctx& c, uint32_t ea) {
 }
 PPC_INLINE void wr32(Ctx& c, uint32_t ea, uint32_t v) {
     if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 4, v); return; }
-    gx::note_write(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] gx::note_write(ea + 3); v = _byteswap_ulong(v); std::memcpy(hp(c, ea), &v, 4);
+    gx::note_write(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] gx::note_write(ea + 3); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4);
 }
 PPC_INLINE void wr16(Ctx& c, uint32_t ea, uint32_t v) {
     if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 2, v & 0xFFFF); return; }
-    gx::note_write(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] gx::note_write(ea + 1); uint16_t h = _byteswap_ushort(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2);
+    gx::note_write(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] gx::note_write(ea + 1); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2);
 }
 PPC_INLINE void wr8(Ctx& c, uint32_t ea, uint32_t v) {
     if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 1, v & 0xFF); return; }
     gx::note_write(ea); *hp(c, ea) = uint8_t(v);
 }
-PPC_INLINE uint32_t rd32_ram(Ctx& c, uint32_t ea) { uint32_t v; std::memcpy(&v, hp(c, ea), 4); return _byteswap_ulong(v); }
-PPC_INLINE uint32_t rd16_ram(Ctx& c, uint32_t ea) { uint16_t v; std::memcpy(&v, hp(c, ea), 2); return _byteswap_ushort(v); }
+PPC_INLINE uint32_t rd32_ram(Ctx& c, uint32_t ea) { uint32_t v; std::memcpy(&v, hp(c, ea), 4); return uc_bswap32(v); }
+PPC_INLINE uint32_t rd16_ram(Ctx& c, uint32_t ea) { uint16_t v; std::memcpy(&v, hp(c, ea), 2); return uc_bswap16(v); }
 PPC_INLINE uint32_t rd8_ram(Ctx& c, uint32_t ea) { return *hp(c, ea); }
-PPC_INLINE void wr32_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] gx::note_write(ea + 3); v = _byteswap_ulong(v); std::memcpy(hp(c, ea), &v, 4); }
-PPC_INLINE void wr16_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] gx::note_write(ea + 1); uint16_t h = _byteswap_ushort(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
+PPC_INLINE void wr32_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] gx::note_write(ea + 3); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
+PPC_INLINE void wr16_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] gx::note_write(ea + 1); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); *hp(c, ea) = uint8_t(v); }
-PPC_INLINE void wr32_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,4); v = _byteswap_ulong(v); std::memcpy(hp(c, ea), &v, 4); }
-PPC_INLINE void wr16_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,2); uint16_t h = _byteswap_ushort(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
+PPC_INLINE void wr32_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
+PPC_INLINE void wr16_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_write(ea); *hp(c, ea) = uint8_t(v); }
 PPC_INLINE float rdf32(Ctx& c, uint32_t ea) { uint32_t b = rd32(c, ea); float f; std::memcpy(&f, &b, 4); return f; }
 PPC_INLINE double rdf64(Ctx& c, uint32_t ea) {
     if (is_mmio(ea)) [[unlikely]] { uint64_t hi = mmio_read(ea, 4), lo = mmio_read(ea + 4, 4); uint64_t b = hi << 32 | lo; double d; std::memcpy(&d, &b, 8); return d; }
-    uint64_t v; std::memcpy(&v, hp(c, ea), 8); v = _byteswap_uint64(v); double d; std::memcpy(&d, &v, 8); return d;
+    uint64_t v; std::memcpy(&v, hp(c, ea), 8); v = uc_bswap64(v); double d; std::memcpy(&d, &v, 8); return d;
 }
 PPC_INLINE void wrf32(Ctx& c, uint32_t ea, float v) { uint32_t b; std::memcpy(&b, &v, 4); wr32(c, ea, b); }
 PPC_INLINE void wrf64(Ctx& c, uint32_t ea, double v) {
     uint64_t b; std::memcpy(&b, &v, 8);
     if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 4, uint32_t(b >> 32)); mmio_write(ea + 4, 4, uint32_t(b)); return; }
-    gx::note_write(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(ea + 7); b = _byteswap_uint64(b); std::memcpy(hp(c, ea), &b, 8);
+    gx::note_write(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(ea + 7); b = uc_bswap64(b); std::memcpy(hp(c, ea), &b, 8);
 }
 
 PPC_INLINE uint32_t ea_d(Ctx& c, int a, int32_t d) { return (a ? c.r[a] : 0u) + uint32_t(d); }
@@ -206,7 +206,7 @@ PPC_INLINE void sra_common(Ctx& c, int s, int a, uint32_t n, bool rc) {
 }
 PPC_INLINE void op_sraw(Ctx& c, int s, int a, int b, bool rc) { sra_common(c, s, a, c.r[b] & 0x3F, rc); }
 PPC_INLINE void op_srawi(Ctx& c, int s, int a, int sh, bool rc) { sra_common(c, s, a, uint32_t(sh), rc); }
-PPC_INLINE uint32_t rotl32(uint32_t v, uint32_t n) { return _rotl(v, int(n & 31)); }
+PPC_INLINE uint32_t rotl32(uint32_t v, uint32_t n) { return uc_rotl32(v, int(n & 31)); }
 PPC_INLINE uint32_t mask32(uint32_t mb, uint32_t me) {
     uint32_t m = (0xFFFFFFFFu >> mb) & (0xFFFFFFFFu << (31 - me));
     return mb <= me ? m : ((0xFFFFFFFFu >> mb) | (0xFFFFFFFFu << (31 - me)));
@@ -254,8 +254,8 @@ PPC_INLINE void op_mftb(Ctx& c, int t, uint32_t tbr) { uint64_t tb = timebase();
 PPC_INLINE void op_mfmsr(Ctx& c, int t) { c.r[t] = c.msr; }
 PPC_INLINE void op_mtmsr(Ctx& c, int t) { c.msr = c.r[t]; }
 PPC_INLINE void op_isync(Ctx&) {}
-PPC_INLINE void op_sync(Ctx&) { _ReadWriteBarrier(); }
-PPC_INLINE void op_eieio(Ctx&) { _ReadWriteBarrier(); }
+PPC_INLINE void op_sync(Ctx&) { uc_compiler_barrier(); }
+PPC_INLINE void op_eieio(Ctx&) { uc_compiler_barrier(); }
 PPC_INLINE void op_dcbf(Ctx&, int, int) {}
 PPC_INLINE void op_dcbst(Ctx&, int, int) {}
 PPC_INLINE void op_dcbi(Ctx&, int, int) {}
@@ -287,10 +287,10 @@ PPC_STORE_FAMILY(stw, wr32, wr32_ram, wr32_stack)
 PPC_STORE_FAMILY(stb, wr8, wr8_ram, wr8_stack)
 PPC_STORE_FAMILY(sth, wr16, wr16_ram, wr16_stack)
 
-PPC_INLINE void op_lwbrx(Ctx& c, int t, int a, int b) { c.r[t] = _byteswap_ulong(rd32(c, ea_x(c, a, b))); }
-PPC_INLINE void op_lhbrx(Ctx& c, int t, int a, int b) { c.r[t] = _byteswap_ushort(uint16_t(rd16(c, ea_x(c, a, b)))); }
-PPC_INLINE void op_stwbrx(Ctx& c, int t, int a, int b) { wr32(c, ea_x(c, a, b), _byteswap_ulong(c.r[t])); }
-PPC_INLINE void op_sthbrx(Ctx& c, int t, int a, int b) { wr16(c, ea_x(c, a, b), _byteswap_ushort(uint16_t(c.r[t]))); }
+PPC_INLINE void op_lwbrx(Ctx& c, int t, int a, int b) { c.r[t] = uc_bswap32(rd32(c, ea_x(c, a, b))); }
+PPC_INLINE void op_lhbrx(Ctx& c, int t, int a, int b) { c.r[t] = uc_bswap16(uint16_t(rd16(c, ea_x(c, a, b)))); }
+PPC_INLINE void op_stwbrx(Ctx& c, int t, int a, int b) { wr32(c, ea_x(c, a, b), uc_bswap32(c.r[t])); }
+PPC_INLINE void op_sthbrx(Ctx& c, int t, int a, int b) { wr16(c, ea_x(c, a, b), uc_bswap16(uint16_t(c.r[t]))); }
 PPC_INLINE void op_lmw(Ctx& c, int t, int a, int32_t d) { uint32_t e = ea_d(c, a, d); for (int i = t; i < 32; ++i, e += 4) c.r[i] = rd32(c, e); }
 PPC_INLINE void op_stmw(Ctx& c, int t, int a, int32_t d) { uint32_t e = ea_d(c, a, d); for (int i = t; i < 32; ++i, e += 4) wr32(c, e, c.r[i]); }
 // Single guest-visible reservation; guest threads never run truly concurrently with the scheduler lock held.
@@ -313,7 +313,7 @@ PPC_INLINE void op_lfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_
 PPC_INLINE void op_lfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); double v = rdf32(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
 PPC_INLINE void op_lfsx(Ctx& c, int t, int a, int b) { double v = rdf32(c, ea_x(c, a, b)); c.f[t] = v; c.ps1[t] = v; }
 PPC_INLINE void op_lfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; double v = rdf32(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
-PPC_INLINE void op_lfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, hp(c, e), 8); v = _byteswap_uint64(v); std::memcpy(&c.f[t], &v, 8); } else c.f[t] = rdf64(c, e); }
+PPC_INLINE void op_lfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, hp(c, e), 8); v = uc_bswap64(v); std::memcpy(&c.f[t], &v, 8); } else c.f[t] = rdf64(c, e); }
 PPC_INLINE void op_lfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.f[t] = rdf64(c, e); c.r[a] = e; }
 PPC_INLINE void op_lfdx(Ctx& c, int t, int a, int b) { c.f[t] = rdf64(c, ea_x(c, a, b)); }
 PPC_INLINE void op_lfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.f[t] = rdf64(c, e); c.r[a] = e; }
@@ -321,7 +321,7 @@ PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea
 PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32(c, e, float(c.f[t])); c.r[a] = e; }
 PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32(c, ea_x(c, a, b), float(c.f[t])); }
 PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32(c, e, float(c.f[t])); c.r[a] = e; }
-PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = _byteswap_uint64(v); if (!stack_base(a)) { gx::note_write(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(e + 7); } else uc::rollback_note_range(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64(c, e, c.f[t]); }
+PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { gx::note_write(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(e + 7); } else uc::rollback_note_range(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64(c, e, c.f[t]); }
 PPC_INLINE void op_stfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf64(c, e, c.f[t]); c.r[a] = e; }
 PPC_INLINE void op_stfdx(Ctx& c, int t, int a, int b) { wrf64(c, ea_x(c, a, b), c.f[t]); }
 PPC_INLINE void op_stfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf64(c, e, c.f[t]); c.r[a] = e; }
@@ -458,7 +458,7 @@ PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = fa
     }
     if (type < 4 && !w && (ram || (!is_mmio(ea) && !is_mmio(ea + 4)))) [[likely]] {   // float pair: one 8-byte read instead of two 4-byte ones
         uint64_t v; std::memcpy(&v, hp(c, ea), 8);
-        const uint32_t b0 = _byteswap_ulong(uint32_t(v)), b1 = _byteswap_ulong(uint32_t(v >> 32)); float f0, f1; std::memcpy(&f0, &b0, 4); std::memcpy(&f1, &b1, 4);
+        const uint32_t b0 = uc_bswap32(uint32_t(v)), b1 = uc_bswap32(uint32_t(v >> 32)); float f0, f1; std::memcpy(&f0, &b0, 4); std::memcpy(&f1, &b1, 4);
         c.f[t] = f0; c.ps1[t] = f1; return;
     }
     double p0 = gq_load1(c, ea, type, scale);
@@ -473,7 +473,7 @@ PPC_INLINE void psq_store(Ctx& c, int t, uint32_t ea, int w, int i, bool stack =
     }
     if (type < 4 && !w && (stack || (!is_mmio(ea) && !is_mmio(ea + 4)))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
         const float f0 = float(c.f[t]), f1 = float(c.ps1[t]); uint32_t b0, b1; std::memcpy(&b0, &f0, 4); std::memcpy(&b1, &f1, 4);
-        const uint64_t v = uint64_t(_byteswap_ulong(b0)) | uint64_t(_byteswap_ulong(b1)) << 32;
+        const uint64_t v = uint64_t(uc_bswap32(b0)) | uint64_t(uc_bswap32(b1)) << 32;
         if (!stack) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(ea + 7); }
         else uc::rollback_note_range(ea,8);
         std::memcpy(hp(c, ea), &v, 8); return;
