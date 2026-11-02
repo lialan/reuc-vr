@@ -150,6 +150,11 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   else()
     target_link_options(uc PRIVATE "LINKER:-Map=$<TARGET_FILE_DIR:uc>/uc.map")
   endif()
+  if(APPLE)
+    set_target_properties(uc PROPERTIES INSTALL_RPATH "@executable_path")   # libSDL3 sits next to uc in the install folder
+  elseif(UNIX)
+    set_target_properties(uc PROPERTIES INSTALL_RPATH "$ORIGIN")
+  endif()
   install(TARGETS uc RUNTIME DESTINATION .)
   install(FILES $<TARGET_FILE_DIR:uc>/uc.map DESTINATION data)
   install(FILES $<TARGET_FILE:SDL3-shared> DESTINATION .)
