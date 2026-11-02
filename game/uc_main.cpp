@@ -1160,6 +1160,16 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 next+=std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(every));
             }
         }
+        {   // UC_CAPTURE_RETRACES=<n>[,<n>...]: the screenshot action once the game passes each retrace (a deterministic demo replay then
+            // captures the same frames in every run: renderer changes compared picture for picture)
+            static std::vector<uint64_t> at=[] {
+                std::vector<uint64_t> list;
+                if(const char* text=std::getenv("UC_CAPTURE_RETRACES")) for(const char* p=text;*p;) { char* end=nullptr; const auto v=std::strtoull(p,&end,10); if(end==p) break; list.push_back(v); p=*end==',' ? end+1 : end; }
+                std::sort(list.rbegin(),list.rend());
+                return list;
+            }();
+            if(!at.empty() && uc::vi_stats().retraces>=at.back()) { debug_capture_requested=true; at.pop_back(); }
+        }
         if(!controlled && options.window_mode==uc::WindowMode::windowed &&
             (services.pressed&(uint64_t(1)<<unsigned(uc::Action::release_cursor)))) {
             capture_pointer(false);

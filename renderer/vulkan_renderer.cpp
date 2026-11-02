@@ -319,6 +319,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
             device_extensions.push_back("VK_KHR_portability_subset");
         for (const char* name : {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME})
             if (std::any_of(supported.begin(), supported.end(), [&](const auto& extension) { return std::strcmp(extension.extensionName, name) == 0; })) device_extensions.push_back(name);
+        // LOAD_OP_NONE: a pass whose draws never touch depth leaves the depth attachment alone (neither loaded nor stored); either name.
+        for (const char* name : {"VK_KHR_load_store_op_none", "VK_EXT_load_store_op_none"})
+            if (!load_op_none_ && std::any_of(supported.begin(), supported.end(), [&](const auto& extension) { return std::strcmp(extension.extensionName, name) == 0; })) { device_extensions.push_back(name); load_op_none_ = true; }
         if (through_streamline && std::any_of(supported.begin(),supported.end(),[](const auto& extension) { return std::strcmp(extension.extensionName,VK_KHR_PRESENT_ID_EXTENSION_NAME)==0; }))
             device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);   // dependency of the low-latency extension Streamline enables
     }
@@ -2404,7 +2407,45 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         rt_material_cleared_=rt_material_initialized_=true;
         scene_rt_layout_=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
-    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea = {{0, 0}, target.extent}; rendering.layerCount = 1; rendering.viewMask = layers_>1 ? 0b11u : 0u; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachments = colors;
+    // The render area: only the pixels this pass's draws can reach (the union of their viewport and scissor rectangles; clipping keeps
+    // every fragment inside its viewport). Load and store only cover the render area, so on a tiler (Quest) a post pass drawing one
+    // 160x90 quad no longer loads and stores the whole EFB, colour and depth, for both eyes. Outside it the attachments keep their
+    // contents. A first use (cleared) and the held overlay frame (other viewport mapping) keep the whole target.
+    static const bool full_render_area = std::getenv("UC_FULL_RENDER_AREA") != nullptr;   // diagnostics: the whole target, as before
+    VkRect2D render_area{{0, 0}, target.extent};
+    if (initialized && !overlay_frame && !full_render_area) {
+        int64_t x0 = target.extent.width, y0 = target.extent.height, x1 = 0, y1 = 0;
+        const auto add = [&](int64_t ax, int64_t ay, int64_t bx, int64_t by) {
+            ax = std::clamp<int64_t>(ax, 0, target.extent.width); bx = std::clamp<int64_t>(bx, 0, target.extent.width);
+            ay = std::clamp<int64_t>(ay, 0, target.extent.height); by = std::clamp<int64_t>(by, 0, target.extent.height);
+            if (bx <= ax || by <= ay) return;
+            x0 = std::min(x0, ax); y0 = std::min(y0, ay); x1 = std::max(x1, bx); y1 = std::max(y1, by);
+        };
+        if (scene && scene_clear_.pending) {
+            const auto& r = scene_clear_.region;
+            add(int64_t(r[0]) * target.extent.width / 640, int64_t(r[1]) * target.extent.height / 480,
+                (int64_t(r[0]) + r[2]) * target.extent.width / 640 + 1, (int64_t(r[1]) + r[3]) * target.extent.height / 480 + 1);
+        }
+        for (size_t d = first; d < last; ++d) {
+            if (x0 == 0 && y0 == 0 && x1 == int64_t(target.extent.width) && y1 == int64_t(target.extent.height)) break;   // already everything
+            const auto& draw = packet.draws[d];
+            if (!gpu_draws[d].index_count) continue;
+            if (draw.reticle || draw.late_aim) { add(0, 0, target.extent.width, target.extent.height); continue; }   // scaled or moved after the fact
+            const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
+            const auto a = uc::efb_viewport(v, target.extent.width, target.extent.height);
+            int64_t ax = int64_t(std::floor(std::min(a.x, a.x + a.width))), ay = int64_t(std::floor(std::min(a.y, a.y + a.height)));
+            int64_t bx = int64_t(std::ceil(std::max(a.x, a.x + a.width))) + 1, by = int64_t(std::ceil(std::max(a.y, a.y + a.height))) + 1;
+            if (draw.state->scissor) {   // the same rectangle the draw loop sets
+                const auto& s = *draw.state->scissor;
+                ax = std::max(ax, int64_t(s[0]) * target.extent.width / 640); ay = std::max(ay, int64_t(s[1]) * target.extent.height / 480);
+                bx = std::min(bx, (int64_t(s[0]) + s[2]) * target.extent.width / 640); by = std::min(by, (int64_t(s[1]) + s[3]) * target.extent.height / 480);
+            }
+            add(ax, ay, bx, by);
+        }
+        if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = y1 = 1; }   // nothing drawn: one pixel
+        render_area = {{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+    }
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea = render_area; rendering.layerCount = 1; rendering.viewMask = layers_>1 ? 0b11u : 0u; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachments = colors;
     const VkImageLayout depth_before=!initialized ? VK_IMAGE_LAYOUT_UNDEFINED : scene ? scene_depth_layout_ : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     barrier(slot.command,target.depth,depth_before,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             initialized ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,initialized ? VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
@@ -2412,7 +2453,28 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     if (scene) scene_depth_layout_=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depth.imageView=target.depth_view; depth.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depth.loadOp=initialized && !target.clear_depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR; depth.storeOp=VK_ATTACHMENT_STORE_OP_STORE; depth.clearValue.depthStencil={packet.clear_depth/float(0xFFFFFF),0};
+    // A pass whose draws neither test nor write depth (the game's full-screen post quads, 2D) and that clears none keeps depth as it is
+    // without moving it through the tile memory: not stored, and with LOAD_OP_NONE not loaded either.
+    if (initialized && !target.clear_depth && !full_render_area && !(scene && scene_clear_.pending) &&
+        std::none_of(gpu_draws.begin()+first,gpu_draws.begin()+last,[](const auto& info) { return info.index_count && ((info.key[68]&1) || ((info.key[68]>>4)&1)); })) {
+        depth.storeOp=VK_ATTACHMENT_STORE_OP_NONE;
+        if (load_op_none_) depth.loadOp=VK_ATTACHMENT_LOAD_OP_NONE_EXT;
+    }
     rendering.pDepthAttachment=&depth;
+    {   // UC_GPU_PACKETS: the attachment pixels moved through tile memory (loaded + stored, colour and depth, all eyes) against the whole target
+        static const bool area_stats = std::getenv("UC_GPU_PACKETS") != nullptr;
+        if (area_stats) {
+            static double moved = 0, full = 0; static uint64_t passes = 0; static auto since = std::chrono::steady_clock::now();
+            const double pixels = double(render_area.extent.width) * render_area.extent.height * layers_, whole = double(target.extent.width) * target.extent.height * layers_;
+            const int color_moves = (color.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) + 1, depth_moves = (depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) + (depth.storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+            moved += pixels * (color_moves + depth_moves); full += whole * (color_moves + 2); ++passes;
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
+                std::fprintf(stderr, "[gpu-area] %llu passes: %.1f M attachment pixels moved (whole targets, colour+depth loaded and stored: %.1f M), %.0f%%\n",
+                             (unsigned long long)passes, moved / 1e6, full / 1e6, 100 * moved / std::max(1.0, full));
+                moved = full = 0; passes = 0; since = std::chrono::steady_clock::now();
+            }
+        }
+    }
     vkCmdBeginRendering(slot.command, &rendering);
     if (scene && scene_clear_.pending) {   // the last present's clear, which GX applied to the EFB this scene renders into
         const auto& r=scene_clear_.region;
@@ -2776,6 +2838,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const PassTarget overlay_target{slot.image,held_.depth,slot.view,held_.depth_view,VK_NULL_HANDLE,VK_NULL_HANDLE,extent_,&overlay_initialized,true};
         if (!packet.draws.empty()) record_pass(overlay_target,0,packet.draws.size(),false);
     }
+    static const bool full_render_area_clears = std::getenv("UC_FULL_RENDER_AREA") != nullptr;
     auto clear_region=[&](const PassTarget& active, bool with_motion) {   // after a copy: GX clears the copied EFB region when asked
             barrier(slot.command,active.depth,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
             barrier(slot.command,active.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -2793,6 +2856,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             const uint32_t x=uint64_t(source[0])*active.extent.width/640,y=uint64_t(source[1])*active.extent.height/480;
             const uint32_t right=std::max(x+1,uint32_t(uint64_t(source[0]+source[2])*active.extent.width/640)),bottom=std::max(y+1,uint32_t(uint64_t(source[1]+source[3])*active.extent.height/480));
             VkClearRect rectangle{{{int32_t(x),int32_t(y)},{right-x,bottom-y}},0,1};
+            // Only the cleared rectangle: every attachment of this pass is cleared over exactly its render area, so nothing is loaded
+            // (on a tiler the rest of the EFB is neither read nor written back).
+            if (!full_render_area_clears) {
+                clear_render.renderArea=rectangle.rect;
+                for (auto& attachment:colors) attachment.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                depth.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            }
             VkClearAttachment clears[6]{}; clears[0].aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; clears[1].aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT;
             uint32_t clear_count=2;
             if (clear_motion) { clears[clear_count].aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; clears[clear_count++].colorAttachment=1; }

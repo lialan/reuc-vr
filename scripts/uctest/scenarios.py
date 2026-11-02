@@ -411,7 +411,8 @@ def fight(g, args):
         mark = json.loads(mark_path.read_text(encoding="utf-8"))
         if getattr(args, "wave_offset", None) is not None:   # --wave-offset: the slowdown point relative to the 30-actor wave start, instead of the learned F5 point
             mark["wave_offset"] = args.wave_offset
-    key_state = ctypes.windll.user32.GetAsyncKeyState
+    # F5 (marking the slowdown by hand) is read from the Windows desktop; elsewhere it is never pressed
+    key_state = ctypes.windll.user32.GetAsyncKeyState if hasattr(ctypes, "windll") else (lambda key: 0)
     VK_F5 = 0x74
     pressed_before = bool(key_state(VK_F5) & 0x8000)
 

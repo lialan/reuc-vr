@@ -369,6 +369,7 @@ private:
     VkExtent2D bloom_region_{};   // the part of the EFB the glow covers, in EFB pixels (set when the bloom is recorded)
     uint64_t bloom_generation_=0; // BloomPass::generation() the HDR pass's descriptor sets were last reset for
     BloomLayer bloom_layer(VkOffset2D origin, VkExtent2D size) const;   // the glow for an HDR encode of this EFB rectangle; empty unless this frame's glow is valid
+    bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
     HdrPass hdr_pass_;
