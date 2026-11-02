@@ -2,7 +2,21 @@
 #include "pipeline_keys.h"
 #include <fstream>
 
+static void test_without_logic_op() {   // a GPU without logicOp (MoltenVK) draws the GX logic ops with blend equivalents
+    uc::PipelineKey k{}; k[69]=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const uint32_t writes=(1u<<12)|(1u<<13);
+    k[0]=2u|(1u<<2)|(0u<<5)|(0u<<8)|writes;   // CLEAR
+    CHECK(uc::without_logic_op(k)[0]==(1u|(0u<<2)|(0u<<5)|(3u<<8)|writes));
+    k[0]=2u|(1u<<2)|(0u<<5)|(5u<<8)|(1u<<12);   // NOOP, colour writes only
+    CHECK(uc::without_logic_op(k)[0]==(1u|(0u<<2)|(1u<<5)|(3u<<8)|(1u<<12)));
+    k[0]=2u|(1u<<2)|(0u<<5)|(6u<<8)|writes;   // XOR: no equivalent, a plain write
+    CHECK(uc::without_logic_op(k)[0]==(0u|(1u<<2)|(0u<<5)|(3u<<8)|writes));
+    CHECK(uc::valid_pipeline_key(uc::without_logic_op(k),false));
+    k[0]=1u|(4u<<2)|(5u<<5)|(3u<<8)|writes;   // an ordinary blend is left alone
+    CHECK(uc::without_logic_op(k)==k);
+}
 int main() {
+    test_without_logic_op();
     const auto path=std::filesystem::temp_directory_path()/"uc_test_pipeline_keys.bin";
     std::filesystem::remove(path);
     CHECK(uc::load_pipeline_keys(path).empty());

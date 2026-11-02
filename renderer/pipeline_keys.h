@@ -16,6 +16,16 @@ using PipelineKey=std::array<uint32_t,70>;
 // Key file: {magic, version, key size} followed by raw keys. Replaying it at startup compiles pipelines before the game first needs them.
 inline constexpr uint32_t kPipelineKeysHeader[3]={0x4B504355u,1u,uint32_t(sizeof(PipelineKey))};
 
+// The key a logic-op draw gets on a GPU without logicOp (VulkanRenderer::pipeline_key): CLEAR and NOOP as blends, everything else as a plain
+// write. key[0] = mode | source<<2 | destination<<5 | logic<<8 | color_write<<12 | alpha_write<<13.
+inline PipelineKey without_logic_op(PipelineKey key) {
+    if ((key[0]&3)!=2) return key;
+    const uint32_t writes=key[0]&(3u<<12), logic=(key[0]>>8)&15;
+    if (logic==0) key[0]=1u|(0u<<2)|(0u<<5)|(3u<<8)|writes;        // CLEAR: ZERO*src + ZERO*dst
+    else if (logic==5) key[0]=1u|(0u<<2)|(1u<<5)|(3u<<8)|writes;   // NOOP: ZERO*src + ONE*dst
+    else key[0]=0u|(1u<<2)|(0u<<5)|(3u<<8)|writes;                 // COPY and the rest: no blending
+    return key;
+}
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>16)==0 && ((key[0]&3)!=2 || logic_ops);

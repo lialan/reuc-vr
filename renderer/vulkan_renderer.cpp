@@ -18,6 +18,7 @@
 #include <tuple>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstring>
@@ -532,7 +533,19 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     if(alpha_pass) blend={0,1,0,3,false,true};
     else if(draw.uniforms->pixel[2]&256) blend.alpha_write=false;
     if (blend.mode>3 || blend.source>7 || blend.destination>7 || blend.logic>15) throw std::invalid_argument("invalid native blend state");
-    if (blend.mode==2 && !logic_ops_) throw std::runtime_error("native GX logic operation requires GPU logicOp support");
+    if (blend.mode==2 && !logic_ops_) {
+        // No logicOp on this GPU (MoltenVK: Metal has none). The ops with a blend equivalent are drawn exactly: CLEAR (the only one RBUE08
+        // uses, see project/pipeline_keys.seed) = ZERO*src + ZERO*dst, NOOP = ZERO*src + ONE*dst, COPY = no blending. Any other op is drawn
+        // as COPY and named once, so an artifact can be traced to it.
+        if (blend.logic==0) { blend.mode=1; blend.source=0; blend.destination=0; }
+        else if (blend.logic==5) { blend.mode=1; blend.source=0; blend.destination=1; }
+        else {
+            static std::array<std::atomic<bool>,16> reported{};
+            if (blend.logic!=3 && !reported[blend.logic].exchange(true))
+                std::fprintf(stderr,"[vulkan] GX logic op %u drawn as a plain write: the GPU has no logicOp\n",unsigned(blend.logic));
+            blend.mode=0;
+        }
+    }
     // Fields the pipeline ignores in this mode must not split the key space (factors only matter when blending, the logic op only in logic mode).
     if (blend.mode!=1) { blend.source=1; blend.destination=0; }
     if (blend.mode!=2) blend.logic=3;
@@ -799,7 +812,7 @@ void VulkanRenderer::load_pipeline_cache() {
     std::fprintf(stderr,"[pipeline] disk cache bytes=%zu\n",data.size());
     for (const char* name:{"pipeline_keys.seed","pipeline_keys.bin"})
         for (const auto& recorded:load_pipeline_keys(cache_dir_/name))
-            if (const auto key=static_key(recorded); valid_pipeline_key(key,logic_ops_) && known_keys_.insert(key).second) warm_keys_.push_back(key);
+            if (const auto key=logic_ops_ ? static_key(recorded) : without_logic_op(static_key(recorded)); valid_pipeline_key(key,logic_ops_) && known_keys_.insert(key).second) warm_keys_.push_back(key);
     std::fprintf(stderr,"[pipeline] known pipeline keys=%zu\n",warm_keys_.size());
 }
 void VulkanRenderer::save_pipeline_cache() {
