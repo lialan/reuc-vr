@@ -1,6 +1,6 @@
 #include "check.h"
 #include "clock.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <atomic>
 #include <chrono>
 #include <string>

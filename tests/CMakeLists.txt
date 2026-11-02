@@ -529,6 +529,10 @@ foreach(t test_dol test_dol_scan test_isa test_analyzer test_isa_roundtrip test_
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# Guest memory alone (the platform's mapping source, see UC_GUEST_MEM_SOURCE in runtime/CMakeLists.txt).
+add_executable(test_guest_mem test_guest_mem.cpp ${UC_GUEST_MEM_SOURCE})
+target_include_directories(test_guest_mem PRIVATE ${CMAKE_SOURCE_DIR}/runtime)
+add_test(NAME test_guest_mem COMMAND test_guest_mem)
 foreach(t test_ppc_int test_ppc_mem test_ppc_float test_clock test_mmio test_lowmem test_sched test_os_hle test_dvd test_vi test_exi test_ios test_dsp test_gx_audit test_render_lifecycle test_sdk_math_hle test_sdk_regs_hle test_leaf_hle)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${t}.cpp)
     add_executable(${t} ${t}.cpp)

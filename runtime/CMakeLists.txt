@@ -1,4 +1,10 @@
-add_library(uc_runtime STATIC guest_mem.cpp dispatch.cpp trace.cpp fatal.cpp guest_call.cpp hle/nop.cpp clock.cpp mmio.cpp lowmem.cpp sched.cpp hle/os_thread.cpp hle/os_sync.cpp hle/os_misc.cpp hle/format_guest.cpp dvdfs.cpp hle/dvd.cpp hle/vi.cpp hle/exi.cpp hle/ios.cpp hle/dsp.cpp)
+if(WIN32)
+  set(UC_GUEST_MEM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/guest_mem.cpp)
+else()
+  set(UC_GUEST_MEM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/guest_mem_posix.cpp)
+endif()
+set(UC_GUEST_MEM_SOURCE ${UC_GUEST_MEM_SOURCE} PARENT_SCOPE)
+add_library(uc_runtime STATIC ${UC_GUEST_MEM_SOURCE} dispatch.cpp trace.cpp fatal.cpp guest_call.cpp hle/nop.cpp clock.cpp mmio.cpp lowmem.cpp sched.cpp hle/os_thread.cpp hle/os_sync.cpp hle/os_misc.cpp hle/format_guest.cpp dvdfs.cpp hle/dvd.cpp hle/vi.cpp hle/exi.cpp hle/ios.cpp hle/dsp.cpp)
 target_include_directories(uc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/common)   # common: host_compat.h for ppc_rt.h
 target_sources(uc_runtime PRIVATE gx_audit.cpp)
 target_sources(uc_runtime PRIVATE hle/gx.cpp hle/sdk_math.cpp hle/sdk_regs.cpp hle/leaf_gen.cpp)

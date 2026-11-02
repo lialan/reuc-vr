@@ -1,6 +1,6 @@
 #pragma once
 #include "ppc_rt.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <string>
 namespace uc {
 void os_hle_init(Sched& s, uint8_t* guest_mem, uint32_t dummy_context_addr);   // dummy_context_addr: guest memory handed to alarm handlers as their OSContext*

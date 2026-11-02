@@ -1,6 +1,6 @@
 #pragma once
 #include "gx_packets.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <string>
 namespace uc {
 struct GxStats { uint64_t draws = 0, vertices = 0, submitted = 0, completed = 0, outside_bytes = 0, copies = 0, texture_decodes = 0, geometry_hits = 0, geometry_misses = 0, prompt_annotations=0,prompt_present=0,prompt_fallback=0, texture_evictions=0, texture_resident=0; };

@@ -3,7 +3,7 @@
 #include "dispatch.h"
 #include "hle/os.h"
 #include "ppc_fixture.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include "vi.h"
 using namespace ppc;
 

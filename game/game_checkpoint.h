@@ -1,7 +1,7 @@
 #pragma once
 #include "native_input.h"
 #include "savefs.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include "rollback_memory.h"
 #include <span>
 

@@ -8,7 +8,7 @@
 #include "hle/gx.h"
 #include "game_input.h"
 #include "clock.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include "game_pacing.h"
 #include "cpu_sampler.h"
 #include "texture_replacement.h"

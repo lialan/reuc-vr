@@ -1,7 +1,7 @@
 #include "check.h"
 #include "clock.h"
 #include "dispatch.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <stdexcept>
 
 namespace {

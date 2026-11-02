@@ -1,4 +1,4 @@
-#include "sched.h"
+#include "guest_sched.h"
 #include "clock.h"
 #include "crash_report.h"
 #include "fatal.h"

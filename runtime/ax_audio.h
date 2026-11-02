@@ -1,6 +1,6 @@
 #pragma once
 #include "ppc_rt.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <span>
 #include <functional>
 namespace uc {

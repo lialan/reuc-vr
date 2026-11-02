@@ -30,7 +30,7 @@
 #include "hle/os_layout.h"
 #include "lowmem.h"
 #include "mmio.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include "trace.h"
 #include "vi.h"
 #include "options.h"

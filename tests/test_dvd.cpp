@@ -5,7 +5,7 @@
 #include "hle/os.h"
 #include "hle/os_layout.h"
 #include "ppc_fixture.h"
-#include "sched.h"
+#include "guest_sched.h"
 #include <cstring>
 #include <filesystem>
 #include <fstream>
