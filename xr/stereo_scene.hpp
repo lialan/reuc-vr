@@ -28,7 +28,13 @@ struct StereoRay {std::array<float,3> origin{},direction{};int x=-100000,y=-1000
 struct StereoSettings {
     float scale=1,screen=3,hud_lens=0,hud_pitch=0,zoom_lens=8;
     bool head_locked=false;
+    // Umbrella Chronicles (not HOTD4): in gameplay the HUD follows the head and spans the display, its sides at the edges of what both eyes
+    // see (hud_margin of the inner half-angle), in the game picture's shape. Menus keep HOTD4's screen, which the gun aims at.
+    bool hud_fit=false; float hud_margin=.9f;
 };
+// A renderer-side draw class beside HOTD4's four: a 2D draw that marks a place in the world (the aim reticle), kept on HOTD4's world-locked
+// screen of the game's lens when the rest of the HUD follows the head.
+enum { LG_STEREO_HUD_AIM=4 };
 // Renderer-thread camera policy. Pose publication invalidates a bounded, reusable transform cache; identical draws never invert their
 // camera again. No OpenXR/SDL/GL dependency: the host supplies anchored poses once per frame.
 class StereoScene {
@@ -52,12 +58,15 @@ public:
     size_t transform_builds() const { return builds_; }
     const std::array<float,2> &screen_lens() const { return lens_; }
     void set_screen_lens(std::array<float,2> lens) { lens_=lens; }   // the game's own lens before any frame was observed
+    // Whether the head-following HUD applies now (gameplay; settings().hud_fit): set once a frame before its draws.
+    void set_hud_fit(bool on) { if(on!=fit_on_) { fit_on_=on; cache_.clear(); last_=0; } }
 private:
     StereoSettings settings_;
     std::array<StereoPose,2> eyes_;
     Matrices overlay_{};std::array<std::array<float,3>,2> eye_positions_{};
     bool valid_=false;
-    std::array<Matrix,2> view_{},hud_view_{};
+    std::array<Matrix,2> view_{},hud_view_{},head_view_{};   // head_view_: head-relative eye views (the fitted HUD's)
+    bool fit_on_=false;
     std::array<std::array<float,4>,2> tangents_{};
     std::array<float,2> lens_{1.732f,2.309f};
     struct Entry { Matrix projection;int kind;Matrices matrices; };

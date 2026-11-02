@@ -28,6 +28,7 @@ std::unique_ptr<XrCompositor> make_android_xr() {
     config.refresh = float(settings.refresh);
     config.foveation_level = settings.foveation;
     config.stereo.scale = settings.scale; config.stereo.screen = settings.screen; config.stereo.hud_pitch = float(settings.hud_pitch);
+    config.stereo.hud_fit = true;   // gameplay HUD at the display's edges, following the head (StereoScene); menus keep HOTD4's screen
     auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
     JavaVM* vm = nullptr;
     if (!env || env->GetJavaVM(&vm) != JNI_OK) throw std::runtime_error("OpenXR: no Java VM");

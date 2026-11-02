@@ -42,6 +42,7 @@ void StereoScene::publish(const std::array<StereoPose,2> &eyes)
         for(unsigned i=0;i<3;++i) offset[i]=eyes[eye].position[i]-.5f*(eyes[0].position[i]+eyes[1].position[i]);
         lg_stereo_rotate(inverse,offset,relative);
         lg_stereo_pose_view(unit,relative,settings_.scale,hud_view_[eye].data());
+        head_view_[eye]=hud_view_[eye];
         if(!settings_.head_locked) hud_view_[eye]=view_[eye];
         else if(settings_.hud_pitch!=0) {
             const float a=settings_.hud_pitch*.017453292519943295f;
@@ -90,15 +91,29 @@ const Matrices &StereoScene::transforms(const Matrix &p,int kind)
     if(cache_.size()==32)cache_.clear(); // bounded storage, no per-draw allocation growth
     Entry e{};e.projection=p;e.kind=kind;
     const auto unit=identity();
+    // The fitted HUD (settings_.hud_fit, in gameplay): the head's screen whose sides reach hud_margin of the inner half-angle of both eyes (what
+    // both see), in the game lens's shape, lowered only if that is taller than both eyes see.
+    std::array<float,2> fit_lens=lens_;
+    const bool fitted=kind==LG_STEREO_HUD && settings_.hud_fit && fit_on_;
+    if(fitted) {
+        const float aspect=lens_[1]/lens_[0];   // p11/p00: width over height of the game's picture
+        float tx=std::min(tangents_[0][1],tangents_[1][0])*settings_.hud_margin, ty=tx/aspect;
+        const float ty_max=std::min({tangents_[0][2],tangents_[0][3],tangents_[1][2],tangents_[1][3]})*settings_.hud_margin;
+        if(ty>ty_max) {ty=ty_max;tx=ty*aspect;}
+        fit_lens={1/tx,1/ty};
+    }
+    const bool hud=kind==LG_STEREO_HUD||kind==LG_STEREO_HUD_AIM;
     for(unsigned eye=0;eye<2;++eye) {
         auto &out=e.matrices.view_projection[eye];
         if(kind==LG_STEREO_FILL) {std::memcpy(out,unit.data(),64);out[10]=0;out[14]=-.999f;continue;}
-        LgStereoProjection policy{view_[eye].data(),hud_view_[eye].data(),tangents_[eye].data(),lens_.data(),settings_.screen*settings_.scale};
+        // HUD_AIM: HOTD4's world-locked screen of the game's lens (the reticle stays over what it marks).
+        const float *hud_view=kind==LG_STEREO_HUD_AIM ? view_[eye].data() : fitted ? head_view_[eye].data() : hud_view_[eye].data();
+        LgStereoProjection policy{view_[eye].data(),hud_view,tangents_[eye].data(),(fitted ? fit_lens : lens_).data(),settings_.screen*settings_.scale};
         Matrix effective;
         // HUD maps guest clip space straight onto its screen plane. It is
         // independent of the original lens, so needs one transform per frame.
-        lg_stereo_eye_projection(kind==LG_STEREO_HUD?unit.data():p.data(),kind,&policy,effective.data());
-        if(kind==LG_STEREO_HUD)std::memcpy(out,effective.data(),64);
+        lg_stereo_eye_projection(hud?unit.data():p.data(),hud?LG_STEREO_HUD:kind,&policy,effective.data());
+        if(hud)std::memcpy(out,effective.data(),64);
         else if(!lg_stereo_clip_reprojection(p.data(),effective.data(),out))
             throw std::runtime_error("Cannot reproject a singular guest camera");
     }

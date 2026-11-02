@@ -60,6 +60,9 @@ public:
     // The headset output (xr_compositor.h): before initialize(); the instance and device then come from the OpenXR runtime and every
     // presented frame goes to the headset instead of the window's swapchain.
     void use_xr(class XrCompositor* xr) { xr_ = xr; }
+    // The game's input context each loop (any thread): in a menu the headset's HUD stays on HOTD4's screen, which the gun aims at; in gameplay it
+    // follows the head at the display's edges (StereoScene hud_fit).
+    void set_menu_context(bool menu) { menu_context_.store(menu, std::memory_order_relaxed); }
     bool xr_active() const { return xr_ != nullptr; }
     void initialize(SDL_Window* window, bool validation, const std::filesystem::path& shaders, double render_scale = 0.5, double render_aspect = 16.0/9, bool exclusive_fullscreen = false);
     // Suppressing display preserves guest-frame rendering, copies, clears and completion.
@@ -272,6 +275,7 @@ private:
     xr::StereoScene* stereo_ = nullptr;
     bool preview_frame_open_ = false, preview_lens_seen_ = false;
     uint64_t preview_world_frames_ = 0;   // frames that drew the world (UC_VR_CLASSIFY_DUMP picks one)
+    std::atomic<bool> menu_context_{true};
     void preview_publish();
     bool xr_frame_ = false;   // this presented frame draws into the headset (begin_frame() said so)
     uint32_t layers_ = 1;     // 2 with the headset: the EFB, its copies and the presented picture hold one layer per eye (multiview)

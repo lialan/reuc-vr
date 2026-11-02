@@ -1225,6 +1225,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 int width=0,height=0;
                 if(SDL_GetWindowSizeInPixels(window.get(),&width,&height)) input.extent(uint32_t(std::max(0,width)),uint32_t(std::max(0,height)));   // stick speed and gyro counts are in pixels
                 if(gamepad) gamepad->update(input,!host_keys.menu_open && !host_keys.paused && (SDL_GetWindowFlags(window.get())&SDL_WINDOW_INPUT_FOCUS)!=0);
+                renderer.set_menu_context(input.current_context()!=uc::InputContext::gameplay && input.current_context()!=uc::InputContext::qte);   // the VR HUD (preview or headset)
 #ifdef UC_OPENXR
                 if(xr && !controlled) uc::feed_xr_input(*xr,input);   // the headset controllers as the game's Wii Remote (not while the harness drives input: its pointer would be overridden)
 #endif

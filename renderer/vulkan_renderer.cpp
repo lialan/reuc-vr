@@ -113,6 +113,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         // screen plane 3 m ahead; UC_VR_SCALE overrides the scale) and the screen lens the compositor starts from, before a frame shows the game's own.
         xr::StereoSettings settings;
         settings.scale = 10;
+        settings.hud_fit = true;   // as the headset (xr_android.cpp)
         if (const char* s = std::getenv("UC_VR_SCALE")) settings.scale = float(std::atof(s));
         if (!(settings.scale > 0)) throw std::invalid_argument("UC_VR_SCALE must be positive");
         preview_ = std::make_unique<xr::StereoScene>(settings);
@@ -2223,11 +2224,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     PresentImage* present_image=nullptr;
 #ifdef UC_OPENXR
     if (xr_) {   // the headset's frame opens with the game frame's first packet (HOTD4): every pass of it uses this frame's eye poses
-        if (display && !xr_->frame_open()) { xr_frame_ = xr_->begin_frame(); world_drawn_ = false; }
+        if (display && !xr_->frame_open()) { xr_frame_ = xr_->begin_frame(); world_drawn_ = false; xr_->scene().set_hud_fit(!menu_context_.load(std::memory_order_relaxed)); }
     } else
 #endif
     {
-        if (preview_ && display && !preview_frame_open_) { preview_publish(); preview_frame_open_ = true; world_drawn_ = false; }   // as the headset's frame opens
+        if (preview_ && display && !preview_frame_open_) {   // as the headset's frame opens
+            preview_publish(); preview_frame_open_ = true; world_drawn_ = false;
+            preview_->set_hud_fit(!menu_context_.load(std::memory_order_relaxed));
+        }
     }
     if (!xr_ && packet.present && display && !hold) {
         const bool legacy_retirement=!present_fences_ && !retired_.empty();
@@ -2506,6 +2510,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     const auto& b=*box;
                     facts.covers_viewport=b[0]<=-.95f && b[1]<=-.95f && b[2]>=.95f && b[3]>=.95f;
                     facts.fills_screen=b[0]<=-.98f && b[1]<=-.98f && b[2]>=.98f && b[3]>=.98f;
+                    // This game draws its full-screen effects (the damage flash and blood) as four corner quads, none of which covers the screen:
+                    // a big 2D draw (a fifth of the screen or more) that reaches a horizontal and a vertical edge is part of such an overlay and
+                    // fills its part of each eye. A strip from edge to edge on one axis only (a sliding banner) stays on the HUD's screen.
+                    const float area=(std::clamp(b[2],-1.f,1.f)-std::clamp(b[0],-1.f,1.f))*(std::clamp(b[3],-1.f,1.f)-std::clamp(b[1],-1.f,1.f))/4;
+                    if (area>=.2f && (b[0]<=-.98f || b[2]>=.98f) && (b[1]<=-.98f || b[3]>=.98f)) facts.fills_screen=1;
                 }
                 // HOTD4's "offscreen" is a target that is not eye-sized. Here every pass draws into the EFB, which holds both eyes, and its
                 // copies are per eye: the scene's packets (copied whole, 640x360, or at half size, 320x180) are eye renders. Only a small
@@ -2530,6 +2539,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                             copy_source[0],copy_source[1],copy_source[2],copy_source[3],int(texture_view),int(facts.covers_viewport),
                             draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height,int(source[0]),int(source[1]),int(source[2]),int(source[3]),target.extent.width,target.extent.height);
                         ++huds[key];
+                        if (kind==LG_STEREO_HUD && !facts.perspective) if (const auto b=gx::draw_bounds_ndc(draw)) {   // the big 2D draws: where their boxes lie
+                            const float area=(std::clamp((*b)[2],-1.f,1.f)-std::clamp((*b)[0],-1.f,1.f))*(std::clamp((*b)[3],-1.f,1.f)-std::clamp((*b)[1],-1.f,1.f))/4;
+                            if (area>0.25f) {
+                                char big[200]; std::snprintf(big,sizeof big,"BIG hud box %.2f,%.2f..%.2f,%.2f tex=%d blend %u callsite %08X world_drawn %d fills %d present %d copy %d draws %zu",(*b)[0],(*b)[1],(*b)[2],(*b)[3],int(texture_view),unsigned(draw.blend.mode),draw.callsite,int(world_drawn_),int(facts.fills_screen),int(packet.present),int(bool(copy_target)),packet.draws.size());
+                                ++huds[big];
+                            }
+                        }
                     }
                     if (std::chrono::steady_clock::now()-since>std::chrono::seconds(1)) {
                         std::fprintf(stderr,"[vr-class-sec] world p=%llu o=%llu otex=%llu | hud p=%llu o=%llu otex=%llu | pass %llu | fill %llu\n",
@@ -2548,6 +2564,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                                  (unsigned long long)frame_index_,int(packet.present),int(bool(copy_target)),d,kind>=0&&kind<4?kNames[kind]:"?",int(facts.perspective),int(texture_view),int(facts.covers_viewport),int(world_drawn_),int(facts.offscreen),
                                  draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height,target.extent.width,target.extent.height,int(source[0]),int(source[1]),int(source[2]),int(source[3]),p[0][0],p[1][1],p[0][3],p[1][3]);
                 }
+                // The aim reticle (and its wake) marks a place in the world: it stays on HOTD4's world-locked screen when the HUD follows the head.
+                if (kind==LG_STEREO_HUD && (draw.reticle || draw.late_aim || draw.wake)) kind=xr::LG_STEREO_HUD_AIM;
                 const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
                 float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*kStereoBlockBytes);
                 for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
