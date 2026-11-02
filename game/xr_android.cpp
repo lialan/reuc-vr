@@ -62,15 +62,23 @@ void feed_xr_input(XrCompositor& xr, NativeInput& input) {
     struct Map { unsigned cabinet; uint16_t wii; };
     static constexpr Map kMap[] = {{CAB_P1_TRIGGER, 7}, {CAB_P1_RELOAD, 6}, {CAB_P1_ACTION, 8}, {CAB_P1_FIREMODE, 4}, {CAB_P1_START, 10}};
     static unsigned previous = 0;
+    // HOTD4's trigger also selects in its menus. The Wii game fires with B but confirms with A, and B is "back" in its menus: a trigger pull
+    // on a menu (the save prompts) answered "no". So in a menu the trigger is A; the button a pull pressed is the one its release lets go.
+    static uint16_t trigger_button = 7;
     for (const auto& m : kMap) {
         const bool down = (snapshot.held & m.cabinet) != 0, was = (previous & m.cabinet) != 0;
-        if (down != was) input.host_button(PhysicalInput{PhysicalKind::wii_button, m.wii}, down);
+        uint16_t wii = m.wii;
+        if (m.cabinet == CAB_P1_TRIGGER) {
+            if (down && !was) trigger_button = input.current_context() == InputContext::menu ? 8 : 7;
+            wii = trigger_button;
+        }
+        if (down != was) input.host_button(PhysicalInput{PhysicalKind::wii_button, wii}, down);
         // Diagnostics for "the trigger did not shoot": every press of fire (aimed: on the game's picture), reload (the trigger off the
         // picture, or grip) and A, with the ray's place on the kAimWidth x kAimHeight picture. [kpad] in native_input.cpp shows what the game read.
         if (down && !was && (m.cabinet & (CAB_P1_TRIGGER | CAB_P1_RELOAD | CAB_P1_ACTION)))
-            std::fprintf(stderr, "[xr-input] %s ray %s %d,%d held %04X\n",
-                         m.cabinet == CAB_P1_TRIGGER ? "fire" : m.cabinet == CAB_P1_RELOAD ? "reload (trigger off the picture, or grip)" : "A",
-                         snapshot.valid[0] ? "valid" : "invalid", ray.x, ray.y, snapshot.held);
+            std::fprintf(stderr, "[xr-input] %s (Wii %s) ray %s %d,%d held %04X\n",
+                         m.cabinet == CAB_P1_TRIGGER ? "trigger" : m.cabinet == CAB_P1_RELOAD ? "reload (trigger off the picture, or grip)" : "action",
+                         wii == 8 ? "A" : wii == 7 ? "B" : wii == 6 ? "1" : "?", snapshot.valid[0] ? "valid" : "invalid", ray.x, ray.y, snapshot.held);
     }
     previous = snapshot.held;
 }

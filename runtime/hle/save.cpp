@@ -31,6 +31,8 @@ std::string path(ppc::Ctx& c,uint32_t address) {
 template<class Function> void call(ppc::Ctx& c,Function fn) {
 #ifdef UC_TRACE
     const auto caller=c.lr, arg3=c.r[3], arg4=c.r[4];
+#else
+    const auto arg3_before=c.r[3], arg4_before=c.r[4];
 #endif
     int result=-128;
     if (files) {
@@ -41,6 +43,12 @@ template<class Function> void call(ppc::Ctx& c,Function fn) {
     c.r[3]=uint32_t(result);
 #ifdef UC_TRACE
     std::fprintf(stderr,"[save] caller %08X args %08X %08X result %d\n",caller,arg3,arg4,result);
+#else
+    // A failed save call is rare and decides "cannot save": always logged (not found, -106, is the games' normal existence check).
+    if (result<0 && result!=-106) {
+        static unsigned logged=0;
+        if (logged<200) { ++logged; std::fprintf(stderr,"[save] call from %08X failed: %d (r3 %08X r4 %08X)\n",c.lr,result,arg3_before,arg4_before); }
+    }
 #endif
 }
 void complete(ppc::Ctx& c,void (*fn)(ppc::Ctx&),uint32_t callback,uint32_t argument) {

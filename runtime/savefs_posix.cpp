@@ -24,6 +24,10 @@
 namespace fs=std::filesystem;
 namespace {
 int error(int value) {
+    if (value != ENOENT && value != ENOTDIR && value != EEXIST) {   // the ISFS code alone hides the host's reason: rare, so always logged
+        static unsigned logged = 0;
+        if (logged < 100) { ++logged; std::fprintf(stderr, "[savefs] host error %d (%s)\n", value, std::strerror(value)); }
+    }
     switch (value) {
     case ENOENT: case ENOTDIR: return -106;
     case EEXIST: return -105;
@@ -66,7 +70,11 @@ bool internal(std::string name) {
 // A regular file with one link (the Windows version also refuses reparse points and directories here).
 int file_info(int fd, struct stat& st) {
     if (fstat(fd, &st) != 0) return last_error();
-    return !S_ISREG(st.st_mode) || st.st_nlink != 1 ? -102 : 0;
+    if (!S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        std::fprintf(stderr, "[savefs] refused: mode %o links %u\n", unsigned(st.st_mode), unsigned(st.st_nlink));
+        return -102;
+    }
+    return 0;
 }
 // Opens a directory without following a link; -102 for a link or a file in its place.
 int open_directory(const fs::path& path) {

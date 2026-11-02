@@ -40,6 +40,7 @@ public:
     void focus(bool focused);
     void bindings(const Bindings&);
     void context(InputContext);
+    InputContext current_context() { std::lock_guard lock(mutex_); return context_; }   // the headset maps its trigger by it (xr_android.cpp)
     void qte_window(bool);
     void host_button(PhysicalInput,bool) override;
     void host_wheel(int);

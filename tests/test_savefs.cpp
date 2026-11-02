@@ -112,8 +112,15 @@ int main() {
         CHECK(fs.create_file("/link/escape.bin")==-102 && !std::filesystem::exists(outside/"escape.bin"));
     else CHECK(GetLastError()==ERROR_PRIVILEGE_NOT_HELD); // platform cannot create this fixture
 #else
-    // A symbolic link is refused like a Windows reparse point: a linked directory, and a linked file inside the save tree.
-    std::filesystem::create_directory_symlink(outside,root/"link");
+    // A symbolic link is refused like a Windows reparse point: a linked directory, and a linked file inside the save tree. Android's shared
+    // storage (FUSE, where the Quest app keeps its saves) cannot hold links at all: the fixture is skipped there, as hard links above.
+    std::error_code symlinked;
+    std::filesystem::create_directory_symlink(outside,root/"link",symlinked);
+    if (symlinked) {
+        std::fprintf(stderr,"symbolic links refused here (%s): link checks skipped\n",symlinked.message().c_str());
+        std::filesystem::remove_all(outside); std::filesystem::remove_all(root);
+        return 0;   // every check above passed (CHECK stops at the first failure)
+    }
     CHECK(fs.create_file("/link/escape.bin")==-102 && !std::filesystem::exists(outside/"escape.bin"));
     { std::ofstream target(outside/"target.bin",std::ios::binary); target << "outside"; }
     std::filesystem::create_symlink(outside/"target.bin",root/"title/data/linked.bin");
