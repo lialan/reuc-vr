@@ -5,9 +5,22 @@
 #include <fstream>
 #include <string>
 #include <chrono>
+#include <climits>
+#include <cstdio>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+static unsigned long process_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
+}
 
 int main() {
-    const auto suffix=std::to_string(GetCurrentProcessId())+"-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto suffix=std::to_string(process_id())+"-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     auto root=std::filesystem::temp_directory_path()/ ("uc-native-save-test-"+suffix);
     uc::SaveFs fs(root);
     CHECK(fs.initialize()==0);
@@ -19,11 +32,13 @@ int main() {
     CHECK(fs.create_file("/title/data/save.bin")==0);
     CHECK(fs.create_file("/title/data/save.bin")==-105);
     int fd=fs.open("/title/data/save.bin",3); CHECK(fd>=0);
+#ifdef _WIN32   // open directories deny renames and writers (share modes); POSIX has no such locks
     CHECK(!MoveFileExW((root/"title").c_str(),(root/"moved").c_str(),0));
     CHECK(GetLastError()==ERROR_SHARING_VIOLATION || GetLastError()==ERROR_ACCESS_DENIED);
     HANDLE writer=CreateFileW((root/"title/data").c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
     CHECK(writer==INVALID_HANDLE_VALUE);
     CHECK(GetLastError()==ERROR_SHARING_VIOLATION || GetLastError()==ERROR_ACCESS_DENIED);
+#endif
     const std::array<uint8_t,4> original{1,2,3,4};
     CHECK(fs.write(fd,original)==4);
     auto stats=fs.stats(fd); CHECK(stats.result==0 && stats.length==4 && stats.position==4);
@@ -76,13 +91,32 @@ int main() {
     CHECK(archived_replacement);
     CHECK(fs.rename("/title/data/replace.bin","/title/data/a")==0);
     CHECK(fs.create_dir("/title/empty")==0 && fs.remove("/title/empty")==0);
+#ifdef _WIN32
     CHECK(CreateHardLinkW((root/"title/data/alias.bin").c_str(),(root/"title/data/new.bin").c_str(),nullptr));
+#else
+    std::error_code linked; std::filesystem::create_hard_link(root/"title/data/new.bin",root/"title/data/alias.bin",linked); CHECK(!linked);
+#endif
     CHECK(fs.open("/title/data/alias.bin",3)==-102);
     CHECK(fs.create_file("/.BACKUPS/escape")==-102);
     CHECK(fs.remove("/title/data")==-115);
     const auto outside=root.parent_path()/("uc-save-outside-"+suffix);
     std::filesystem::create_directories(outside);
+#ifdef _WIN32
     if (CreateSymbolicLinkW((root/"link").c_str(),outside.c_str(),SYMBOLIC_LINK_FLAG_DIRECTORY|SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
         CHECK(fs.create_file("/link/escape.bin")==-102 && !std::filesystem::exists(outside/"escape.bin"));
     else CHECK(GetLastError()==ERROR_PRIVILEGE_NOT_HELD); // platform cannot create this fixture
+#else
+    // A symbolic link is refused like a Windows reparse point: a linked directory, and a linked file inside the save tree.
+    std::filesystem::create_directory_symlink(outside,root/"link");
+    CHECK(fs.create_file("/link/escape.bin")==-102 && !std::filesystem::exists(outside/"escape.bin"));
+    { std::ofstream target(outside/"target.bin",std::ios::binary); target << "outside"; }
+    std::filesystem::create_symlink(outside/"target.bin",root/"title/data/linked.bin");
+    CHECK(fs.open("/title/data/linked.bin",3)==-102);
+    CHECK(fs.open("/title/data/linked.bin",1)==-102);
+    bool directory=false; CHECK(fs.attributes("/title/data/linked.bin",directory)==-102);
+    CHECK(fs.remove("/title/data/linked.bin")==-102);
+    { std::ifstream target(outside/"target.bin",std::ios::binary); std::string text; target >> text; CHECK(text=="outside"); }
+    std::filesystem::remove_all(outside);
+    std::filesystem::remove_all(root);
+#endif
 }

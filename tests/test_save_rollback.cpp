@@ -3,6 +3,10 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#ifndef _WIN32
+#include <unistd.h>
+static unsigned long GetCurrentProcessId() { return static_cast<unsigned long>(getpid()); }
+#endif
 
 int main() {
     const auto root=std::filesystem::temp_directory_path()/ ("uc-save-rollback-"+std::to_string(GetCurrentProcessId())+"-"+

@@ -5,7 +5,7 @@ dist/
 /.release-build.lock
 /UC-Windows-*.zip
 dist-raw/
-generated/
+/generated/
 *.spv
 .superpowers/
 third_party/signatures/

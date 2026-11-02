@@ -5,10 +5,19 @@
 #include <set>
 #include <stdexcept>
 #include <system_error>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include "file_rename.h"
+#else
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 namespace uc {
 namespace {
 using Json=nlohmann::ordered_json;
@@ -64,6 +73,7 @@ std::optional<std::string> read_file(const std::filesystem::path& path) {
     if(!file.read(bytes.data(),std::streamsize(bytes.size())))throw std::runtime_error("config: cannot read file");
     return bytes;
 }
+#ifdef _WIN32
 struct Handle {
     HANDLE value=INVALID_HANDLE_VALUE;
     ~Handle() {if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
@@ -74,6 +84,24 @@ struct Handle {
 [[noreturn]] void io_error(const char* message) {
     throw std::runtime_error(std::string("config: ")+message+": "+std::system_category().message(int(GetLastError())));
 }
+#else
+struct Fd {
+    int value=-1;
+    ~Fd() {if(value>=0)::close(value);}
+    Fd(const Fd&)=delete;
+    Fd& operator=(const Fd&)=delete;
+    explicit Fd(int fd):value(fd) {}
+};
+[[noreturn]] void io_error(const char* message) {
+    throw std::runtime_error(std::string("config: ")+message+": "+std::generic_category().message(errno));
+}
+int flush_file(int fd) {
+#if defined(__APPLE__)
+    if(fcntl(fd,F_FULLFSYNC)==0)return 0;   // fsync alone does not reach the disk on macOS
+#endif
+    return fsync(fd);
+}
+#endif
 }
 Bindings bindings_from_json(const nlohmann::ordered_json& bindings,Bindings result) {
     try {
@@ -164,6 +192,7 @@ std::string serialize_config(const ConfigDocument& document) {
 }
 void save_config(const std::filesystem::path& path,ConfigDocument& document) {
     const auto bytes=serialize_config(document);
+#ifdef _WIN32
     auto lock_path=path; lock_path+=L".write-lock";
     Handle lock(CreateFileW(lock_path.c_str(),GENERIC_WRITE|DELETE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_HIDDEN|FILE_FLAG_DELETE_ON_CLOSE,nullptr));
     if(lock.value==INVALID_HANDLE_VALUE)io_error("writer lock unavailable; another writer may be active");
@@ -188,6 +217,33 @@ void save_config(const std::filesystem::path& path,ConfigDocument& document) {
             throw std::runtime_error("config: save failed and temporary file cleanup failed");
         throw;
     }
+#else
+    // One writer at a time: an flock on <config>.write-lock (released by the kernel when a writer dies, unlike a lock file alone).
+    auto lock_path=path; lock_path+=".write-lock";
+    Fd lock(::open(lock_path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600));
+    if(lock.value<0 || flock(lock.value,LOCK_EX|LOCK_NB)!=0)io_error("writer lock unavailable; another writer may be active");
+    if(read_file(path)!=document.original_bytes)throw std::runtime_error("config: file changed since loading; reload before saving");
+    static std::atomic<uint64_t> serial=0;
+    const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto temporary=path; temporary+=".tmp-"+std::to_string(getpid())+"-"+std::to_string(ms)+"-"+std::to_string(serial.fetch_add(1));
+    bool created=false;
+    try {
+        Fd file(::open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0644));
+        if(file.value<0)io_error("cannot create temporary file");
+        created=true;
+        if(::write(file.value,bytes.data(),bytes.size())!=ssize_t(bytes.size()))io_error("cannot write temporary file");
+        if(flush_file(file.value)!=0)io_error("cannot flush temporary file");
+        // rename(2) replaces the file atomically: readers see the old configuration or the new one.
+        if(std::rename(temporary.c_str(),path.c_str())!=0)io_error("cannot replace file");
+        created=false;
+    } catch(...) {
+        // Only this writer's unique temporary file is eligible for cleanup.
+        if(created && ::unlink(temporary.c_str())!=0 && errno!=ENOENT)
+            throw std::runtime_error("config: save failed and temporary file cleanup failed");
+        throw;
+    }
+    ::unlink(lock_path.c_str());
+#endif
     document.original_bytes=bytes;
 }
 }

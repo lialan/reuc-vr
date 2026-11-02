@@ -124,7 +124,7 @@ bool same_memory(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i + 4 <= a.size(); i += 4) {
         uint32_t x, y; std::memcpy(&x, &a[i], 4); std::memcpy(&y, &b[i], 4);
-        if (x != y && !(is_nan32(_byteswap_ulong(x)) && is_nan32(_byteswap_ulong(y)))) return false;
+        if (x != y && !(is_nan32(uc_bswap32(x)) && is_nan32(uc_bswap32(y)))) return false;
     }
     return true;
 }

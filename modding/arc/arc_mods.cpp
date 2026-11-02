@@ -98,7 +98,12 @@ ArcBuild build_arc_mods(const fs::path& cache_root, const std::vector<const ModE
         for (fs::recursive_directory_iterator it(files, error), last; !error && it != last; it.increment(error)) {
             std::error_code entry_error;
             const auto type = it->symlink_status(entry_error).type();
-            if (type == fs::file_type::symlink || type == fs::file_type::junction) { it.disable_recursion_pending(); continue; }
+#ifdef _WIN32
+            const bool link = type == fs::file_type::symlink || type == fs::file_type::junction;   // junction: Microsoft STL only
+#else
+            const bool link = type == fs::file_type::symlink;
+#endif
+            if (link) { it.disable_recursion_pending(); continue; }
             if (type != fs::file_type::regular) continue;
             std::vector<std::string> parts;
             for (const auto& part : it->path().lexically_relative(files)) parts.push_back(utf8(part));
@@ -145,7 +150,7 @@ ArcBuild build_arc_mods(const fs::path& cache_root, const std::vector<const ModE
         const auto stamp = [](const fs::path& file) {
             std::error_code error;
             const auto size = fs::file_size(file, error);
-            const auto time = fs::last_write_time(file, error).time_since_epoch().count();
+            const auto time = static_cast<long long>(fs::last_write_time(file, error).time_since_epoch().count());   // libc++: a 128-bit count
             return utf8(file) + "|" + (error ? std::string("?") : std::to_string(size) + "|" + std::to_string(time)) + "\n";
         };
         signature = utf8(cache_root) + "\n";

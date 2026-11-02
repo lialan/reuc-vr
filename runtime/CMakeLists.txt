@@ -14,7 +14,12 @@ add_library(uc_runtime STATIC ${UC_GUEST_MEM_SOURCE} ${UC_HOST_THREAD_SOURCE} di
 target_include_directories(uc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/common)   # common: host_compat.h for ppc_rt.h
 target_sources(uc_runtime PRIVATE gx_audit.cpp)
 target_sources(uc_runtime PRIVATE hle/gx.cpp hle/sdk_math.cpp hle/sdk_regs.cpp hle/leaf_gen.cpp)
-target_sources(uc_runtime PRIVATE savefs.cpp save_rollback.cpp hle/save.cpp)
+if(WIN32)
+  target_sources(uc_runtime PRIVATE savefs.cpp)
+else()
+  target_sources(uc_runtime PRIVATE savefs_posix.cpp)
+endif()
+target_sources(uc_runtime PRIVATE save_rollback.cpp hle/save.cpp)
 target_sources(uc_runtime PRIVATE native_input.cpp)
 target_sources(uc_runtime PRIVATE ax_audio.cpp audio_gap_audit.cpp)
 target_sources(uc_runtime PRIVATE locked_copy.cpp)

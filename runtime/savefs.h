@@ -1,9 +1,12 @@
 #pragma once
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -12,6 +15,11 @@
 #include <vector>
 
 namespace uc {
+#ifdef _WIN32
+using SaveHandle = HANDLE;
+#else
+using SaveHandle = int;   // a file descriptor
+#endif
 class SaveFs {
 public:
     struct Stats { int result; uint32_t length=0,position=0; };
@@ -46,15 +54,15 @@ private:
     Snapshot& writable();
     struct Pin { std::filesystem::path path; std::shared_ptr<void> handle; };
     using Pins=std::vector<Pin>;
-    struct File { HANDLE handle; uint32_t mode; Pins parents; };
+    struct File { SaveHandle handle; uint32_t mode; Pins parents; };
     std::filesystem::path root_;
     std::map<int,File> files_;
     int next_fd_=100;
     uint64_t revision_=0;
     static int pin(const std::filesystem::path& directory,Pins& pins);
     int resolve(const std::string& path,std::filesystem::path& host,Pins& pins) const;
-    int backup(HANDLE source);
+    int backup(SaveHandle source);
     int backup(const std::filesystem::path& path);
-    std::filesystem::path revision(const wchar_t* directory,Pins& pins);
+    std::filesystem::path revision(const std::filesystem::path::value_type* directory,Pins& pins);
 };
 }

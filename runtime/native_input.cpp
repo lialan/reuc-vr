@@ -65,12 +65,20 @@ void NativeInput::restore(const Snapshot& saved) {
 NativeInput::~NativeInput() { if(demo_out_)std::fclose(demo_out_); }
 void NativeInput::demo_record(const std::filesystem::path& path) {
     std::lock_guard lock(mutex_);
+#ifdef _WIN32
     demo_out_=_wfopen(path.c_str(),L"wb");
+#else
+    demo_out_=std::fopen(path.c_str(),"wb");
+#endif
     if(!demo_out_)throw std::runtime_error("cannot create the input demo");
 }
 void NativeInput::demo_play(const std::filesystem::path& path) {
     std::lock_guard lock(mutex_);
+#ifdef _WIN32
     std::FILE* file=_wfopen(path.c_str(),L"rb");
+#else
+    std::FILE* file=std::fopen(path.c_str(),"rb");
+#endif
     if(!file)throw std::runtime_error("cannot open the input demo");
     std::vector<uint8_t> data; uint8_t chunk[65536]; size_t got;
     while((got=std::fread(chunk,1,sizeof chunk,file))>0)data.insert(data.end(),chunk,chunk+got);
