@@ -112,6 +112,7 @@ private:
     bool refresh_control_ = false, performance_control_ = false, thread_control_ = false;
 #ifdef __ANDROID__
     PFN_xrSetAndroidApplicationThreadKHR set_thread_ = nullptr;
+    size_t guest_tids_seen_ = 0;   // guest host threads already registered with the runtime (begin_frame)
 #endif
     std::vector<float> refresh_rates_;
     float requested_refresh_ = 0;

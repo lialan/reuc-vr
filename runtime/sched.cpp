@@ -576,6 +576,7 @@ void Sched::start_host(Thread* t) {
 }
 
 void Sched::thread_main(Thread* t) {
+    host_thread_mark_guest();   // the headset registers it with the XR runtime (xr_compositor.cpp)
     struct HostExit {
         Sched& s; Thread& t;
         ~HostExit() { std::lock_guard lock(s.baton_m_); t.host_alive=false; s.rewind_cv_.notify_all(); }

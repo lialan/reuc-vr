@@ -1,6 +1,7 @@
 // HOTD4 VR's OpenXR host for this renderer: the session, swapchain, frame loop, foveation and refresh code of lindberghrecomp's
 // renderer/vulkan/openxr.cpp (ef5cd20), with lindbergh's Device/Target replaced by the renderer's handles and the screen pass below.
 #include "xr_compositor.h"
+#include "../runtime/host_thread.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -337,6 +338,17 @@ void XrCompositor::poll() {
 bool XrCompositor::begin_frame() {
     if (!session_ || frame_open_) throw std::logic_error("Invalid OpenXR frame begin");
     poll(); if (!running_ || exiting_) return false;
+#ifdef __ANDROID__
+    static const bool guest_threads = std::getenv("UC_NO_GUEST_XR_THREAD") == nullptr;   // UC_NO_GUEST_XR_THREAD=1: as before (A/B)
+    if (set_thread_ && guest_threads) {   // the guest's host threads (the CPU-bound game) are the application's main threads: performance-critical scheduling
+        std::vector<int> tids;
+        guest_tids_seen_ = uc::host_thread_guest_tids(guest_tids_seen_, tids);
+        for (const int tid : tids) {
+            const auto result = set_thread_(session_, XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR, uint32_t(tid));
+            std::fprintf(stderr, "[vulkan-xr] guest thread %d registered: %d\n", tid, int(result));
+        }
+    }
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO}; xr_check(xrWaitFrame(session_, &wait, &frame_), "wait OpenXR frame");
     const auto t1 = std::chrono::steady_clock::now();
