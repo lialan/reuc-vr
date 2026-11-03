@@ -119,7 +119,7 @@ struct SyncText {
 };
 
 // The SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; HLE entries SaveGprN ... RestFprN, see
-// runtime/hle/sdk_regs.cpp): a call of one is the same loads or stores at r11 in the same order, so in register-cache mode the translator
+// runtime/hle/sdk_regs.cpp): a call of one does what the helper does (ppc::save_gpr<N> ..., ppc_rt.h), so in register-cache mode the translator
 // writes them in place of the call; no sync of the register copy around every prologue and epilogue.
 struct RegHelper { char kind = 0; uint32_t first = 0; };   // 'S' SaveGpr, 'R' RestGpr, 's' SaveFpr, 'r' RestFpr
 static RegHelper reg_helper(const Program& p, uint32_t target) {
@@ -132,14 +132,9 @@ static RegHelper reg_helper(const Program& p, uint32_t target) {
     const uint32_t first = uint32_t(std::stoul(n.substr(7)));
     return first >= 14 && first <= 31 ? RegHelper{kind, first} : RegHelper{};
 }
-static std::string reg_helper_text(const RegHelper& h) {
-    std::string o;
-    for (uint32_t i = h.first; i < 32; ++i) {
-        const bool gpr = h.kind == 'S' || h.kind == 'R';
-        const std::string op = h.kind == 'S' ? "stw" : h.kind == 'R' ? "lwz" : h.kind == 's' ? "stfd" : "lfd";
-        o += "ppc::op_" + op + "(c, " + num(i) + ", 11, " + num(-(gpr ? 4 : 8) * int(32 - i)) + "); ";
-    }
-    return o;
+static std::string reg_helper_text(const RegHelper& h) {   // the helper's own code (ppc_rt.h), in the local register copy
+    const char* fn = h.kind == 'S' ? "save_gpr" : h.kind == 'R' ? "rest_gpr" : h.kind == 's' ? "save_fpr" : "rest_fpr";
+    return std::string("ppc::") + fn + "<" + num(h.first) + ">(c); ";
 }
 static RegEffect reg_helper_effect(const RegHelper& h) {
     RegEffect e;

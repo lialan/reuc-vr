@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <array>
+#include <utility>
 #include <cstring>
 #include "host_compat.h"
 #include "gx_write_watch.h"
@@ -525,5 +526,58 @@ PPC_INLINE void op_psq_lx(Ctx& c, int t, int a, int b, int w, int i) { psq_load(
 PPC_INLINE void op_psq_lux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_load(c, t, e, w, i); c.r[a] = e; }
 PPC_INLINE void op_psq_stx(Ctx& c, int t, int a, int b, int w, int i) { psq_store(c, t, ea_x(c, a, b), w, i); }
 PPC_INLINE void op_psq_stux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_store(c, t, e, w, i); c.r[a] = e; }
+
+
+// ---- the SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; r11 points just above the save area) ----
+// runtime/hle/sdk_regs.cpp runs them as HLE entries and the translator writes them in place of a call (register-cache mode). The save
+// area (on the stack) is checked once: both ends outside MMIO and no wrap; then the accesses go straight to memory and the write watch /
+// rollback tracker mark its one or two pages once, the pages the per-store barriers mark. Any other area takes the instruction-by-instruction path.
+PPC_INLINE bool reg_area_plain(uint32_t top, uint32_t size) { return top >= size && !is_mmio(top - size) && !is_mmio(top - 1); }
+PPC_INLINE void put_be32(uint8_t* p, uint32_t v) { v = uc_bswap32(v); std::memcpy(p, &v, 4); }
+PPC_INLINE uint32_t get_be32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return uc_bswap32(v); }
+PPC_INLINE void put_be64(uint8_t* p, double d) { uint64_t v; std::memcpy(&v, &d, 8); v = uc_bswap64(v); std::memcpy(p, &v, 8); }
+PPC_INLINE double get_be64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); v = uc_bswap64(v); double d; std::memcpy(&d, &v, 8); return d; }
+template <int First, int... I> PPC_INLINE void save_gpr_block(Ctx& c, std::integer_sequence<int, I...>) {
+    constexpr uint32_t size = 4 * (32 - First);
+    if (const uint32_t top = c.r[11]; reg_area_plain(top, size)) [[likely]] {
+        gx::note_write_range(top - size, size);
+        uint8_t* p = hp(c, top - size);
+        (put_be32(p + 4 * I, c.r[First + I]), ...);
+        return;
+    }
+    (op_stw(c, First + I, 11, -4 * (32 - First - I)), ...);
+}
+template <int First, int... I> PPC_INLINE void rest_gpr_block(Ctx& c, std::integer_sequence<int, I...>) {
+    constexpr uint32_t size = 4 * (32 - First);
+    if (const uint32_t top = c.r[11]; reg_area_plain(top, size)) [[likely]] {
+        const uint8_t* p = hp(c, top - size);
+        ((c.r[First + I] = get_be32(p + 4 * I)), ...);
+        return;
+    }
+    (op_lwz(c, First + I, 11, -4 * (32 - First - I)), ...);
+}
+template <int First, int... I> PPC_INLINE void save_fpr_block(Ctx& c, std::integer_sequence<int, I...>) {
+    constexpr uint32_t size = 8 * (32 - First);
+    if (const uint32_t top = c.r[11]; reg_area_plain(top, size)) [[likely]] {
+        gx::note_write_range(top - size, size);
+        uint8_t* p = hp(c, top - size);
+        (put_be64(p + 8 * I, c.f[First + I]), ...);
+        return;
+    }
+    (op_stfd(c, First + I, 11, -8 * (32 - First - I)), ...);
+}
+template <int First, int... I> PPC_INLINE void rest_fpr_block(Ctx& c, std::integer_sequence<int, I...>) {
+    constexpr uint32_t size = 8 * (32 - First);
+    if (const uint32_t top = c.r[11]; reg_area_plain(top, size)) [[likely]] {
+        const uint8_t* p = hp(c, top - size);
+        ((c.f[First + I] = get_be64(p + 8 * I)), ...);
+        return;
+    }
+    (op_lfd(c, First + I, 11, -8 * (32 - First - I)), ...);
+}
+template <int First> PPC_INLINE void save_gpr(Ctx& c) { save_gpr_block<First>(c, std::make_integer_sequence<int, 32 - First>{}); }
+template <int First> PPC_INLINE void rest_gpr(Ctx& c) { rest_gpr_block<First>(c, std::make_integer_sequence<int, 32 - First>{}); }
+template <int First> PPC_INLINE void save_fpr(Ctx& c) { save_fpr_block<First>(c, std::make_integer_sequence<int, 32 - First>{}); }
+template <int First> PPC_INLINE void rest_fpr(Ctx& c) { rest_fpr_block<First>(c, std::make_integer_sequence<int, 32 - First>{}); }
 
 }  // namespace ppc

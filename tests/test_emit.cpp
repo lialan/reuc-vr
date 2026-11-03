@@ -164,7 +164,7 @@ int main() {
         auto q = make_prog(a.w, cfg);
         std::string t = uc::emit_function(q, q.an.functions[0], st);
         char buf[200];
-        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ppc::op_stw(c, 29, 11, -12); ppc::op_stw(c, 30, 11, -8); ppc::op_stw(c, 31, 11, -4); ", a.addr(call) + 4);
+        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ppc::save_gpr<29>(c); ", a.addr(call) + 4);
         CHECK(t.find(buf) != std::string::npos);
         CHECK(t.find("invoke_hle") == std::string::npos);
         CHECK(t.find("c.r[29] = ctx.r[29]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31];") != std::string::npos);   // read on entry
