@@ -376,7 +376,10 @@ void Sched::post_at(uint64_t tick, Event fn,EventKind kind) { timed_.emplace(tic
 
 void Sched::drain_async() {
     std::unique_lock lock(ext_m_);
-    if(!ext_cv_.wait_for(lock,std::chrono::seconds(5),[&] { return shutdown_ || async_pending_==0; }))
+    ++ext_waiters_;
+    const bool drained=ext_cv_.wait_for(lock,std::chrono::seconds(5),[&] { return shutdown_ || async_pending_==0; });
+    --ext_waiters_;
+    if(!drained)
         throw std::runtime_error("checkpoint timed out waiting for external I/O");
     if(shutdown_) throw ThreadExit{};
 }
@@ -384,14 +387,16 @@ void Sched::drain_async() {
 void Sched::post_external(Event fn,EventKind kind,std::optional<uint64_t> generation) {
     if (generation && *generation!=generation_.load()) return;
     if (det_ && is_guest_thread()) { post_at(0,std::move(fn),kind); return; }
+    bool waiting;
     {
         std::lock_guard<std::mutex> lk(ext_m_);
         if (shutdown_) return;
         if (generation && *generation!=generation_.load()) return;
         if (det_ && async_pending_ > 0) --async_pending_;   // the announced result of another thread has arrived
         ext_q_.push_back({std::move(fn),kind});
+        waiting = ext_waiters_ > 0;
     }
-    ext_cv_.notify_all();
+    if (waiting) ext_cv_.notify_all();
 }
 
 void Sched::deliver_events() {
@@ -479,7 +484,10 @@ void Sched::idle_wait() {
     if (!ext_q_.empty() || shutdown_) return;
     if (det_) {
         if (async_pending_ > 0) {   // a DVD read or a GPU frame is on its way: its arrival, not the host speed, decides what happens next
-            if (!ext_cv_.wait_for(lk, std::chrono::milliseconds(deadlock_ms_), [&] { return !ext_q_.empty() || shutdown_; })) { lk.unlock(); fail("deterministic mode: an announced asynchronous result never arrived\n" + dump_threads()); }
+            ++ext_waiters_;
+            const bool arrived = ext_cv_.wait_for(lk, std::chrono::milliseconds(deadlock_ms_), [&] { return !ext_q_.empty() || shutdown_; });
+            --ext_waiters_;
+            if (!arrived) { lk.unlock(); fail("deterministic mode: an announced asynchronous result never arrived\n" + dump_threads()); }
             return;
         }
         if (!timed_.empty()) { det_clock_advance_to(timed_.begin()->first); return; }   // idle: time jumps to the next event
@@ -495,7 +503,9 @@ void Sched::idle_wait() {
         timed = true;
     }
     const uint64_t idle_start = steady_ns();
+    ++ext_waiters_;
     bool woke = ext_cv_.wait_until(lk, until, [&] { return !ext_q_.empty() || shutdown_; });
+    --ext_waiters_;
     const uint64_t idle_duration = steady_ns() - idle_start;
     idle_ns_ += idle_duration;
     if (idle_duration >= 1000000) {   // diagnosis of frame-time spikes: which threads were blocked on what
