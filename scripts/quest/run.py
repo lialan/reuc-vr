@@ -87,6 +87,7 @@ def main():
                            stdin=transfer.stdout, check=True, timeout=120)
             transfer.wait()
         shell("run-as", PACKAGE, "rm", "-f", private + "/uc.log")
+        shell("run-as", PACKAGE, "rm", "-rf", private + "/captures")   # this run's captures only (they piled up to GBs and the pull failed)
         if args.guardian_pause:
             guardian = True; shell("setprop", "debug.oculus.guardian_pause", "1")
         token = uuid.uuid4().hex
