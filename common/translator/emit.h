@@ -23,6 +23,7 @@ struct Program {
     Analysis an;
     Config cfg;
     bool cr_opt = true;   // drop dead CR writes and fuse compare+branch (translator --no-cr-opt turns it off)
+    bool count_insns = false;   // diagnostic: count every executed guest instruction in ppc::g_guest_insns (translator --count-insns)
     bool reg_cache = true;   // keep guest registers in function-local copies, synced at calls and exits (translator --no-reg-cache turns it off)
 };
 

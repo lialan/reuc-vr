@@ -799,6 +799,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         std::string code = comment[i];
         if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
         else ++st.instructions;
+        if (p.count_insns) code = "++ppc::g_guest_insns; " + code;
         o << "  /*" << hex8(pc) << "*/ { " << code << " }" << (fall_flush[i].empty() ? "" : " { " + fall_flush[i] + "}") << "\n";
     }
     const std::string end_flush = local ? copy_text(dirty_after[n], true) : "";

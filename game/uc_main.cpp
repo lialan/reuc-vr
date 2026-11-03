@@ -460,8 +460,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         if (deterministic && retraces % 60 == 0) {   // identical work per game second: the wall time and guest cycles between marks are what builds are compared on
             static auto last = std::chrono::steady_clock::now(); static uint64_t last_draws = 0, last_cycles = 0;
             const auto now = std::chrono::steady_clock::now(); const uint64_t draws = uc::gx_stats().draws, cycles = sched.guest_cycles();
-            std::fprintf(stderr, "[detbench] retrace %llu draws %llu guest_mcycles %.2f wall_ms %.2f\n", (unsigned long long)retraces, (unsigned long long)(draws - last_draws), (cycles - last_cycles) / 1e6, std::chrono::duration<double, std::milli>(now - last).count());
-            last = now; last_draws = draws; last_cycles = cycles;
+            static uint64_t last_insns = 0; const uint64_t insns = ppc::g_guest_insns;   // nonzero only in a --count-insns generation
+            std::fprintf(stderr, "[detbench] retrace %llu draws %llu guest_mcycles %.2f wall_ms %.2f", (unsigned long long)retraces, (unsigned long long)(draws - last_draws), (cycles - last_cycles) / 1e6, std::chrono::duration<double, std::milli>(now - last).count());
+            if (insns) std::fprintf(stderr, " guest_insns %llu", (unsigned long long)(insns - last_insns));
+            std::fprintf(stderr, "\n");
+            last = now; last_draws = draws; last_cycles = cycles; last_insns = insns;
         }
         if (options.stop_retrace && retraces >= options.stop_retrace) det_stop = true;
         static const char* sample_flag = std::getenv("UC_CPU_SAMPLE_FLAG"); static const char* sample_from = std::getenv("UC_CPU_SAMPLE_RETRACE");
