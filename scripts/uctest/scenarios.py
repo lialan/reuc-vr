@@ -496,6 +496,8 @@ def reach_fight(g, args):
         print(f"fight: saved {mark_path}", flush=True)
     with g.step("normal_speed"):
         g.set_speed(1)
+        if getattr(args, "fight_fps_limit", None) is not None:   # --fight-fps-limit: the limit the fight is measured (or played) at
+            g.set_options(fps_limit=args.fight_fps_limit)
         g.wait(lambda f: f.get("speed") == 1 and f.get("context") == "gameplay", seconds=10, awaited="speed 1 in gameplay")
     return marked
 
