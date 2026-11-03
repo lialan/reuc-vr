@@ -2933,6 +2933,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 set_draw_state(alpha_key);
                 if (alpha.uber) { push.alpha_pass=1; vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push); }
                 vkCmdDrawIndexed(slot.command,run.count,1,run.first,0,0);
+                ++alpha_passes_;
             }
             if (counted) { vkCmdEndQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_)); frag_queries_.push_back(uint32_t(run.d)); }
         };
@@ -3114,8 +3115,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     }
                 }
                 if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
-                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds, %llu pipeline binds\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_,(unsigned long long)pipeline_binds_);
-                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
+                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds, %llu pipeline binds, %llu second destination-alpha draws\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_,(unsigned long long)pipeline_binds_,(unsigned long long)alpha_passes_);
+                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=alpha_passes_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
             }
             if (culled) continue;

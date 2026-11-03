@@ -128,3 +128,33 @@ bins still carry ~1 ms of per-draw cost each). Tried and not kept:
 - Relaxed precision (`UC_RELAXED_TEV=1`: the folded TEV modules' colour arithmetic marked RelaxedPrecision, texture coordinates and
   the fog's depth kept full precision; tools/spirv_relaxed_precision.py): main scene 23.4 -> 22.2 ms, the heat-haze packet 10.3 ->
   9.9 ms, frame 60.0 -> 58.6 ms at 3.07x. Small; kept opt-in until its pictures are compared on the headset.
+
+### Fix 3: destination alpha in one draw (bc66d9e)
+
+Almost every main-scene draw has GX destination alpha; the renderer drew each such draw twice (colour, then the constant alpha alone
+through a second pipeline): two pipeline binds per draw or merged run, every fragment shaded twice. A non-blending draw is now drawn
+once with the constant alpha (`UC_NO_FUSED_ALPHA=1` off). Pipeline binds in the fight: 28.3k -> 7.7k per 2 s on the headset.
+
+| fightvr replay, main scene ms a frame | scale 1 (545 MHz) | scale 3.07 (640 MHz) |
+|---|---|---|
+| same build, `UC_NO_FUSED_ALPHA=1` | 11.2 | 23.2 |
+| destination alpha fused | 5.9 | 12.5 |
+| GPU per presented frame (all packets) | 21.4 -> 16.1 | 59.9 -> 50.2 |
+
+Also measured and not kept as a speed-up: descriptor sets shared by texture combination with the uniform and eye blocks as dynamic
+offsets (8c59b8f, kept for the fewer descriptor writes): 11.1 -> 10.9 ms at scale 1, within noise. Cull and depth state static in the
+pipelines (`UC_STATIC_DEPTH=1`): 23.4 ms at 3.07x either way; the trace counts no LRZ-killed pixels with or without it.
+
+### Where the frame stands (fightvr replay, all fixes)
+
+Main scene, before -> now: scale 1 32.6 -> 5.9 ms, scale 3.07 51.3 -> 12.5 ms. GPU per presented frame: scale 1 ~16 ms (present 4.0,
+heat-haze packet 2.0, HUD/overlay ~1.7), scale 3.07 ~50 ms (main scene 12.5, HUD/overlay 10.1, heat-haze 10, copy chain, present).
+At native resolution the other packets now cost as much as the main scene; all of them are pixel-bound there.
+
+Next, by expected gain:
+- The HUD/overlay packet at 3.07x (~10 ms: ~1.5 eye-screens of full-screen quads at ~210 instructions a fragment in a pass over
+  the whole 640x480 EFB) and the heat-haze packet (~10 ms, ~6x overdraw of translucent quads through the indirect path).
+- Per-draw cost that is left: a run still ends on a texture change (55%) or a pipeline change (28%); bindless textures (an
+  index per draw into a texture array) would let more draws merge. Only ~3% of the scene's draws are free to reorder.
+- `UC_RELAXED_TEV=1` (-5% on the main scene) once its pictures are compared on the headset.
+- The game's widened view is short vertically for the Quest's eyes (1.62x reach): objects pop at the top and bottom edges.
