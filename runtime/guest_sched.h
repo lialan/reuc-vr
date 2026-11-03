@@ -41,6 +41,7 @@ struct Thread {
     } continuation;
     bool entered=false, restart=false;
     bool host_alive=false, rewind_requested=false, rewound=false; // baton_m_
+    std::atomic<bool> spinning{false};   // waiting for the baton without sleeping (Sched::handoff): it needs no wake-up
 };
 
 class Sched {
@@ -126,6 +127,8 @@ private:
     std::condition_variable rewind_cv_;
     std::vector<void*> handles_;
     Thread* running_ = nullptr;
+    std::atomic<Thread*> baton_{nullptr};   // running_ for the spin in handoff (written with running_, under baton_m_)
+    uint64_t spin_ns_ = 0;                  // how long a thread that handed the baton on spins for it before sleeping (UC_SCHED_SPIN_US)
     Thread* main_ = nullptr;
     ppc::Ctx irq_ctx_{};
     std::atomic<bool> shutdown_{false}, main_done_{false};
