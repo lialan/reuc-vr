@@ -2,6 +2,7 @@
 #include "analyzer/analyzer.h"
 #include <cstdint>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -45,6 +46,8 @@ struct CrHints {
     // a return or a trap the instruction writes `flush` (local -> ctx); after a call or an interrupt poll it writes `reload` (ctx -> local).
     bool local = false;
     std::string flush, reload;
+    std::map<uint32_t, std::string> edge;   // flush on the taken edge to an internal label (where the paths that meet there disagree)
+    std::string not_taken;                  // a conditional call: flush on the path that skips the call
 };
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t word, EmitStats& st, const CrHints* hints = nullptr);

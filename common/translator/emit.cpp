@@ -100,9 +100,19 @@ static std::string cond_expr(uint32_t bo, uint32_t bi, std::string& pre) {
 
 // Sync code of one instruction in register-cache mode (CrHints::local); empty strings and the context `c` otherwise.
 struct SyncText {
-    std::string cx = "c", flush, reload;
-    explicit SyncText(const CrHints* h) { if (h && h->local) { cx = "ctx"; flush = h->flush; reload = h->reload; } }
+    std::string cx = "c", flush, reload, not_taken;
+    const std::map<uint32_t, std::string>* edges = nullptr;
+    explicit SyncText(const CrHints* h) {
+        if (h && h->local) { cx = "ctx"; flush = h->flush; reload = h->reload; not_taken = h->not_taken; edges = &h->edge; }
+    }
     bool local() const { return cx == "ctx"; }
+    // the else branch of a conditional call: what the path that skips the call flushes (code after the call would also run after it)
+    std::string otherwise(bool lk) const { return lk && !not_taken.empty() ? " else { " + not_taken + "}" : ""; }
+    std::string edge(uint32_t target) const {   // a forward jump to an internal label
+        if (!edges) return "";
+        auto it = edges->find(target);
+        return it == edges->end() ? "" : it->second;
+    }
 };
 
 // The SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; HLE entries SaveGprN ... RestFprN, see
@@ -147,7 +157,7 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
         }
     }
     if (tk.kind == Target::Internal && !lk) {
-        if (target > pc) return "goto L_" + hex8(target) + ";";
+        if (target > pc) return s.edge(target) + "goto L_" + hex8(target) + ";";
         // a loop is a safe point; the interrupts that may run there see the registers in the real context
         if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + "} goto L_" + hex8(target) + ";";
         return "ppc::poll(c); goto L_" + hex8(target) + ";";
@@ -194,7 +204,7 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
             uint32_t target = ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w));
             std::string pre;
             std::string cond = hints && hints->fused ? fused_cond(*hints->fused, bo, bi) : cond_expr(bo, bi, pre);
-            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st, s) + " } }";
+            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st, s) + " }" + s.otherwise(ppc::lk(w)) + " }";
         }
         case Kind::BCLR: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
@@ -203,7 +213,7 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
             std::string act = ppc::lk(w) ? "{ uint32_t t_ = c.lr; c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", t_); " + s.reload + "}"
                                          : s.flush + "return;";
             if (cond == "true" && pre.empty()) return act;
-            return "{ " + pre + "if (" + cond + ") { " + act + " } }";
+            return "{ " + pre + "if (" + cond + ") { " + act + " }" + s.otherwise(ppc::lk(w)) + " }";
         }
         case Kind::BCCTR: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
@@ -211,13 +221,13 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
             std::string cond = cond_expr(bo | 4, bi, pre);   // bcctr never decrements CTR
             if (ppc::lk(w)) {
                 std::string act = "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", c.ctr);" + (s.reload.empty() ? "" : " " + s.reload);
-                return cond == "true" ? act : "if (" + cond + ") { " + act + " }";
+                return cond == "true" ? act : "if (" + cond + ") { " + act + " }" + s.otherwise(true);
             }
             for (const auto& jt : p.an.jump_tables) {
                 if (jt.bctr_addr != pc) continue;
                 std::set<uint32_t> seen;
                 std::string sw = "switch (c.ctr) { ";
-                for (uint32_t t : jt.targets) if (seen.insert(t).second) sw += "case 0x" + hex8(t) + "u: goto L_" + hex8(t) + "; ";
+                for (uint32_t t : jt.targets) if (seen.insert(t).second) sw += "case 0x" + hex8(t) + "u: " + s.edge(t) + "goto L_" + hex8(t) + "; ";
                 sw += "default: " + s.flush + trap_str(pc, "jump table index out of range") + " }";
                 return sw;
             }
@@ -632,32 +642,57 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     const bool local = p.reg_cache;
     RegSet entry_load;
     std::vector<RegSet> dirty_after(n + 1), live_in(n + 1);
+    std::vector<std::string> fall_flush(n);   // flush on the fall-through edge into the next instruction
     if (local) {
         std::vector<RegNode> nodes(n);
         for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty());
+        // Control-flow edges. Dirty = written since the last sync on *every* path: where paths with different dirty sets meet over a forward
+        // edge, the edge itself flushes the difference (a join after a conditional write stores there, once); over a back edge the loop head
+        // keeps the union (the loop runs without stores) and the entry path keeps those registers current instead (the liveness below makes
+        // them reloaded at its last sync). So a flush never stores a copy that a path left stale.
+        struct Edge { int from, to; bool sync, back, fall; };   // sync: the edge leaves a call (nothing is dirty after it); fall: the fall-through edge
+        std::vector<Edge> edges;
+        std::vector<std::vector<int>> into(n + 1);
+        auto add = [&](int from, int to, bool sync, bool fall = false) { into[size_t(to)].push_back(int(edges.size())); edges.push_back({from, to, sync, from >= 0 && to <= from, fall}); };
+        add(-1, 0, true);
+        if (has_sec) for (uint32_t t : sit->second) if (t >= f.entry && t < f.end) add(-1, int((t - f.entry) / 4), true);
+        for (size_t i = 0; i < n; ++i) {
+            const RegNode& nd = nodes[i];
+            if (nd.fall) add(int(i), int(i + 1), false, true);
+            if (nd.call) add(int(i), int(i + 1), true);
+            if (nd.target >= 0) add(int(i), nd.target, false);
+            for (int t : nd.table) add(int(i), t, false);
+        }
         std::vector<RegSet> dirty_in(n + 1);
-        for (bool changed = true; changed;) {   // forward: written since the last sync, on some path
+        auto edge_out = [&](const Edge& e) { return e.sync || e.from < 0 ? RegSet() : dirty_after[size_t(e.from)]; };
+        for (bool changed = true; changed;) {
             changed = false;
-            auto flow = [&](int to, const RegSet& s) { const RegSet before = dirty_in[size_t(to)]; dirty_in[size_t(to)] |= s; changed |= dirty_in[size_t(to)] != before; };
-            for (size_t i = 0; i < n; ++i) {
-                const RegNode& nd = nodes[i];
-                dirty_after[i] = dirty_in[i] | nd.eff.may;
-                if (nd.fall) flow(int(i + 1), dirty_after[i]);
-                if (nd.target >= 0) flow(nd.target, dirty_after[i]);
-                for (int t : nd.table) flow(t, dirty_after[i]);
+            for (size_t m = 0; m <= n; ++m) {
+                RegSet fwd, back;
+                bool any_fwd = false;
+                for (int k : into[m]) {
+                    const Edge& e = edges[size_t(k)];
+                    if (e.back) back |= edge_out(e);
+                    else { fwd = any_fwd ? (fwd & edge_out(e)) : edge_out(e); any_fwd = true; }
+                }
+                const RegSet in = fwd | back;
+                if (in != dirty_in[m]) { dirty_in[m] = in; changed = true; }
+                if (m < n) dirty_after[m] = dirty_in[m] | nodes[m].eff.may;
             }
         }
         dirty_after[n] = dirty_in[n];
+        std::vector<RegSet> edge_flush(edges.size());
+        for (size_t k = 0; k < edges.size(); ++k) if (!edges[k].back) edge_flush[k] = edge_out(edges[k]) & ~dirty_in[size_t(edges[k].to)];
+        std::vector<std::vector<int>> out(n);
+        for (size_t k = 0; k < edges.size(); ++k) if (edges[k].from >= 0) out[size_t(edges[k].from)].push_back(int(k));
         live_in[n] = dirty_in[n];   // past the end: a tail call or a trap flushes
         for (bool changed = true; changed;) {   // backward: needed (read, or flushed) before the next write
             changed = false;
             for (size_t i = n; i-- > 0;) {
                 const RegNode& nd = nodes[i];
                 RegSet x;
-                if (nd.fall) x |= live_in[i + 1];
-                if (nd.call || nd.exit) x |= dirty_after[i];
-                if (nd.target >= 0) { x |= live_in[size_t(nd.target)]; if (nd.poll) x |= dirty_after[i]; }
-                for (int t : nd.table) x |= live_in[size_t(t)];
+                if (nd.call || nd.exit || nd.poll) x |= dirty_after[i];
+                for (int k : out[i]) if (!edges[size_t(k)].sync) x |= live_in[size_t(edges[size_t(k)].to)] | edge_flush[size_t(k)];
                 const RegSet in = nd.eff.use | (nd.eff.may & ~nd.eff.must) | (x & ~nd.eff.must);
                 if (in != live_in[i]) { live_in[i] = in; changed = true; }
             }
@@ -670,6 +705,15 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(dirty_after[i], true); st.reg_flushes += dirty_after[i].count(); }
             if (nd.call) { hints[i].reload = copy_text(live_in[i + 1], false); st.reg_reloads += live_in[i + 1].count(); }
             else if (nd.poll) { hints[i].reload = copy_text(live_in[size_t(nd.target)], false); st.reg_reloads += live_in[size_t(nd.target)].count(); }
+        }
+        for (size_t k = 0; k < edges.size(); ++k) {
+            const Edge& e = edges[size_t(k)];
+            if (e.from < 0 || e.sync || e.back || edge_flush[k].none()) continue;
+            st.reg_flushes += edge_flush[k].count();
+            const std::string text = copy_text(edge_flush[k], true);
+            if (e.fall && nodes[size_t(e.from)].call) hints[size_t(e.from)].not_taken = text;   // a conditional call: in its else branch
+            else if (e.fall) fall_flush[size_t(e.from)] = text;   // after the instruction, before the next label
+            else hints[size_t(e.from)].edge[f.entry + uint32_t(e.to) * 4] = text;   // on the jump (a jump table: in its case)
         }
         st.reg_entry_loads += entry_load.count();
     }
@@ -690,7 +734,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         std::string code = comment[i];
         if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
         else ++st.instructions;
-        o << "  /*" << hex8(pc) << "*/ { " << code << " }\n";
+        o << "  /*" << hex8(pc) << "*/ { " << code << " }" << (fall_flush[i].empty() ? "" : " { " + fall_flush[i] + "}") << "\n";
     }
     const std::string end_flush = local ? copy_text(dirty_after[n], true) : "";
     if (local) st.reg_flushes += dirty_after[n].count();

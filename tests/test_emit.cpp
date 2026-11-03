@@ -114,6 +114,27 @@ int main() {
         t = uc::emit_function(q, q.an.functions[0], st);
         CHECK(!has("ctx"));
     }
+    {   // where a path that wrote a register meets one that did not, the edge flushes it: the call after the join stores only what every
+        // path wrote, and nothing is reloaded just to be stored again; a conditional call's skipping path flushes in its else branch
+        Asm a;
+        size_t br = a.emit(0);
+        a.emit(addi(4, 4, 1));
+        uint32_t skip = a.here();
+        size_t call = a.emit(0);
+        size_t ccall = a.emit(0);
+        a.emit(addi(5, 4, 0)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(blr);
+        a.patch_bc(br, 12, 2, skip); a.patch_bl(call, g); a.w[ccall] = enc::bc(12, 2, int32_t(g - a.addr(ccall))) | 1;   // beq skip; bl g; beql g
+        auto q = make_prog(a.w);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        auto has = [&](const std::string& s) { return t.find(s) != std::string::npos; };
+        CHECK(has("ppc::op_addi(c, 4, 4, 1); } { ctx.r[4] = c.r[4]; }"));
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "{ c.lr = 0x%08Xu; ctx.lr = c.lr; fn_%08X(ctx); c.r[4] = ctx.r[4]; c.cr[0] = ctx.cr[0]; c.lr = ctx.lr;  }", a.addr(call) + 4, g);
+        CHECK(has(buf));
+        std::snprintf(buf, sizeof buf, "{ c.lr = 0x%08Xu; ctx.lr = c.lr; fn_%08X(ctx); c.r[4] = ctx.r[4];  } else { ctx.lr = c.lr; } }", a.addr(ccall) + 4, g);
+        CHECK(has(buf));
+    }
     {   // a call of a register save/restore helper becomes its stores in place (no call, no sync); without the cache it stays an HLE call
         Asm a;
         size_t call = a.emit(0); a.emit(blr);
