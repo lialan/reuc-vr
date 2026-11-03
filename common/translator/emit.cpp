@@ -818,12 +818,14 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
 // The translated functions a call may sync with partially: no call (the save/restore helpers are written in place), no loop (so no
 // interrupt poll: no safe point where the scheduler or an interrupt could look at the context), no jump table, no tail or indirect jump
 // and no fall into the next function. Their loads and stores of the real context are their entry loads and flushes, all within the
-// registers they read or write.
+// registers they read or write. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very
+// instructions) qualify the same way: they copy in and out only registers their guest code uses.
 static std::unordered_map<uint32_t, LeafRegs> analyze_leaves(const Program& p, const CrLive* live) {
     std::unordered_map<uint32_t, LeafRegs> out;
     EmitStats scratch;
     for (const auto& f : p.an.functions) {
-        if (p.cfg.hle.count(f.entry) || f.end <= f.entry) continue;
+        if (f.end <= f.entry) continue;
+        if (auto h = p.cfg.hle.find(f.entry); h != p.cfg.hle.end() && h->second.compare(0, 5, "Leaf_") != 0) continue;
         FnPlan plan;
         plan_function(p, f, live, scratch, plan);
         if (plan.tail_end) continue;
