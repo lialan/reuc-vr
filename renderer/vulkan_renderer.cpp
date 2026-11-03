@@ -41,7 +41,7 @@ constexpr size_t kStereoBlockBytes=128;   // smoke.slang StereoBlock: two eyes x
 const std::shared_ptr<const gx::TexturePixels>& draw_texture(const gx::DrawPacket& draw,size_t map) { return map ? draw.texture_maps[map-1] : draw.texture; }
 // The fragment shading rate of a draw of the game's bloom chain: a 2D quad (outside the scene, drawn the same in both eyes) whose every
 // texture is magnified onto it: EFB copies of at most 320x180 (the half- and quarter-size blur chain) at no more than one texel per guest
-// pixel, other textures (the lens masks) at four guest pixels a texel or more. Such a draw is shaded on a grid of 1.5 points per guest
+// pixel, other textures (the lens masks) at two guest pixels a texel or more. Such a draw is shaded on a grid of 1.5 points per guest
 // pixel or finer on each axis (on the Quest's 3.2 x 6.1 EFB scale: 2x4), not at the EFB's full scale; anything else at 1x1.
 VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, bool eligible) {
     const VkExtent2D full{1,1};
@@ -55,7 +55,7 @@ VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, boo
         const auto& texture=draw_texture(draw,map);
         if (!texture || texture->levels.empty()) continue;
         const float w=float(texture->levels[0].width), h=float(texture->levels[0].height);
-        if (texture->gpu_only ? (w>320 || w>width*1.05f || h>height*1.05f) : (w*4>width || h*4>height)) return full;
+        if (texture->gpu_only ? (w>320 || w>width*1.05f || h>height*1.05f) : (w*2>width || h*2>height)) return full;
         any|=texture->gpu_only;
     }
     if (!any) return full;
@@ -351,8 +351,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         // LOAD_OP_NONE: a pass whose draws never touch depth leaves the depth attachment alone (neither loaded nor stored); either name.
         for (const char* name : {"VK_KHR_load_store_op_none", "VK_EXT_load_store_op_none"})
             if (!load_op_none_ && std::any_of(supported.begin(), supported.end(), [&](const auto& extension) { return std::strcmp(extension.extensionName, name) == 0; })) { device_extensions.push_back(name); load_op_none_ = true; }
-        // Coarse shading for the game's bloom chain (blurred copies of a half-size scene, magnified): the pipeline rate is enough.
-        if (std::getenv("UC_EXP_VRS") && std::any_of(supported.begin(), supported.end(), [](const auto& extension) { return std::strcmp(extension.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0; })) {
+        // Coarse shading for the game's bloom chain (blurred copies of a half-size scene, magnified): the pipeline rate is enough. On by default on
+        // the headset (UC_NO_VRS=1: off), on the desktop with UC_VRS=1.
+        if (((layers_ > 1 && !std::getenv("UC_NO_VRS")) || std::getenv("UC_VRS")) && std::any_of(supported.begin(), supported.end(), [](const auto& extension) { return std::strcmp(extension.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0; })) {
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &shading_rate;
             vkGetPhysicalDeviceFeatures2(physical_, &query);
             if (shading_rate.pipelineFragmentShadingRate) {
@@ -2470,6 +2471,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         char kind[128];
         if (packet.texture_copy) std::snprintf(kind, sizeof kind, "copy %ux%u draws %s%s", packet.texture_copy->source[2], packet.texture_copy->source[3], bucket, packet.present ? " +present" : "");
         else std::snprintf(kind, sizeof kind, "%s draws %s", packet.present ? "present" : "no copy", bucket);
+        if (packet.texture_copy && copy_target && n < 10) {   // the post chain's packets apart: exact draws, the first draw's callsite, the copy's texture size
+            const size_t used = std::strlen(kind);
+            std::snprintf(kind + used, sizeof kind - used, " [%zu %08X ->%ux%u]", n, n ? packet.draws[0].callsite : 0u, copy_target->extent.width, copy_target->extent.height);
+        }
         slot.timing_kind = kind;
         // An estimate of the fragments this packet shades: each draw's clip-space box (clamped to its viewport) times the viewport's pixels,
         // times the layers (both eyes). Exact for full-screen quads, an upper bound for meshes; per kind, per 2 s.
@@ -2686,6 +2691,23 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             char textures[200] = ""; size_t used = 0;
             for (size_t map = 0; map < 8; ++map) if (const auto& t = draw_texture(draw, map); t && !t->levels.empty() && used < sizeof textures - 40)
                 used += std::snprintf(textures + used, sizeof textures - used, " t%zu=%ux%u%s%s/%zu w%02x", map, t->levels[0].width, t->levels[0].height, t->gpu_only ? "c" : "", t->guest_address ? "a" : "", t->levels.size(), unsigned(draw.texture_wrap[map]));
+            {   // the folded module this draw's pipeline looks for (tools/fold_tev_shaders.py name) and whether it exists
+                const auto& key = gpu_draws[d].key; uint64_t hash = 0xCBF29CE484222325ull;
+                const auto mix = [&](uint8_t byte) { hash ^= byte; hash *= 0x100000001B3ull; };
+                for (size_t i = 1; i < 68; ++i) for (int shift = 0; shift < 32; shift += 8) mix(uint8_t(key[i] >> shift));
+                for (int shift = 0; shift < 32; shift += 8) mix(uint8_t(((key[0] >> 16) & 1) >> shift));
+                mix(((key[0] >> 16) & 1) ? 0 : 1);
+                std::lock_guard guard(folded_mutex_);
+                const auto found = folded_modules_.find(hash);
+                std::fprintf(stderr, "[post-dump]   draw %zu pipeline %s fold %016llx %s key0 %08X tev %08X %08X %08X %08X %08X %08X gen0 %08X fog3 %08X alpha %08X\n", d, gpu_draws[d].choice.uber ? "uber" : "specialized", (unsigned long long)hash,
+                             found == folded_modules_.end() ? "unknown" : found->second ? "folded" : "MISSING", key[0], key[1], key[2], key[3], key[4], key[5], key[6],
+                             draw.uniforms->tex_gens[0], draw.uniforms->fog[3], draw.uniforms->pixel[0]);
+                if (draw.vertex_view().size() <= 6) for (const auto& vertex : draw.vertex_view())
+                    std::fprintf(stderr, "[post-dump]     v %.3f %.3f %.3f uv %.4f %.4f rgba %u %u %u %u row %u\n", vertex.position[0], vertex.position[1], vertex.position[2], vertex.texcoord[0][0], vertex.texcoord[0][1],
+                                 vertex.color[0][0], vertex.color[0][1], vertex.color[0][2], vertex.color[0][3], vertex.position_matrix);
+                const auto& rows = draw.uniforms->tex_rows;
+                std::fprintf(stderr, "[post-dump]     texrow0 %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f\n", rows[0][0], rows[0][1], rows[0][2], rows[0][3], rows[1][0], rows[1][1], rows[1][2], rows[1][3]);
+            }
             std::fprintf(stderr, "[post-dump]   draw %zu idx %u callsite %08X vp %.0f,%.0f %.0fx%.0f sc %s box %s blend %u cw %d aw %d z %u tev %u persp %d%s\n", d, gpu_draws[d].index_count, draw.callsite,
                          v[0], v[1], v[2], v[3], draw.state->scissor ? (std::to_string((*draw.state->scissor)[0]) + "," + std::to_string((*draw.state->scissor)[1]) + " " + std::to_string((*draw.state->scissor)[2]) + "x" + std::to_string((*draw.state->scissor)[3])).c_str() : "-",
                          box ? (std::to_string((*box)[0]).substr(0, 5) + "," + std::to_string((*box)[1]).substr(0, 5) + ".." + std::to_string((*box)[2]).substr(0, 5) + "," + std::to_string((*box)[3]).substr(0, 5)).c_str() : "-",
@@ -2868,10 +2890,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 static const bool rate_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
                 if (rate_stats) {
-                    static uint64_t coarse=0, all=0; static auto since=std::chrono::steady_clock::now();
-                    ++all; coarse+=rate.width*rate.height>1;
+                    static uint64_t coarse=0, all=0; static VkExtent2D coarse_rate{1,1}; static auto since=std::chrono::steady_clock::now();
+                    ++all; if (rate.width*rate.height>1) { ++coarse; coarse_rate=rate; }
                     if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
-                        std::fprintf(stderr,"[vrs] %llu of %llu draws shaded coarsely (%ux%u)\n",(unsigned long long)coarse,(unsigned long long)all,rate.width,rate.height);
+                        std::fprintf(stderr,"[vrs] %llu of %llu draws shaded coarsely (%ux%u)\n",(unsigned long long)coarse,(unsigned long long)all,coarse_rate.width,coarse_rate.height);
                         coarse=all=0; since=std::chrono::steady_clock::now();
                     }
                 }
