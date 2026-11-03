@@ -830,13 +830,19 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
 // interrupt poll: no safe point where the scheduler or an interrupt could look at the context), no jump table, no tail or indirect jump
 // and no fall into the next function. Their loads and stores of the real context are their entry loads and flushes, all within the
 // registers they read or write. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very
-// instructions) qualify the same way: they copy in and out only registers their guest code uses.
+// instructions) qualify the same way: they copy in and out only registers their guest code uses. So do the native SDK matrix/vector
+// routines below: they read the guest routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both).
+static bool leaf_hle(const std::string& name) {
+    static const std::set<std::string> math = {"PSMTXIdentity", "PSMTXCopy", "PSMTXConcat", "PSMTXTransApply", "PSMTXScaleApply", "PSMTXMultVec",
+        "PSVECAdd", "PSVECSubtract", "PSVECScale", "PSVECNormalize", "PSVECSquareMag", "PSVECMag", "PSQUATDotProduct", "PSVECCrossProduct"};
+    return name.compare(0, 5, "Leaf_") == 0 || math.count(name);
+}
 static std::unordered_map<uint32_t, LeafRegs> analyze_leaves(const Program& p, const CrLive* live) {
     std::unordered_map<uint32_t, LeafRegs> out;
     EmitStats scratch;
     for (const auto& f : p.an.functions) {
         if (f.end <= f.entry) continue;
-        if (auto h = p.cfg.hle.find(f.entry); h != p.cfg.hle.end() && h->second.compare(0, 5, "Leaf_") != 0) continue;
+        if (auto h = p.cfg.hle.find(f.entry); h != p.cfg.hle.end() && !leaf_hle(h->second)) continue;
         FnPlan plan;
         plan_function(p, f, live, scratch, plan);
         if (plan.tail_end) continue;
