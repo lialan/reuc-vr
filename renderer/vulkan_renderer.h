@@ -438,11 +438,15 @@ private:
     struct ParticleLayer {
         VkImage color=VK_NULL_HANDLE, depth=VK_NULL_HANDLE; VkDeviceMemory color_memory=VK_NULL_HANDLE, depth_memory=VK_NULL_HANDLE;
         VkImageView color_view=VK_NULL_HANDLE, depth_view=VK_NULL_HANDLE; VkExtent2D extent{}; bool initialized=false;
-        VkDescriptorSet set=VK_NULL_HANDLE; VkPipeline composite=VK_NULL_HANDLE; int supported=-1;
+        VkDescriptorSet set=VK_NULL_HANDLE; VkPipeline composite=VK_NULL_HANDLE;
+        // the depth downsample (particle_depth.slang): its own set (the scene depth), layout and pipeline
+        VkDescriptorSetLayout depth_set_layout=VK_NULL_HANDLE; VkPipelineLayout depth_layout=VK_NULL_HANDLE; VkDescriptorPool depth_pool=VK_NULL_HANDLE;
+        VkDescriptorSet depth_set=VK_NULL_HANDLE; VkPipeline depth_pipeline=VK_NULL_HANDLE; VkShaderModule depth_vertex=VK_NULL_HANDLE, depth_fragment=VK_NULL_HANDLE;
+        VkImageView scene_depth_view=VK_NULL_HANDLE;   // the view the set holds (the EFB depth's, remade with the EFB)
         uint64_t packets=0, draws=0;
     };
     ParticleLayer particle_;
-    bool particle_layer_supported();
+    static bool particle_layer_on() { static const bool on=[] { const char* v=std::getenv("UC_PARTICLE_LAYER"); return v && *v=='1'; }(); return on; }
     void ensure_particle_layer();
     void destroy_particle_layer();
     void composite_particle_layer(VkCommandBuffer command);

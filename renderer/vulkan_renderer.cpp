@@ -1973,6 +1973,7 @@ void VulkanRenderer::make_attachment(VkImage& target,VkDeviceMemory& memory,VkIm
     image.extent = {extent.width, extent.height, 1}; image.mipLevels = 1; image.arrayLayers = layers; image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.tiling = VK_IMAGE_TILING_OPTIMAL; image.usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;   // sampled: the HDR encode reads the EFB and the slot images
     if (motion_outputs_) image.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | (depth ? 0 : VK_IMAGE_USAGE_STORAGE_BIT);   // upscaler inputs and outputs
+    if (depth && layers_>1 && particle_layer_on()) image.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;   // the particle layer's depth downsample reads it
     vk_check(vkCreateImage(device, &image, nullptr, &target), "native attachment image");
     VkMemoryRequirements requirements; vkGetImageMemoryRequirements(device, target, &requirements);
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; allocate.allocationSize = requirements.size; allocate.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -2158,16 +2159,6 @@ void VulkanRenderer::put_back_bloom_proxy(VkCommandBuffer command) {
         bloom_proxy_.packets=bloom_proxy_.put_backs=0; since=std::chrono::steady_clock::now();
     }
 }
-// The particle layer (UC_PARTICLE_LAYER=1): the depth blit needs D32 blits on the device.
-bool VulkanRenderer::particle_layer_supported() {
-    if (particle_.supported<0) {
-        VkFormatProperties properties{}; vkGetPhysicalDeviceFormatProperties(physical_,VK_FORMAT_D32_SFLOAT,&properties);
-        const auto need=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        particle_.supported=(properties.optimalTilingFeatures&need)==need;
-        std::fprintf(stderr,"[vr] particle layer %s\n",particle_.supported ? "available" : "unavailable: no D32 blits");
-    }
-    return particle_.supported>0;
-}
 void VulkanRenderer::ensure_particle_layer() {
     const VkExtent2D extent{(efb_extent_.width+1)/2,(efb_extent_.height+1)/2};
     if (particle_.color && particle_.extent.width==extent.width && particle_.extent.height==extent.height) return;
@@ -2205,17 +2196,54 @@ void VulkanRenderer::ensure_particle_layer() {
         pipeline.pMultisampleState=&multisample; pipeline.pColorBlendState=&blend; pipeline.pDynamicState=&dynamic; pipeline.layout=hud_.layout;
         vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&pipeline,nullptr,&particle_.composite),"particle layer composite pipeline");
     }
+    if (!particle_.depth_pipeline) {   // the depth downsample: a set with the scene depth, a depth-only multiview pipeline
+        const VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+        VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set.bindingCount=1; set.pBindings=&binding;
+        vk_check(vkCreateDescriptorSetLayout(device,&set,nullptr,&particle_.depth_set_layout),"particle depth set layout");
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount=1; layout.pSetLayouts=&particle_.depth_set_layout;
+        vk_check(vkCreatePipelineLayout(device,&layout,nullptr,&particle_.depth_layout),"particle depth layout");
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1};
+        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&size;
+        vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&particle_.depth_pool),"particle depth pool");
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=particle_.depth_pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&particle_.depth_set_layout;
+        vk_check(vkAllocateDescriptorSets(device,&allocate,&particle_.depth_set),"particle depth set");
+        particle_.depth_vertex=shader(device,shaders_/"particle_depth.vert.spv"); particle_.depth_fragment=shader(device,shaders_/"particle_depth.frag.spv");
+        static const uint32_t farthest=[] { const char* v=std::getenv("UC_PARTICLE_DEPTH"); return v && std::string_view(v)=="far" ? 1u : 0u; }();
+        const VkSpecializationMapEntry entry{0,0,sizeof(uint32_t)}; const VkSpecializationInfo specialization{1,&entry,sizeof farthest,&farthest};
+        const VkPipelineShaderStageCreateInfo stages[]={{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,particle_.depth_vertex,"vertexMain",nullptr},
+                                                        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_FRAGMENT_BIT,particle_.depth_fragment,"fragmentMain",&specialization}};
+        VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount=viewport.scissorCount=1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.cullMode=VK_CULL_MODE_NONE; raster.lineWidth=1;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; multisample.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO}; depth.depthTestEnable=VK_TRUE; depth.depthWriteEnable=VK_TRUE; depth.depthCompareOp=VK_COMPARE_OP_ALWAYS;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        const VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount=2; dynamic.pDynamicStates=dynamic_states;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask=0b11; rendering.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
+        VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext=&rendering; pipeline.stageCount=2; pipeline.pStages=stages;
+        pipeline.pVertexInputState=&vertices; pipeline.pInputAssemblyState=&assembly; pipeline.pViewportState=&viewport; pipeline.pRasterizationState=&raster;
+        pipeline.pMultisampleState=&multisample; pipeline.pDepthStencilState=&depth; pipeline.pColorBlendState=&blend; pipeline.pDynamicState=&dynamic; pipeline.layout=particle_.depth_layout;
+        vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&pipeline,nullptr,&particle_.depth_pipeline),"particle depth pipeline");
+    }
     const VkDescriptorImageInfo images[2]{{VK_NULL_HANDLE,particle_.color_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,particle_.color_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet writes[2]{};
     for (uint32_t i=0;i<2;++i) { writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet=particle_.set; writes[i].dstBinding=i; writes[i].descriptorCount=1; writes[i].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[i].pImageInfo=&images[i]; }
     vkUpdateDescriptorSets(device,2,writes,0,nullptr);
     std::fprintf(stderr,"[vr] particle layer %ux%u a layer\n",extent.width,extent.height);
+    particle_.scene_depth_view=VK_NULL_HANDLE;   // the set is pointed at the EFB depth on first use (ensure below)
 }
 void VulkanRenderer::destroy_particle_layer() {
     for (VkImageView view:{particle_.color_view,particle_.depth_view}) if (view) vkDestroyImageView(device,view,nullptr);
     for (VkImage image:{particle_.color,particle_.depth}) if (image) vkDestroyImage(device,image,nullptr);
     for (VkDeviceMemory memory:{particle_.color_memory,particle_.depth_memory}) if (memory) vkFreeMemory(device,memory,nullptr);
     if (particle_.composite) vkDestroyPipeline(device,particle_.composite,nullptr);
+    if (particle_.depth_pipeline) vkDestroyPipeline(device,particle_.depth_pipeline,nullptr);
+    if (particle_.depth_layout) vkDestroyPipelineLayout(device,particle_.depth_layout,nullptr);
+    if (particle_.depth_set_layout) vkDestroyDescriptorSetLayout(device,particle_.depth_set_layout,nullptr);
+    if (particle_.depth_pool) vkDestroyDescriptorPool(device,particle_.depth_pool,nullptr);
+    for (VkShaderModule module:{particle_.depth_vertex,particle_.depth_fragment}) if (module) vkDestroyShaderModule(device,module,nullptr);
     particle_=ParticleLayer{};
 }
 // The particle layer into the EFB (both eyes): EFB * T + L in one draw. The EFB and the layer are between passes (TRANSFER_SRC_OPTIMAL).
@@ -3394,21 +3422,63 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     bool particle_pass=false;
     const auto particle_pipeline=[&](const PipelineKey& key) { auto k=key; k[0]|=kParticleLayerKeyBit; return pipeline_for(k).pipeline; };
     size_t particle_first=0, particle_last=0;
+    std::vector<uint8_t> particle_draw;   // 1: drawn in the particle layer (inside [particle_first, particle_last)), the rest of the run in the EFB
     {
-        static const bool on=[] { const char* v=std::getenv("UC_PARTICLE_LAYER"); return v && *v=='1'; }();
-        if (on && layers_>1 && stereo_ && !overlay_frame && !(scene_phase_ && !upscale_here) && particle_layer_supported() && std::min(efb_extent_.width/640.f,efb_extent_.height/480.f)>=2.5f) {
-            size_t run_first=0, best_first=0, best_last=0, best_count=0, count=0;
+        if (particle_layer_on() && layers_>1 && stereo_ && !overlay_frame && !(scene_phase_ && !upscale_here) && efb_initialized_ && std::min(efb_extent_.width/640.f,efb_extent_.height/480.f)>=2.5f) {
+            // A run of additive world sprites (perspective, no depth write, blend (SRC_ALPHA or ONE, ONE)): additions commute, so the run's
+            // sprites whose textures are magnified (a guest pixel a texel or more) can go to the layer and the others stay in the EFB at full
+            // size (a spark's sharp rays), in any order. Any other draw ends the run.
+            particle_draw.assign(packet.draws.size(),0);
+            size_t run_first=0, best_first=0, best_last=0, best_layer=0, layer=0, count=0;
+            double area=0, best_area=0;   // the run's layer sprites' screen area (guest pixels, clipped boxes): the layer pays off from about a screen
             for (size_t d=scene_draws; d<packet.draws.size(); ++d) {
                 const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
+                if (!info.index_count) continue;
                 const uint32_t depth=info.key[68]; const auto& b=draw.blend;
-                const bool sprite=info.index_count && draw.transforms->projection[3][3]==0 && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer &&
-                    b.mode==1 && b.color_write && !b.alpha_write && !(depth&16) && (b.source==kGxSrcSrcAlpha || b.source==kGxSrcOne || b.source==kGxSrcZero || b.source==kGxSrcInvSrcAlpha) &&
-                    (b.destination==kGxDstOne || b.destination==kGxDstInvSrcAlpha || b.destination==kGxDstSrcAlpha || b.destination==kGxDstZero) &&
+                const bool sprite=draw.transforms->projection[3][3]==0 && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer &&
+                    b.mode==1 && b.color_write && !b.alpha_write && !(depth&16) && (b.source==kGxSrcSrcAlpha || b.source==kGxSrcOne) && b.destination==kGxDstOne &&
                     [&] { const auto facts=stereo_facts(d); return lg_stereo_classify_draw(&facts)==LG_STEREO_WORLD && !facts.offscreen; }();
-                if (sprite) { if (!count) run_first=d; if (++count>best_count) { best_count=count; best_first=run_first; best_last=d+1; } }
-                else if (info.index_count) count=0;
+                if (!sprite) { count=layer=0; area=0; continue; }
+                if (!count) run_first=d;
+                ++count;
+                const bool magnified=[&] {   // every texture its stages sample has a texel over a guest pixel or more (by the draw's box), none an EFB copy
+                    const auto box=gx::draw_bounds_ndc(draw);
+                    if (!box) return false;
+                    const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
+                    const float width=(std::clamp((*box)[2],-1.f,1.f)-std::clamp((*box)[0],-1.f,1.f))*.5f*std::abs(v[2]), height=(std::clamp((*box)[3],-1.f,1.f)-std::clamp((*box)[1],-1.f,1.f))*.5f*std::abs(v[3]);
+                    const auto& key=info.key; const auto& u=*draw.uniforms;
+                    uint32_t maps=key[1]==0 ? 1u : 0u;
+                    for (uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) {
+                        if (key[5+4*stage]&64) maps|=1u<<(key[5+4*stage]&7);
+                        if (u.ind_cmd[stage]) maps|=1u<<((u.indirect[9]>>((u.ind_cmd[stage]&3)*6))&7);
+                    }
+                    for (size_t map=0;map<8;++map) if ((maps>>map)&1) {
+                        const auto& texture=draw_texture(draw,map);
+                        if (!texture || texture->levels.empty() || texture->gpu_only) return false;
+                        if (texture->levels[0].width>width || texture->levels[0].height>height) return false;   // a texel over a guest pixel or more: 1.6 layer pixels or more at native
+                    }
+                    return true;
+                }();
+                if (magnified) {
+                    particle_draw[d]=1; ++layer;
+                    if (const auto box=gx::draw_bounds_ndc(draw)) {
+                        const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
+                        area+=double(std::clamp((*box)[2],-1.f,1.f)-std::clamp((*box)[0],-1.f,1.f))*.5*std::abs(v[2])*double(std::clamp((*box)[3],-1.f,1.f)-std::clamp((*box)[1],-1.f,1.f))*.5*std::abs(v[3]);
+                    }
+                }
+                if (area>best_area) { best_area=area; best_layer=layer; best_first=run_first; best_last=d+1; }
             }
-            if (best_count>=32) { particle_first=best_first; particle_last=best_last; }
+            if (post_dump) {
+                size_t sprites_seen=0, magnified_seen=0;
+                for (size_t d=scene_draws; d<packet.draws.size(); ++d) { magnified_seen+=particle_draw[d]; }
+                for (size_t d=scene_draws; d<packet.draws.size(); ++d) { const auto& b=packet.draws[d].blend; sprites_seen+=packet.draws[d].transforms->projection[3][3]==0 && b.mode==1 && b.destination==kGxDstOne; }
+                std::fprintf(stderr,"[post-dump] particle scan: %zu draws, %zu additive perspective, %zu magnified, best run %zu..%zu with %zu (%.2f screens)\n",packet.draws.size(),sprites_seen,magnified_seen,best_first,best_last,best_layer,best_area/(640*360));
+            }
+            static const double min_screens=std::getenv("UC_PARTICLE_MIN_SCREENS") ? std::atof(std::getenv("UC_PARTICLE_MIN_SCREENS")) : 1.0;
+            if (best_area>=min_screens*640*360) {
+                particle_first=best_first; particle_last=best_last;
+                for (size_t d=0; d<packet.draws.size(); ++d) if (d<particle_first || d>=particle_last) particle_draw[d]=0;
+            } else particle_draw.clear();
         }
     }
     auto record_pass=[&](const PassTarget& target, size_t first, size_t last, bool scene) {
@@ -3470,7 +3540,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (size_t d = first; d < last; ++d) {
             if (x0 == 0 && y0 == 0 && x1 == int64_t(target.extent.width) && y1 == int64_t(target.extent.height)) break;   // already everything
             const auto& draw = packet.draws[d];
-            if (!gpu_draws[d].index_count || (!hud_draw.empty() && hud_draw[d])) continue;
+            if (!gpu_draws[d].index_count || (!hud_draw.empty() && hud_draw[d]) || (!particle_draw.empty() && bool(particle_draw[d])!=particle_pass)) continue;
             if (draw.reticle || draw.late_aim) { add(0, 0, target.extent.width, target.extent.height); continue; }   // scaled or moved after the fact
             const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
             const auto a = uc::efb_viewport(v, target.extent.width, target.extent.height);
@@ -3684,6 +3754,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
             const size_t set_index=d;
             if (!info.index_count || (!hud_draw.empty() && hud_draw[d])) continue;   // drawn into the HUD layer (record_hud_layer)
+            if (!particle_draw.empty() && bool(particle_draw[d])!=particle_pass) continue;   // the particle layer's draws in its pass only
             if (layer_on && !overlay_frame && draw.layer) continue;   // drawn later, over the held frame
             if (overlay_frame && !draw.layer) continue;
             if (gx::bloom_composite(draw) && (motion_outputs_ || !bloom_active())) continue;   // the game's own bloom is replaced by bloom_pass_ (off means none); a device without the scene-target path cannot run it and keeps the game's
@@ -4145,17 +4216,31 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         bloom_proxy_.valid=true; ++bloom_proxy_.packets;
     }
     else if (particle_last>particle_first) {   // the particle layer: the draws before, the run in the layer and composited, the draws after
-        if (particle_first>scene_draws) record_pass(efb_target,scene_draws,particle_first,false);
+        record_pass(efb_target,scene_draws,particle_last,false);   // the draws before the run and the run's full-size sprites (additions commute)
         ensure_particle_layer();
+        if (particle_.scene_depth_view!=depth_view_) {   // the EFB (and its depth view) is remade with the render scale
+            const VkDescriptorImageInfo image{VK_NULL_HANDLE,depth_view_,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; write.dstSet=particle_.depth_set; write.dstBinding=0; write.descriptorCount=1; write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; write.pImageInfo=&image;
+            vkUpdateDescriptorSets(device,1,&write,0,nullptr);
+            particle_.scene_depth_view=depth_view_;
+        }
         const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
-        // the scene's depth, nearest-sampled to the layer's size (both layers), and L = 0, T = 1
-        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
-        barrier(slot.command,particle_.depth,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
-        VkImageBlit blit{}; blit.srcSubresource=blit.dstSubresource={VK_IMAGE_ASPECT_DEPTH_BIT,0,0,layers_};
-        blit.srcOffsets[1]={int32_t(efb_extent_.width),int32_t(efb_extent_.height),1}; blit.dstOffsets[1]={int32_t(particle_.extent.width),int32_t(particle_.extent.height),1};
-        vkCmdBlitImage(slot.command,depth_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,particle_.depth,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
-        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
-        barrier(slot.command,particle_.depth,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        // the scene's depth at the layer's size (particle_depth.slang: the nearest of each 2x2 block), and L = 0, T = 1
+        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        barrier(slot.command,particle_.depth,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,all,any,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        {
+            VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; target.imageView=particle_.depth_view; target.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            target.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE; target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;   // every texel written
+            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea={{0,0},particle_.extent}; rendering.layerCount=1; rendering.viewMask=0b11; rendering.pDepthAttachment=&target;
+            vkCmdBeginRendering(slot.command,&rendering);
+            const VkViewport viewport{0,0,float(particle_.extent.width),float(particle_.extent.height),0,1}; const VkRect2D scissor{{0,0},particle_.extent};
+            vkCmdSetViewport(slot.command,0,1,&viewport); vkCmdSetScissor(slot.command,0,1,&scissor);
+            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,particle_.depth_pipeline);
+            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,particle_.depth_layout,0,1,&particle_.depth_set,0,nullptr);
+            vkCmdDraw(slot.command,3,1,0,0);
+            vkCmdEndRendering(slot.command);
+        }
+        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
         barrier(slot.command,particle_.color,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
         const VkClearColorValue clear{{0,0,0,1}}; const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(slot.command,particle_.color,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&clear,1,&range);
@@ -4164,13 +4249,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const PassTarget particle_target{particle_.color,particle_.depth,particle_.color_view,particle_.depth_view,VK_NULL_HANDLE,VK_NULL_HANDLE,particle_.extent,&particle_.initialized};
         particle_pass=true; record_pass(particle_target,particle_first,particle_last,false); particle_pass=false;
         composite_particle_layer(slot.command);
-        ++particle_.packets; particle_.draws+=particle_last-particle_first;
+        ++particle_.packets; particle_.draws+=size_t(std::count(particle_draw.begin(),particle_draw.end(),1));
         static const bool stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
         static auto since=std::chrono::steady_clock::now();
         if (stats && std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
             std::fprintf(stderr,"[particle-layer] 2 s: %llu packets, %llu draws at %ux%u a layer\n",(unsigned long long)particle_.packets,(unsigned long long)particle_.draws,particle_.extent.width,particle_.extent.height);
             particle_.packets=particle_.draws=0; since=std::chrono::steady_clock::now();
         }
+        particle_draw.clear();
         if (particle_last<packet.draws.size()) record_pass(efb_target,particle_last,packet.draws.size(),false);
     }
     else if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
