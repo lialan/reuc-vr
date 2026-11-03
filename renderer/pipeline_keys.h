@@ -38,9 +38,11 @@ inline PipelineKey headset_direct_key(PipelineKey key) {
 }
 // key[0] bit 18: the headset's HUD layer variant (hud_layer.h): no multiview, two colour attachments (L, T), no depth.
 constexpr uint32_t kHudLayerKeyBit=1u<<18;
+// key[0] bit 19: the headset's particle layer variant (VulkanRenderer, UC_PARTICLE_LAYER): the EFB's formats, alpha written as T (ZERO, D).
+constexpr uint32_t kParticleLayerKeyBit=1u<<19;
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>19)==0 && ((key[0]&3)!=2 || logic_ops);
+    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>20)==0 && ((key[0]&3)!=2 || logic_ops);
 }
 }  // namespace uc (pipeline keys)
 namespace gx {

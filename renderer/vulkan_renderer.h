@@ -434,6 +434,18 @@ private:
         uint64_t packets=0, put_backs=0;
     };
     BloomProxy bloom_proxy_;
+    // The particle layer (UC_PARTICLE_LAYER=1): a packet's run of translucent world sprites at half the EFB's size a side.
+    struct ParticleLayer {
+        VkImage color=VK_NULL_HANDLE, depth=VK_NULL_HANDLE; VkDeviceMemory color_memory=VK_NULL_HANDLE, depth_memory=VK_NULL_HANDLE;
+        VkImageView color_view=VK_NULL_HANDLE, depth_view=VK_NULL_HANDLE; VkExtent2D extent{}; bool initialized=false;
+        VkDescriptorSet set=VK_NULL_HANDLE; VkPipeline composite=VK_NULL_HANDLE; int supported=-1;
+        uint64_t packets=0, draws=0;
+    };
+    ParticleLayer particle_;
+    bool particle_layer_supported();
+    void ensure_particle_layer();
+    void destroy_particle_layer();
+    void composite_particle_layer(VkCommandBuffer command);
     void ensure_bloom_proxy();
     void destroy_bloom_proxy();
     void bloom_proxy_corner(VkCommandBuffer command, bool to_efb);

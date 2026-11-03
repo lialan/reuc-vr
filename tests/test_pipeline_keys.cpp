@@ -30,7 +30,8 @@ static void test_alpha_test_bit() {   // pipelines whose draws cannot fail the G
     k[0]|=1u<<17; CHECK(uc::valid_pipeline_key(k,true));    // bit 17: per-vertex texture matrices (the headset's bank vertex stage)
     CHECK((uc::without_logic_op(k)[0]>>17&1)==1u);
     k[0]|=uc::kHudLayerKeyBit; CHECK(uc::valid_pipeline_key(k,true));   // bit 18: the headset's HUD layer variant
-    k[0]|=1u<<19; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 18
+    k[0]|=uc::kParticleLayerKeyBit; CHECK(uc::valid_pipeline_key(k,true));   // bit 19: the particle layer variant
+    k[0]|=1u<<20; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 19
 }
 // The headset's direct-stage marks (order word bit 16): a key recorded before them reads as all-direct, a marked one stays as it is.
 void test_headset_direct_key() {

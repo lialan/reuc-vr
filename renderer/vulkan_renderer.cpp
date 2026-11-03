@@ -1108,6 +1108,10 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         const bool rt_writes=rt_material_write(key);
         blends[3].colorWriteMask=rt_writes ? VK_COLOR_COMPONENT_R_BIT : 0;   // material record index
         blends[4].colorWriteMask=rt_writes ? gbuffer_write_mask(key) : 0;    // albedo
+        if ((key[0]&kParticleLayerKeyBit) && mode.mode==1) {   // the particle layer: colour as the draw blends it, alpha the scene's remaining share (T' = D * T)
+            blends[0].colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+            blends[0].srcAlphaBlendFactor=VK_BLEND_FACTOR_ZERO; blends[0].dstAlphaBlendFactor=destinations[mode.destination];
+        }
         const bool hud_layer=(key[0]&kHudLayerKeyBit)!=0;   // the HUD layer (hud_layer.h): L takes the draw's blend, T the factor the scene behind keeps
         if (hud_layer) {
             blends[0].colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT;
@@ -2029,8 +2033,8 @@ void VulkanRenderer::ensure_hud_layer(HudLayer& layer, VkExtent2D extent) {
         const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT,0,112};   // hud_layer.slang Composite
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount=1; layout.pSetLayouts=&hud_.set_layout; layout.pushConstantRangeCount=1; layout.pPushConstantRanges=&push;
         vk_check(vkCreatePipelineLayout(device,&layout,nullptr,&hud_.layout),"HUD layer pipeline layout");
-        const VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,4},{VK_DESCRIPTOR_TYPE_SAMPLER,2}};
-        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=2; pool.poolSizeCount=2; pool.pPoolSizes=sizes;
+        const VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,6},{VK_DESCRIPTOR_TYPE_SAMPLER,3}};
+        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=3; pool.poolSizeCount=2; pool.pPoolSizes=sizes;   // the HUD, glow and particle layers
         vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&hud_.pool),"HUD layer pool");
         for (HudLayer* each:{&hud_,&glow_}) {   // a set per layer, both from hud_'s pool
             VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=hud_.pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&hud_.set_layout;
@@ -2153,6 +2157,88 @@ void VulkanRenderer::put_back_bloom_proxy(VkCommandBuffer command) {
         std::fprintf(stderr,"[bloom-proxy] 2 s: %llu packets drawn in the proxy, the corner put back %llu times\n",(unsigned long long)bloom_proxy_.packets,(unsigned long long)bloom_proxy_.put_backs);
         bloom_proxy_.packets=bloom_proxy_.put_backs=0; since=std::chrono::steady_clock::now();
     }
+}
+// The particle layer (UC_PARTICLE_LAYER=1): the depth blit needs D32 blits on the device.
+bool VulkanRenderer::particle_layer_supported() {
+    if (particle_.supported<0) {
+        VkFormatProperties properties{}; vkGetPhysicalDeviceFormatProperties(physical_,VK_FORMAT_D32_SFLOAT,&properties);
+        const auto need=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        particle_.supported=(properties.optimalTilingFeatures&need)==need;
+        std::fprintf(stderr,"[vr] particle layer %s\n",particle_.supported ? "available" : "unavailable: no D32 blits");
+    }
+    return particle_.supported>0;
+}
+void VulkanRenderer::ensure_particle_layer() {
+    const VkExtent2D extent{(efb_extent_.width+1)/2,(efb_extent_.height+1)/2};
+    if (particle_.color && particle_.extent.width==extent.width && particle_.extent.height==extent.height) return;
+    if (particle_.color) {
+        vk_check(present_.wait_idle(device),"particle layer resize");
+        for (VkImageView view:{particle_.color_view,particle_.depth_view}) if (view) vkDestroyImageView(device,view,nullptr);
+        for (VkImage image:{particle_.color,particle_.depth}) if (image) vkDestroyImage(device,image,nullptr);
+        for (VkDeviceMemory memory:{particle_.color_memory,particle_.depth_memory}) if (memory) vkFreeMemory(device,memory,nullptr);
+    }
+    make_attachment(particle_.color,particle_.color_memory,particle_.color_view,extent,false,VK_FORMAT_UNDEFINED,layers_);
+    make_attachment(particle_.depth,particle_.depth_memory,particle_.depth_view,extent,true,VK_FORMAT_UNDEFINED,layers_);
+    particle_.extent=extent; particle_.initialized=false;
+    if (!hud_.layout) ensure_hud_layer(hud_,{16,16});   // the composite's layout, sampler and shaders live with the HUD layer's
+    if (!particle_.set) {
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=hud_.pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&hud_.set_layout;
+        vk_check(vkAllocateDescriptorSets(device,&allocate,&particle_.set),"particle layer set");
+        const uint32_t mode=2; const VkSpecializationMapEntry entry{0,0,sizeof(uint32_t)}; const VkSpecializationInfo specialization{1,&entry,sizeof mode,&mode};
+        const VkPipelineShaderStageCreateInfo stages[]={{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,hud_.vertex,"vertexMain",nullptr},
+                                                        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_FRAGMENT_BIT,hud_.fragment,"fragmentMain",&specialization}};
+        VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount=viewport.scissorCount=1;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.cullMode=VK_CULL_MODE_NONE; raster.lineWidth=1;
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; multisample.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState attachment{}; attachment.blendEnable=VK_TRUE; attachment.colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT;
+        attachment.srcColorBlendFactor=attachment.srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE; attachment.dstColorBlendFactor=attachment.dstAlphaBlendFactor=VK_BLEND_FACTOR_SRC_ALPHA;   // EFB * T + L
+        attachment.colorBlendOp=attachment.alphaBlendOp=VK_BLEND_OP_ADD;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blend.attachmentCount=1; blend.pAttachments=&attachment;
+        const VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount=2; dynamic.pDynamicStates=dynamic_states;
+        const VkFormat format=VK_FORMAT_R8G8B8A8_UNORM;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask=0b11; rendering.colorAttachmentCount=1; rendering.pColorAttachmentFormats=&format;
+        VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext=&rendering; pipeline.stageCount=2; pipeline.pStages=stages;
+        pipeline.pVertexInputState=&vertices; pipeline.pInputAssemblyState=&assembly; pipeline.pViewportState=&viewport; pipeline.pRasterizationState=&raster;
+        pipeline.pMultisampleState=&multisample; pipeline.pColorBlendState=&blend; pipeline.pDynamicState=&dynamic; pipeline.layout=hud_.layout;
+        vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&pipeline,nullptr,&particle_.composite),"particle layer composite pipeline");
+    }
+    const VkDescriptorImageInfo images[2]{{VK_NULL_HANDLE,particle_.color_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,particle_.color_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i=0;i<2;++i) { writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet=particle_.set; writes[i].dstBinding=i; writes[i].descriptorCount=1; writes[i].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[i].pImageInfo=&images[i]; }
+    vkUpdateDescriptorSets(device,2,writes,0,nullptr);
+    std::fprintf(stderr,"[vr] particle layer %ux%u a layer\n",extent.width,extent.height);
+}
+void VulkanRenderer::destroy_particle_layer() {
+    for (VkImageView view:{particle_.color_view,particle_.depth_view}) if (view) vkDestroyImageView(device,view,nullptr);
+    for (VkImage image:{particle_.color,particle_.depth}) if (image) vkDestroyImage(device,image,nullptr);
+    for (VkDeviceMemory memory:{particle_.color_memory,particle_.depth_memory}) if (memory) vkFreeMemory(device,memory,nullptr);
+    if (particle_.composite) vkDestroyPipeline(device,particle_.composite,nullptr);
+    particle_=ParticleLayer{};
+}
+// The particle layer into the EFB (both eyes): EFB * T + L in one draw. The EFB and the layer are between passes (TRANSFER_SRC_OPTIMAL).
+void VulkanRenderer::composite_particle_layer(VkCommandBuffer command) {
+    const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier(command,particle_.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; color.imageView=efb_view_; color.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD; color.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea={{0,0},efb_extent_}; rendering.layerCount=1; rendering.viewMask=0b11; rendering.colorAttachmentCount=1; rendering.pColorAttachments=&color;
+    vkCmdBeginRendering(command,&rendering);
+    const VkViewport viewport{0,0,float(efb_extent_.width),float(efb_extent_.height),0,1}; const VkRect2D scissor{{0,0},efb_extent_};
+    vkCmdSetViewport(command,0,1,&viewport); vkCmdSetScissor(command,0,1,&scissor);
+    struct { float rows[2][3][4]; float size[2]; float unused[2]; } push{};
+    const float sx=float(efb_extent_.width)/(2*particle_.extent.width), sy=float(efb_extent_.height)/(2*particle_.extent.height);   // the layer covers 2x its size of the EFB
+    for (int eye=0;eye<2;++eye) { push.rows[eye][0][0]=sx; push.rows[eye][1][1]=sy; push.rows[eye][2][2]=1; }
+    push.size[0]=float(efb_extent_.width); push.size[1]=float(efb_extent_.height);
+    vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,hud_.layout,0,1,&particle_.set,0,nullptr);
+    vkCmdPushConstants(command,hud_.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof push,&push);
+    vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,particle_.composite); vkCmdDraw(command,3,1,0,0);
+    vkCmdEndRendering(command);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,all,any);
+    barrier(command,particle_.color,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,all,any);
 }
 // The foveation level asked for: UC_VR_FOVEATION=0..3 (tests, the preview), else the headset's vr.cfg / settings panel.
 int VulkanRenderer::wanted_fovea_level() const {
@@ -3300,6 +3386,31 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             }
         }
     }
+    // The particle layer (UC_PARTICLE_LAYER=1, the headset): the longest run of this packet's translucent world sprites (perspective, no depth
+    // write, a blend whose destination factor is a scalar: additive and alpha-over smoke, heat haze, glows) is drawn at half the EFB's size
+    // a side, tested against a nearest-sampled half-size copy of the scene's depth, into L (colour) and T (alpha: what the scene behind
+    // keeps), then composited into the EFB once (EFB * T + L) before the rest of the packet and its copy. ~5 scene screens of overdraw at
+    // native become a quarter of that plus one full-screen composite.
+    bool particle_pass=false;
+    const auto particle_pipeline=[&](const PipelineKey& key) { auto k=key; k[0]|=kParticleLayerKeyBit; return pipeline_for(k).pipeline; };
+    size_t particle_first=0, particle_last=0;
+    {
+        static const bool on=[] { const char* v=std::getenv("UC_PARTICLE_LAYER"); return v && *v=='1'; }();
+        if (on && layers_>1 && stereo_ && !overlay_frame && !(scene_phase_ && !upscale_here) && particle_layer_supported() && std::min(efb_extent_.width/640.f,efb_extent_.height/480.f)>=2.5f) {
+            size_t run_first=0, best_first=0, best_last=0, best_count=0, count=0;
+            for (size_t d=scene_draws; d<packet.draws.size(); ++d) {
+                const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
+                const uint32_t depth=info.key[68]; const auto& b=draw.blend;
+                const bool sprite=info.index_count && draw.transforms->projection[3][3]==0 && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer &&
+                    b.mode==1 && b.color_write && !b.alpha_write && !(depth&16) && (b.source==kGxSrcSrcAlpha || b.source==kGxSrcOne || b.source==kGxSrcZero || b.source==kGxSrcInvSrcAlpha) &&
+                    (b.destination==kGxDstOne || b.destination==kGxDstInvSrcAlpha || b.destination==kGxDstSrcAlpha || b.destination==kGxDstZero) &&
+                    [&] { const auto facts=stereo_facts(d); return lg_stereo_classify_draw(&facts)==LG_STEREO_WORLD && !facts.offscreen; }();
+                if (sprite) { if (!count) run_first=d; if (++count>best_count) { best_count=count; best_first=run_first; best_last=d+1; } }
+                else if (info.index_count) count=0;
+            }
+            if (best_count>=32) { particle_first=best_first; particle_last=best_last; }
+        }
+    }
     auto record_pass=[&](const PassTarget& target, size_t first, size_t last, bool scene) {
     const bool initialized=*target.initialized;
     barrier(slot.command, target.color, initialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3615,7 +3726,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             const Buffer& index_buffer=info.indices ? *info.indices : slot.indices;
             if (!xform_ && (&vertex_buffer!=bound_vertices || info.vertex_offset!=bound_vertex_offset)) { VkDeviceSize offset=info.vertex_offset; vkCmdBindVertexBuffers(slot.command,0,1,&vertex_buffer.buffer,&offset); bound_vertices=&vertex_buffer; bound_vertex_offset=info.vertex_offset; }   // the pre-pass's pipelines have no vertex input
             if (&index_buffer!=bound_indices || info.index_offset!=bound_index_offset) { vkCmdBindIndexBuffer(slot.command,index_buffer.buffer,info.index_offset,VK_INDEX_TYPE_UINT32); bound_indices=&index_buffer; bound_index_offset=info.index_offset; }
-            bind_pipeline(info.choice.pipeline);
+            bind_pipeline(particle_pass ? particle_pipeline(info.key) : info.choice.pipeline);
             set_draw_state(info.key);
             static const bool probe_sets=std::getenv("UC_PROBE_SETS")!=nullptr;   // diagnostics: one descriptor set for the whole pass (wrong textures and uniforms)
             if (layers_>1) { if (!probe_sets || !probe_bound) bind_draw_set(set_index,false); }
@@ -3742,7 +3853,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (xform_) {   // join the pending run when nothing but the vertex range differs, else draw the pending run and start a new one
                 push.motion=0;   // the stereo shaders read the eye block from the set, not this index
                 const auto& x=xform_draws[d];
-                Run run{d,info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
+                Run run{d,particle_pass ? particle_pipeline(info.key) : info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
                         set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
                 const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
                 const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && set_keys[pending->set]==set_keys[run.set] &&
@@ -4027,6 +4138,35 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (int i=0;i<2;++i) { bloom_proxy_.covered[i]=std::min(bloom_proxy_.covered[i],chain_box[i]); bloom_proxy_.covered[i+2]=std::max(bloom_proxy_.covered[i+2],chain_box[i+2]); }
         bloom_proxy_.valid=true; ++bloom_proxy_.packets;
     }
+    else if (particle_last>particle_first) {   // the particle layer: the draws before, the run in the layer and composited, the draws after
+        if (particle_first>scene_draws) record_pass(efb_target,scene_draws,particle_first,false);
+        ensure_particle_layer();
+        const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
+        // the scene's depth, nearest-sampled to the layer's size (both layers), and L = 0, T = 1
+        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        barrier(slot.command,particle_.depth,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        VkImageBlit blit{}; blit.srcSubresource=blit.dstSubresource={VK_IMAGE_ASPECT_DEPTH_BIT,0,0,layers_};
+        blit.srcOffsets[1]={int32_t(efb_extent_.width),int32_t(efb_extent_.height),1}; blit.dstOffsets[1]={int32_t(particle_.extent.width),int32_t(particle_.extent.height),1};
+        vkCmdBlitImage(slot.command,depth_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,particle_.depth,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
+        barrier(slot.command,depth_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        barrier(slot.command,particle_.depth,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+        barrier(slot.command,particle_.color,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkClearColorValue clear{{0,0,0,1}}; const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(slot.command,particle_.color,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&clear,1,&range);
+        barrier(slot.command,particle_.color,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,all,any);
+        particle_.initialized=true;
+        const PassTarget particle_target{particle_.color,particle_.depth,particle_.color_view,particle_.depth_view,VK_NULL_HANDLE,VK_NULL_HANDLE,particle_.extent,&particle_.initialized};
+        particle_pass=true; record_pass(particle_target,particle_first,particle_last,false); particle_pass=false;
+        composite_particle_layer(slot.command);
+        ++particle_.packets; particle_.draws+=particle_last-particle_first;
+        static const bool stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
+        static auto since=std::chrono::steady_clock::now();
+        if (stats && std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
+            std::fprintf(stderr,"[particle-layer] 2 s: %llu packets, %llu draws at %ux%u a layer\n",(unsigned long long)particle_.packets,(unsigned long long)particle_.draws,particle_.extent.width,particle_.extent.height);
+            particle_.packets=particle_.draws=0; since=std::chrono::steady_clock::now();
+        }
+        if (particle_last<packet.draws.size()) record_pass(efb_target,particle_last,packet.draws.size(),false);
+    }
     else if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
     if (hudless_wanted && !hudless_taken_ && packet.present) take_hudless();
     const PassTarget& active=scene_only ? scene_target : efb_target;
@@ -4244,6 +4384,19 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const double screen=double(efb_extent_.width)*efb_extent_.height*0.75*layers_;   // the 640x360 scene region of every eye
         std::fprintf(stderr,"[frag-dump] packet %zu draws, %.2f M fragments (%.1f scene screens)%s%s\n",packet.draws.size(),total/1e6,total/screen,
                      packet.texture_copy ? " copy" : "",packet.present ? " present" : "");
+        static const bool cost=std::getenv("UC_FRAG_COST")!=nullptr;   // the cost model: every counted draw with its folded module's name
+        if (cost) for (const auto& [n,i]:per) {
+            const size_t d=frag_queries_[i]; const auto& draw=packet.draws[d]; const auto& key=gpu_draws[d].key;
+            uint64_t hash=0xCBF29CE484222325ull;   // tools/fold_tev_shaders.py name: key words 1..67, the alpha-test bit, the module
+            const auto mix=[&](uint8_t byte) { hash^=byte; hash*=0x100000001B3ull; };
+            for (size_t w=1;w<68;++w) for (int shift=0;shift<32;shift+=8) mix(uint8_t(key[w]>>shift));
+            for (int shift=0;shift<32;shift+=8) mix(uint8_t(((key[0]>>16)&1)>>shift));
+            mix(((key[0]>>16)&1) ? 0 : 1);
+            int textures=0; for (size_t map=0;map<8;++map) if (draw_texture(draw,map)) ++textures;
+            std::fprintf(stderr,"[frag-cost] packet %zu%s%s fragments %llu module %016llx stages %u textures %d indices %u callsite %08X persp %d blend %u\n",packet.draws.size(),
+                         packet.texture_copy ? " copy" : "",packet.present ? " present" : "",(unsigned long long)n,(unsigned long long)hash,key[1],textures,gpu_draws[d].index_count,draw.callsite,
+                         int(draw.transforms->projection[3][3]==0),unsigned(draw.blend.mode));
+        }
         for (size_t k=0;k<per.size() && k<25;++k) {
             const size_t d=frag_queries_[per[k].second]; const auto& draw=packet.draws[d]; const auto& key=gpu_draws[d].key;
             const uint32_t alpha=draw.uniforms->pixel[0];
@@ -4344,6 +4497,7 @@ void VulkanRenderer::shutdown() {
         destroy_fovea();
         destroy_hud_layer();
         destroy_bloom_proxy();
+        destroy_particle_layer();
         dlss_g_.reset();
         fsr_g_.reset();   // its swapchain context was emptied by retire_images; the contexts go before the device
         for (int i=0;i<2;++i) {
