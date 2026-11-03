@@ -746,7 +746,6 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             }
         }
         entry_load = live_in[0];
-        if (has_sec) for (uint32_t t : sit->second) if (t >= f.entry && t < f.end) entry_load |= live_in[(t - f.entry) / 4];
         for (size_t i = 0; i < n; ++i) {
             const RegNode& nd = nodes[i];
             hints[i].local = true;
@@ -781,8 +780,20 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     std::ostringstream o;
     if (has_sec) o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
     else o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
-    if (local) o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n  " << copy_text(entry_load, false) << "\n";
-    if (has_sec) {
+    if (local) {
+        // a resume through a secondary entry (rare) loads what is read from there on; the normal entry only what the entry reads
+        o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n";
+        if (has_sec) {
+            o << "  if (at != 0) [[unlikely]] switch (at) { ";
+            for (uint32_t t : sit->second) {
+                const RegSet load = t >= f.entry && t < f.end ? live_in[(t - f.entry) / 4] : RegSet();
+                st.reg_entry_loads += load.count();
+                o << "case 0x" << hex8(t) << "u: " << copy_text(load, false) << "goto L_" << hex8(t) << "; ";
+            }
+            o << "default: break; }\n";
+        }
+        o << "  " << copy_text(entry_load, false) << "\n";
+    } else if (has_sec) {
         o << "  switch (at) { ";
         for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
         o << "default: break; }\n";
