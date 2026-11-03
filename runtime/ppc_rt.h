@@ -56,7 +56,7 @@ PPC_INLINE void guest_note_stack(uint32_t, uint32_t) {}
 PPC_INLINE void guest_note_range(uint32_t, uint32_t) {}
 #else
 PPC_INLINE void guest_note(uint32_t ea) { gx::note_write(ea); }
-PPC_INLINE void guest_note_stack(uint32_t ea, uint32_t n) { uc::rollback_note_access(ea, n); }
+PPC_INLINE void guest_note_stack(uint32_t ea, uint32_t n) { gx::note_access(ea, n); }
 PPC_INLINE void guest_note_range(uint32_t ea, uint32_t n) { gx::note_write_range(ea, n); }
 #endif
 PPC_INLINE bool is_mmio(uint32_t ea) { return ea - 0xCC000000u < 0x02000000u; }

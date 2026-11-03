@@ -17,7 +17,8 @@ int main() {
     const auto identical=memory.capture(true);
     CHECK(uc::RollbackMemory::difference(*initial,*identical).empty());
     CHECK(uc::RollbackMemory::hash(*identical)==initial_hash);
-    CHECK(uc::rollback_dirty[0x3F]==0 && uc::rollback_dirty[0x40]==0);
+    CHECK(!memory.dirty(0x3F000) && !memory.dirty(0x40000));
+    ppc::wr8(f.c,0x8003F000,0); CHECK(memory.dirty(0x3F000) && !memory.dirty(0x40000));   // one store, one page
     ppc::wr8(f.c,0x8003F000,0); ppc::wr8(f.c,0x80040000,17);
     const auto mixed=memory.capture(true);
     CHECK(uc::RollbackMemory::difference(*identical,*mixed).find("RAM 00040000")==0);
