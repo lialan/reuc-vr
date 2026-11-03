@@ -3868,9 +3868,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     ++reasons[pending->pipeline!=run.pipeline || !(gpu_draws[pending->d].key==info.key) ? 0 : textures ? 1 : uniform ? 2 :
                               std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes) ? 3 :
                               !same_push(pending->push,run.push) ? 4 : (std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport) || std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)) ? 5 : 6];
+                    // what bindless textures alone would join: everything but the textures equal (pipeline, uniform block, eye block, push,
+                    // viewport, scissor, consecutive, rate)
+                    if (pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && textures && !uniform &&
+                        !std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes) &&
+                        same_push(pending->push,run.push) && !std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport) && !std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor) &&
+                        pending->first+pending->count==run.first && pending->rate.width==run.rate.width && pending->rate.height==run.rate.height && pending->fovea==run.fovea) ++reasons[7];
                     if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
-                        std::fprintf(stderr,"[merge-why] runs ended by: pipeline %llu, textures %llu, uniform block %llu, eye block %llu, push %llu, viewport %llu, not consecutive %llu\n",
-                                     (unsigned long long)reasons[0],(unsigned long long)reasons[1],(unsigned long long)reasons[2],(unsigned long long)reasons[3],(unsigned long long)reasons[4],(unsigned long long)reasons[5],(unsigned long long)reasons[6]);
+                        std::fprintf(stderr,"[merge-why] runs ended by: pipeline %llu, textures %llu, uniform block %llu, eye block %llu, push %llu, viewport %llu, not consecutive %llu; textures only %llu\n",
+                                     (unsigned long long)reasons[0],(unsigned long long)reasons[1],(unsigned long long)reasons[2],(unsigned long long)reasons[3],(unsigned long long)reasons[4],(unsigned long long)reasons[5],(unsigned long long)reasons[6],(unsigned long long)reasons[7]);
                         std::memset(reasons,0,sizeof reasons); since=std::chrono::steady_clock::now();
                     }
                 }

@@ -768,6 +768,20 @@ its copy: ~5.4 scene screens of shading become ~1.4 plus one full-screen composi
 so the picture (sprites meeting geometry take the half-size depth; the haze samples a half-resolution copy anyway) is checked on the
 headset's captures first.
 
+### Draw merging and textures (evaluated, not done)
+
+`UC_MERGE_WHY=1` in the VR preview's fight (~92 presents a second): ~520 draws issued a frame (~585 more merged into them); runs end on
+textures 45 k / 2 s, pipelines 22 k, uniform blocks 6 k. Counted boundaries where only the textures differ (same pipeline, uniform block,
+eye block, push constants, viewport, scissor, consecutive indices, rate): 33 k / 2 s, ~180 a frame. Bindless textures (a sampled-image
+array indexed per draw, the index carried per vertex from the pre-pass) would therefore take the fight from ~520 to at most ~340 issued
+draws a frame (-35%). It needs every folded module rebuilt with non-uniform indexing, the samplers indexed too (GX sampler modes differ
+per draw) and a per-packet texture table; the headset's per-draw cost (~40 us a tiny draw on the HUD, S17) suggests 1-3 ms at native,
+to be confirmed with a render-stage trace before building it.
+
+The fight's heaviest fragment module (c23d6bfc, the smoke sprites, 51 M of the frame's 88 M fragments) is one texture sample (alpha)
+times constant colours, then GX fog behind a uniform branch: ~25 instructions a fragment without fog, ~45 with it. Nothing exact to remove;
+its cost is the overdraw (the particle layer above).
+
 ### Present
 
 The screen pass is one pass: FXAA and both layers' composite in `xr_screen.slang`, the EFB read in place, the eye image cleared (not
