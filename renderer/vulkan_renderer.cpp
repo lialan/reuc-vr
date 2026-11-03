@@ -2104,6 +2104,56 @@ void VulkanRenderer::flush_layer(VkCommandBuffer command, HudLayer& layer) {
     barrier(command,efb_,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,all,any);
     layer.used=false; ++hud_.flushes;
 }
+// The bloom proxy (the headset; UC_NO_BLOOM_PROXY=1: off): a stand-in for the EFB at 2 points a guest pixel (1280x960, a layer per eye) holding the
+// top-left corner (kBloomCorner) while the game's bloom chain draws there.
+void VulkanRenderer::ensure_bloom_proxy() {
+    const VkExtent2D extent{640*2,480*2};
+    if (bloom_proxy_.color) return;
+    make_attachment(bloom_proxy_.color,bloom_proxy_.color_memory,bloom_proxy_.color_view,extent,false,VK_FORMAT_UNDEFINED,layers_);
+    make_attachment(bloom_proxy_.depth,bloom_proxy_.depth_memory,bloom_proxy_.depth_view,extent,true,VK_FORMAT_UNDEFINED,layers_);
+    bloom_proxy_.extent=extent; bloom_proxy_.initialized=false; bloom_proxy_.valid=false;
+    std::fprintf(stderr,"[vr] bloom proxy %ux%u a layer\n",extent.width,extent.height);
+}
+void VulkanRenderer::destroy_bloom_proxy() {
+    for (VkImageView view:{bloom_proxy_.color_view,bloom_proxy_.depth_view}) if (view) vkDestroyImageView(device,view,nullptr);
+    for (VkImage image:{bloom_proxy_.color,bloom_proxy_.depth}) if (image) vkDestroyImage(device,image,nullptr);
+    for (VkDeviceMemory memory:{bloom_proxy_.color_memory,bloom_proxy_.depth_memory}) if (memory) vkFreeMemory(device,memory,nullptr);
+    bloom_proxy_=BloomProxy{};
+}
+// The corner between the EFB and the proxy: into the proxy (to_efb false: the chain starts) or back into the EFB (true). Both images are
+// between passes (TRANSFER_SRC_OPTIMAL) before and after.
+void VulkanRenderer::bloom_proxy_corner(VkCommandBuffer command, bool to_efb) {
+    const VkImage source=to_efb ? bloom_proxy_.color : efb_, target=to_efb ? efb_ : bloom_proxy_.color;
+    const VkExtent2D source_extent=to_efb ? bloom_proxy_.extent : efb_extent_, target_extent=to_efb ? efb_extent_ : bloom_proxy_.extent;
+    const bool target_ready=to_efb ? efb_initialized_ : bloom_proxy_.initialized;
+    const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier(command,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
+    barrier(command,target,target_ready ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit blit{}; blit.srcSubresource=blit.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,layers_};
+    // into the proxy: the whole corner; back into the EFB: exactly the pixels whose centres the chain's draws covered (the rest of the EFB
+    // keeps what it had, as if the chain had drawn there at full resolution)
+    std::array<float,4> area{0,0,float(kBloomCorner[0]),float(kBloomCorner[1])};
+    if (to_efb) area={std::max(0.f,bloom_proxy_.covered[0]),std::max(0.f,bloom_proxy_.covered[1]),std::min(float(kBloomCorner[0]),bloom_proxy_.covered[2]),std::min(float(kBloomCorner[1]),bloom_proxy_.covered[3])};
+    const auto edge=[](float guest,uint32_t extent,uint32_t axis) { return int32_t(std::max(0.f,std::ceil(guest*extent/(axis ? 480.f : 640.f)-.5f))); };   // first pixel whose centre lies at or past it
+    blit.srcOffsets[0]={edge(area[0],source_extent.width,0),edge(area[1],source_extent.height,1),0};
+    blit.srcOffsets[1]={std::max(blit.srcOffsets[0].x+1,edge(area[2],source_extent.width,0)),std::max(blit.srcOffsets[0].y+1,edge(area[3],source_extent.height,1)),1};
+    blit.dstOffsets[0]={edge(area[0],target_extent.width,0),edge(area[1],target_extent.height,1),0};
+    blit.dstOffsets[1]={std::max(blit.dstOffsets[0].x+1,edge(area[2],target_extent.width,0)),std::max(blit.dstOffsets[0].y+1,edge(area[3],target_extent.height,1)),1};
+    if (to_efb && !(bloom_proxy_.covered[2]>bloom_proxy_.covered[0] && bloom_proxy_.covered[3]>bloom_proxy_.covered[1])) blit.dstOffsets[1]=blit.dstOffsets[0];   // nothing drawn: nothing to put back
+    if (blit.dstOffsets[1].x>blit.dstOffsets[0].x) vkCmdBlitImage(command,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_LINEAR);
+    barrier(command,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,all,any);
+    if (!to_efb) bloom_proxy_.initialized=true;
+}
+void VulkanRenderer::put_back_bloom_proxy(VkCommandBuffer command) {
+    bloom_proxy_corner(command,true);
+    bloom_proxy_.valid=false; ++bloom_proxy_.put_backs;
+    static const bool stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
+    static auto since=std::chrono::steady_clock::now();
+    if (stats && std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
+        std::fprintf(stderr,"[bloom-proxy] 2 s: %llu packets drawn in the proxy, the corner put back %llu times\n",(unsigned long long)bloom_proxy_.packets,(unsigned long long)bloom_proxy_.put_backs);
+        bloom_proxy_.packets=bloom_proxy_.put_backs=0; since=std::chrono::steady_clock::now();
+    }
+}
 // The foveation level asked for: UC_VR_FOVEATION=0..3 (tests, the preview), else the headset's vr.cfg / settings panel.
 int VulkanRenderer::wanted_fovea_level() const {
     static const int forced=std::getenv("UC_VR_FOVEATION") ? std::atoi(std::getenv("UC_VR_FOVEATION")) : -1;
@@ -3889,6 +3939,42 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     };
     const bool scene_only=scene_phase_ && !upscale_here && !overlay_frame;   // the whole packet belongs to the scene: copy and clear act on the scene targets
     const bool writes_scene=scene_phase_ && !overlay_frame && (scene_draws || !scene_initialized_);   // overwrites the depth and vectors frame generation may still read
+    // The headset's bloom proxy (UC_NO_BLOOM_PROXY=1: off): the game's bloom chain draws 2D quads into the EFB's top-left corner and copies that
+    // corner (319x179, 320x180, 160x90), pass after pass, then restores the corner (an opaque quad) before anything else reads it. Such a
+    // packet (its copy and every draw inside the corner, 2D, no depth) is drawn into a proxy of the EFB at 2 points a guest pixel instead of
+    // the EFB's 3.2 x 6.1 (native), and its copy is made from the proxy. The corner's content stays in the proxy until the next other
+    // packet that draws, copies or presents, which first puts it back into the EFB (an upscaling blit: the corner as the chain left it,
+    // at the proxy's resolution).
+    bool bloom_chain=false;
+    std::array<float,4> chain_box{1e9f,1e9f,-1e9f,-1e9f};
+    {
+        static const bool on=std::getenv("UC_NO_BLOOM_PROXY")==nullptr;
+        if (on && layers_>1 && copy_target && !packet.clear_after_copy && !packet.present && !overlay_frame && !scene_phase_ && !scene_draws && efb_initialized_ &&
+            std::min(efb_extent_.width/640.f,efb_extent_.height/480.f)>=2.5f) {
+            const auto& src=packet.texture_copy->source;
+            bloom_chain=src[0]+src[2]<=kBloomCorner[0] && src[1]+src[3]<=kBloomCorner[1] && (!packet.draws.empty() || bloom_proxy_.valid);
+            for (size_t d=0; d<packet.draws.size() && bloom_chain; ++d) {
+                const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
+                if (!info.index_count) continue;
+                const uint32_t depth=info.key[68];
+                const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
+                const auto box=gx::draw_bounds_ndc(draw);
+                const bool inside=!(draw.transforms->projection[3][3]==0) && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer && !(depth&16) && (!(depth&1) || ((depth>>1)&7)==7) && box &&
+                    v[0]+(std::max((*box)[0],-1.f)*.5f+.5f)*v[2]>=-.5f && v[1]+(std::max((*box)[1],-1.f)*.5f+.5f)*v[3]>=-.5f &&
+                    v[0]+(std::min((*box)[2],1.f)*.5f+.5f)*v[2]<=kBloomCorner[0]+.5f && v[1]+(std::min((*box)[3],1.f)*.5f+.5f)*v[3]<=kBloomCorner[1]+.5f;
+                bloom_chain=inside;
+                if (inside) {   // what this draw covers, in guest pixels with the viewport's -1/12 origin (efb_viewport): the part put back
+                    chain_box[0]=std::min(chain_box[0],v[0]-1.f/12+(std::max((*box)[0],-1.f)*.5f+.5f)*v[2]); chain_box[1]=std::min(chain_box[1],v[1]-1.f/12+(std::max((*box)[1],-1.f)*.5f+.5f)*v[3]);
+                    chain_box[2]=std::max(chain_box[2],v[0]-1.f/12+(std::min((*box)[2],1.f)*.5f+.5f)*v[2]); chain_box[3]=std::max(chain_box[3],v[1]-1.f/12+(std::min((*box)[3],1.f)*.5f+.5f)*v[3]);
+                }
+            }
+        }
+        if (!bloom_chain && bloom_proxy_.valid && (!packet.draws.empty() || copy_target || packet.present)) put_back_bloom_proxy(slot.command);
+        if (bloom_chain) {
+            ensure_bloom_proxy();
+            if (!bloom_proxy_.valid) bloom_proxy_corner(slot.command,false);   // the corner as the EFB has it: blended draws build on it
+        }
+    }
     if ((hud_.used || glow_.used) && !overlay_frame && (!packet.draws.empty() || copy_target)) flush_hud_layer(slot.command);   // the HUD layer goes under what this packet draws or into its copy
     if (writes_scene) { record_pass(scene_target,0,scene_draws,true); record_shadow(0,scene_draws); record_rt(0,scene_draws); }
     if (upscale_here) {
@@ -3925,10 +4011,22 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     };
     const bool hudless_wanted=(dlss_generation_enabled() || (fsr_generation_enabled() && fsr_g_->active())) && hudless_[0] && scene_mode_ && !scene_phase_ && !hudless_taken_ && !overlay_frame;
     if (hudless_wanted && efb_initialized_ && hud_packet) take_hudless();
-    if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
+    if (bloom_chain) {
+        if (!packet.draws.empty()) {
+            const PassTarget proxy_target{bloom_proxy_.color,bloom_proxy_.depth,bloom_proxy_.color_view,bloom_proxy_.depth_view,VK_NULL_HANDLE,VK_NULL_HANDLE,bloom_proxy_.extent,&bloom_proxy_.initialized,true};
+            record_pass(proxy_target,0,packet.draws.size(),false);
+        }
+        if (!bloom_proxy_.valid) bloom_proxy_.covered={1e9f,1e9f,-1e9f,-1e9f};
+        for (int i=0;i<2;++i) { bloom_proxy_.covered[i]=std::min(bloom_proxy_.covered[i],chain_box[i]); bloom_proxy_.covered[i+2]=std::max(bloom_proxy_.covered[i+2],chain_box[i+2]); }
+        bloom_proxy_.valid=true; ++bloom_proxy_.packets;
+    }
+    else if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
     if (hudless_wanted && !hudless_taken_ && packet.present) take_hudless();
     const PassTarget& active=scene_only ? scene_target : efb_target;
-    if(copy_target) record_texture_copy(slot.command,active.color,active.extent,packet.texture_copy->source,*copy_target,VK_IMAGE_LAYOUT_UNDEFINED);
+    if(copy_target) {
+        if (bloom_chain) record_texture_copy(slot.command,bloom_proxy_.color,bloom_proxy_.extent,packet.texture_copy->source,*copy_target,VK_IMAGE_LAYOUT_UNDEFINED);
+        else record_texture_copy(slot.command,active.color,active.extent,packet.texture_copy->source,*copy_target,VK_IMAGE_LAYOUT_UNDEFINED);
+    }
     if (scene_only) {
         if (copy_target && !packet.clear_after_copy) scene_restore_copy_=packet.texture_copy;
         else if (!packet.draws.empty() || (copy_target && packet.clear_after_copy)) scene_restore_copy_.reset();
@@ -4238,6 +4336,7 @@ void VulkanRenderer::shutdown() {
         efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; efb_extent_={};
         destroy_fovea();
         destroy_hud_layer();
+        destroy_bloom_proxy();
         dlss_g_.reset();
         fsr_g_.reset();   // its swapchain context was emptied by retire_images; the contexts go before the device
         for (int i=0;i<2;++i) {

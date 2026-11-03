@@ -424,6 +424,20 @@ private:
     void destroy_hud_layer();
     void flush_hud_layer(VkCommandBuffer command);   // both layers, the glow first
     void flush_layer(VkCommandBuffer command, HudLayer& layer);
+    // The bloom proxy (UC_NO_BLOOM_PROXY=1: off): the EFB's top-left corner at 2 points a guest pixel while the game's bloom chain draws there.
+    static constexpr uint32_t kBloomCorner[2]={320,180};
+    struct BloomProxy {
+        VkImage color=VK_NULL_HANDLE, depth=VK_NULL_HANDLE; VkDeviceMemory color_memory=VK_NULL_HANDLE, depth_memory=VK_NULL_HANDLE;
+        VkImageView color_view=VK_NULL_HANDLE, depth_view=VK_NULL_HANDLE; VkExtent2D extent{};
+        bool initialized=false, valid=false;   // valid: the corner's content is in the proxy, not in the EFB
+        std::array<float,4> covered{};          // what the chain's draws covered since it started (guest pixels): put back into the EFB
+        uint64_t packets=0, put_backs=0;
+    };
+    BloomProxy bloom_proxy_;
+    void ensure_bloom_proxy();
+    void destroy_bloom_proxy();
+    void bloom_proxy_corner(VkCommandBuffer command, bool to_efb);
+    void put_back_bloom_proxy(VkCommandBuffer command);
     int wanted_fovea_level() const;
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
