@@ -1,0 +1,282 @@
+# S18: Dolphin as a technical reference for REUC's GPU (and CPU) costs (2026-11-03)
+
+Source read: Dolphin at commit df4bd44 (`/Users/lialan/workspace/third-party-ref/dolphin`), read only: nothing built or run from it. Dolphin is
+GPL-2.0-or-later: this note describes techniques and reasoning in our words, no Dolphin code goes into the repository. References are
+`Dolphin file:function` (paths under `Source/Core/`) and ours (`file:line` at quest3-vr b390cb6). Our numbers are S17's (headset at native
+3.07x unless noted, fightvr replay; Mac counts from the VR preview).
+
+Starting point (S17): GPU-bound, ~36.7 ms GPU a frame at native, ~14 ms needed. Main scene ~10.7 ms (only ~0.8 scene screens of fragments pass
+the depth test; ~443 draws issued a frame, 231-240 with `UC_TEX_MERGE=1`; ~20-40 us fixed per tiny draw), HUD/glow packet (8.7 ms before the
+layers), bloom/copy chain, heat-haze particles (~5.4 screens of fragments), present ~4.4 ms.
+
+**The short answer.** Dolphin is built for immediate-mode desktop GPUs. It has no tiler code at all (the only mentions are two TODO comments:
+`VideoBackends/OGL/OGLGfx.cpp:SetAndDiscardFramebuffer`, `VideoCommon/FramebufferManager.cpp:ReinterpretPixelData`), it ends a host draw at every
+GX state change, texture change and matrix load, and it ends the render pass at every EFB copy. REUC already does more than Dolphin for the
+tiler (vertex pre-pass, merged runs, texture table, HUD/glow layers, bloom proxy, render-area shrinking, depth STORE_OP_NONE, VRS, foveation).
+What Dolphin does have that we lack is GX *exactness* that also happens to be cheaper: early-Z where GX asks for it (zcomploc), a complete
+alpha-test pre-evaluation, the EFB pixel format (no alpha in RGB8), destination alpha in one draw by dual-source blending, the clear folded
+into the next pass's load op, and the deliberate use of one ubershader pipeline per fixed-function state. The ranked lists below map those to
+our measured costs.
+
+## 1. GX/TEV to GPU work
+
+### What Dolphin does
+
+- **Pipeline identity.** A pipeline is `GXPipelineUid` = vertex declaration + `BlendingState` + `DepthState` + `RasterizationState` + VS/GS/PS
+  UIDs, hashed with XXH3 (`VideoCommon/PipelineUtils.cpp:PipelineToHash`, `UpdateHashWithPipeline`). The pixel UID
+  (`VideoCommon/PixelShaderGen.h:pixel_shader_uid_data`, filled by `PixelShaderGen.cpp:GetPixelShaderUid`) specializes: stage count, texgen
+  count, indirect stage count; per stage the 24-bit colour and alpha combiner words, tev order (texmap, texcoord, enable, colour channel),
+  the swap tables actually used, konst *selections*, the full 21-bit `tevind` word; per indirect stage its texmap/texcoord (`tevindref`);
+  texgen projection bits; alpha-test compares and logic (only if the test can go either way); fog type, projection and range enable; ztexture
+  op; zfreeze; early/late Z mode and whether the shader writes depth; destination-alpha flag; RGBA6 format and dither; logic op (only for the
+  framebuffer-fetch path); bounding box. Bits that cannot matter are cleared (`ClearUnusedPixelShaderUidBits`, `num_values` cuts the UID at
+  the last used stage). Per-pixel lighting adds `LightingUidData`.
+- **Kept dynamic** (uniform blocks): TEV colour registers and konst colours, alpha-test references, texture sizes, z bias, indirect matrices and
+  scales, fog colour and parameters (`WritePixelShaderCommonHeader`, the `PSBlock`). In the vertex stage the whole XF matrix memory (positions,
+  normals, post-transform), lights and colours are uniforms indexed by the per-vertex matrix index; the VS UID
+  (`VertexShaderGen.h:vertex_shader_uid_data`) specializes texgen types/sources/post-matrix/normalize/projection, colour-channel lighting
+  config (material/ambient source, diffuse and attenuation function, light mask per channel), vertex components.
+- **Ubershaders** (`UberShaderPixel.cpp:GenPixelShader`, `UberShaderVertex.cpp`): the raw BP/XF state in uniforms, one pipeline per
+  fixed-function state; used by `ShaderCompilationMode` (`VideoConfig.h`) Synchronous / SynchronousUberShaders / AsynchronousUberShaders /
+  AsynchronousSkipRendering, selected per draw in `VertexManagerBase.cpp:UpdatePipelineObject` (specialized when ready,
+  `ShaderCache.cpp:GetPipelineForUidAsync` queues it otherwise). The UID cache on disk (`ShaderCache.cpp:LoadPipelineUIDCache`) replays
+  known pipelines at start, our key files' equivalent.
+- **Destination alpha in one draw** (`PixelShaderGen.cpp:WriteColor`, `RenderState.cpp:BlendingState::Generate`): output 0 carries the colour
+  and the *constant* alpha, output 1 the computed alpha. The colour blend reads source alpha from output 1 (dual-source factors), the alpha
+  blend is ONE/ZERO on output 0, so the stored alpha is the constant: exact also for blending draws, one draw, one shading. Destination alpha
+  only exists with the RGBA6_Z24 EFB format (`GetPixelShaderUid`: `useDstAlpha`); `ApplyDriverBugs` (`PipelineUtils.cpp`) drops dual source
+  where unsupported or broken (`BUG_BROKEN_DUAL_SOURCE_BLENDING`: AMD/Windows GL, Intel/macOS; not Qualcomm).
+- **EFB pixel format** (`BlendingState::Generate`, `BPFunctions.cpp:ClearScreen`, `TextureConverterShaderGen.cpp`): with RGB8_Z24 (or RGB565)
+  the target has no alpha: alpha writes are off, DSTALPHA blend factors become ONE (`RemoveDstAlphaUsage`), clears skip alpha, copies read
+  alpha as 255. RGBA6 colour is quantized to 6 bits with the GX 2x2 dither (`WriteColor`, the `dither` UID bit).
+- **Alpha test and early Z.** `BPMemory.h:AlphaTest::TestResult` pre-evaluates the test from the compare modes and the logic op (AND, OR, XOR,
+  XNOR with ALWAYS/NEVER: Pass, Fail or Undetermined); only Undetermined emits the test. GX zcomploc (BP 0x43 bit 6, `GXSetZCompLoc`) = early:
+  with an undetermined alpha test Dolphin forces early fragment tests (`EmulatedZ::ForcedEarly`, `FORCE_EARLY_Z` in
+  `GeneratePixelShaderCode`): depth is tested and written before shading and the discard only drops colour, as on the console.
+  `ApplyDriverBugs` relaxes ForcedEarly to plain Early when the draw writes no depth. A test that always fails disables colour and alpha
+  writes in the blend state (`alpha_test_may_succeed`). Hardware depth is trusted (`bFastDepthCalc`, default on; per-pixel depth only for
+  ztextures, zfreeze or the accurate-depth option), which keeps the driver's early depth.
+- **zfreeze**: `VertexManagerBase.cpp:CalculateZSlope` stores the reference triangle's depth plane, the shader writes depth from it.
+  **Logic ops**: hardware logicOp, else framebuffer fetch (`WriteLogicOp`) or a blend approximation
+  (`BlendingState::ApproximateLogicOpWithBlending`). **Fog**: `WriteFog`, type and projection specialized. **Indirect**: `WriteStage` emits
+  each stage's indirect path for its own format/bias/matrix/wrap and a fixed texmap (no run-time map choice).
+  **Lighting**: per vertex by default (`bEnablePixelLighting` off).
+- Quirks worth knowing for picture parity: TEV in integer arithmetic; `if (prev.a == 1) prev.a = 0` after the alpha test (an alpha of 1/255
+  passes the test but blends as 0, `GeneratePixelShaderCode`); the Qualcomm workarounds in section 4.
+
+### What REUC does
+
+- `renderer/pipeline_keys.h` (`PipelineKey`, 70 words: blend word, the TEV words as specialization constants 0..65, depth word, topology),
+  `tev.slang` (specialization constants, float TEV), modules folded at build time (`tools/fold_tev_shaders.py`), the ubershader as fallback
+  only (`uber_key`). Konst colours, registers, alpha references, fog and indirect parameters live in the per-draw `DrawState` uniform block
+  (`tev.slang:10`), as in Dolphin.
+- Headset: `kTevDirectStage` (`pipeline_keys.h:32`) compiles the indirect path out of direct stages; stages that do read an indirect
+  coordinate still take `IND_CMD` and the indirect texmap from the uniform block at run time (`tev.slang:345`, `indirectCoord` at 306).
+- Alpha test: key word 0 bit 16 from `gx::alpha_test_can_discard` (`pipeline_keys.h:55`): only ALWAYS-and-ALWAYS (not XOR) counts as
+  "cannot discard"; such pipelines take the `EARLY_Z` variant (`smoke.slang:368`, `[earlydepthstencil]`, no discard). Every other alpha-tested
+  draw is late Z (discard at `smoke.slang:430`).
+- zcomploc and the EFB pixel format are ignored (G21: `GXSetZCompLoc`/`GXSetPixelFmt` -> BP 43, ~185 000 writes).
+- Destination alpha: fused into one draw only without blending (`vulkan_renderer.cpp:841 fused_destination_alpha`); a blending draw with
+  destination alpha is drawn a second time with the full TEV shader and the constant alpha (`vulkan_renderer.cpp:4124`). In the VR preview
+  fight that is ~650 second draws per 2 s against ~70 000 issued (runtime logs of 2026-11-03, `[vr-cull]` line): **about 4 a frame**.
+- Fog: run-time branch on `fsel` (`smoke.slang:318 applyFog`). GX lighting: per vertex, in the compute pre-pass (`smoke.slang:167 xformMain`),
+  generic over the light mask.
+
+### Changes for REUC (ranked)
+
+| # | change | Dolphin reference | expected effect on our costs | picture risk |
+|---|---|---|---|---|
+| 1.1 | Honour zcomploc: an alpha-tested draw whose BP 0x43 bit 6 is set gets `[earlydepthstencil]` with the discard kept (depth written before the test), as Dolphin's ForcedEarly; without a depth write plain early. Log first how many alpha-tested scene draws have the bit. | `GetPixelShaderUid`, `GeneratePixelShaderCode` (FORCE_EARLY_Z), `ApplyDriverBugs` | Hidden fragments of those draws are no longer shaded (late Z shades every covered fragment today). Size = their share of main-scene shading; unknown until counted. | Moves the picture *towards* the console: depth is then written where the alpha test fails, which GX does when the game asked for early Z. Check against the G20 Dolphin oracle frame. On KosmicKrisp mind `BUG_BROKEN_DISCARD_WITH_EARLY_Z` (section 4). |
+| 1.2 | Pre-evaluate the alpha test fully: Dolphin's AND/OR/XOR/XNOR table with ALWAYS/NEVER, plus reference-aware cases our key can afford because the references are known per draw (GEQUAL 0, LEQUAL 255 always pass; LESS 0, GREATER 255 never). A test that always fails: colour and alpha writes off. | `AlphaTest::TestResult`, `BlendingState::Generate` | More pipelines on the `EARLY_Z` variant (no discard: early rejection, LRZ-friendly). Cheap; count the draws first (`[gpu-packets] scene draws not order-free ... alpha test`). | None: exact. Changes keys (bit 16), so the key files and folded modules follow. |
+| 1.3 | Honour the EFB pixel format: RGB8_Z24 means no alpha (no alpha writes, no destination-alpha draws, DSTALPHA -> ONE, copies read alpha 255); RGBA6_Z24 quantizes colour to 6 bits with the 2x2 dither. | `BlendingState::Generate`, `ClearScreen`, `WriteColor` | If the scene runs in RGB8 its destination-alpha work disappears (the ~4 second draws, the alpha writes). If it runs in RGBA6, no gain, but the console's 6-bit banding/dither is then reproduced. | RGB8: none (it is what the hardware does). RGBA6 quantization changes every pixel slightly: make it a separate, owner-visible switch. |
+| 1.4 | Destination alpha with blending in one draw by dual-source blending (output 1 = computed alpha, colour factors SRC1_ALPHA, alpha ONE/ZERO). EFB pipelines on the headset have one colour attachment, which `maxFragmentDualSrcAttachments` (1) allows; KosmicKrisp reports `dualSrcBlend` (docs/superpowers/plans/2026-11-01-macos-vulkan.md); check the Quest's `[vulkan]` features line. | `WriteColor`, `BlendingState::Generate`, `ApplyDriverBugs` | ~4 draws a frame and their second shading. Worth it only if those four are large (find their callsites first: a full-screen draw costs 1.5-2.5 ms at native, S17). | None: exact, and simpler than the second pass. |
+| 1.5 | Indirect stages fully in the key (format, bias, matrix, wrap, the indirect texmap and texcoord: Dolphin's `tevind`/`tevindref`), so an indirect stage loses its run-time texmap switch and size queries as direct stages did in ed2a42f. | `GetPixelShaderUid`, `WriteStage` | Small for the frame: the glow/heat-haze modules are already 60-76 instructions (S17 cost model); 4dffd6f6 (311 instructions, 16 registers) has few fragments. | None; more keys to fold. |
+| 1.6 | Fog type/projection in the key (Dolphin `fog_fsel`, `fog_proj`). | `WriteFog` | Negligible: the sprites with fog need it anyway; registers are already at 6. | None. |
+
+## 2. Draw batching
+
+### What Dolphin does
+
+- `VertexManagerBase.cpp:PrepareForAdditionalData` appends a GX primitive to the open batch and flushes only when the primitive class changes
+  (lists/lines/points) or the stream buffer is full; `Flush` issues one `DrawIndexed` for the batch. But every BP write that changes a value
+  flushes (`BPStructs.cpp:BPWritten` -> `FlushPipeline`), every XF memory write flushes (`XFStructs.cpp:XFMemWritten`: every matrix load), and
+  texture changes are BP writes. So Dolphin issues about one host draw per GX state run: no merging across textures, matrices or TEV setups.
+  Draws stay together only inside one state run, e.g. a skinned mesh whose vertices carry matrix indices (`IndexGenerator` turns quads, strips
+  and fans into lists, or restart strips where primitive restart works; it is off on Qualcomm, `BUG_PRIMITIVE_RESTART`).
+- `CPUCull.cpp` (`VertexManagerBase::AreAllVerticesCulled`) drops primitives that are entirely off-screen or back-facing on the CPU.
+- Vulkan: `VideoBackends/Vulkan/StateTracker.cpp:Bind` binds pipeline, viewport, scissor, vertex and index buffers only when dirty; only viewport
+  and scissor are dynamic state (`VKPipeline.cpp`). `UpdateGXDescriptorSet` allocates a new set only for the part that changed (UBO set,
+  sampler set, SSBO set) from per-command-buffer pools; the UBOs are `UNIFORM_BUFFER_DYNAMIC`, so a new constant upload is a new offset in the
+  bind, not a new set. Constants come in three blocks (vertex, geometry, pixel) uploaded only when their manager is dirty
+  (`VKVertexManager.cpp:UploadUniforms`): a matrix load costs a new vertex-block offset and leaves the pixel block as it was.
+- Host draws per frame: for this game Dolphin would issue roughly the game's GX draws, i.e. our issued + merged count before any merging
+  (~990 a frame in the VR preview fight). REUC issues 443, or 231-240 with the texture table.
+
+### What REUC does
+
+Vertex pre-pass (transforms, lighting and texgen baked per vertex, S17 fix 1), runs of draws merged into one `vkCmdDrawIndexed`
+(`vulkan_renderer.cpp:3824 issue_run`), texture table (`UC_TEX_MERGE=1`), descriptor sets shared per texture combination with the uniform and
+eye blocks as dynamic offsets (`vulkan_renderer.cpp:2984-3073`), cull and depth as dynamic state. What still ends a run (Mac, `UC_TEX_MERGE=1`,
+per presented frame): pipeline 112-116, textures 53-55, uniform block 32-33. On the headset S17 measured ~40 us per tiny HUD draw; binding one
+pipeline for the whole HUD packet (a diagnostic) saved 1.3 of 2.2 ms, viewport/push constants/dynamic state 0.7, descriptor sets nothing.
+
+### Changes for REUC (ranked)
+
+| # | change | Dolphin reference | expected effect | picture risk |
+|---|---|---|---|---|
+| 2.1 | **Ubershader as a merge vehicle for small draws.** Dolphin uses its ubershader against compile stalls, but its property (one pipeline per fixed-function state, the TEV setup as data) attacks our per-draw cost directly. Step 1: the HUD packet's draws on `uber_key` pipelines (the HUD layer variant) instead of specialized ones. Step 2: the fragment stage reads the draw's `DrawState` from the pre-pass's `xformDrawStates` array by a per-vertex draw index (the texture table already carries one per-vertex index, `tev.slang` TEX_TABLE), so draws that differ in TEV setup, uniform block and textures but not in blend/depth/viewport/scissor join one run. Gate by draw area (`gx::draw_bounds_ndc`): only draws whose fragments are few go uber; big draws keep their folded module. | `UberShaderPixel.cpp:GenPixelShader`, `VertexManagerBase.cpp:UpdatePipelineObject` | HUD: up to the measured 1.3 ms (one pipeline for the packet). Main scene: the pipeline (112-116) and uniform (32-33) run ends among small draws; at 20-40 us each the ceiling is ~3-6 ms, realistically 1-3 ms. Costs ALU on the merged draws' fragments (the uber module is far longer than a folded one): measure with an area threshold sweep. | Same TEV source (`-DUBER`), so the same arithmetic; the uber needs an `EARLY_Z` form for draws without discard (key word 0 bit 16 survives `uber_key`). Check captures for 1/255 differences. |
+| 2.2 | **Fragment-only uniform identity** (Dolphin's separate pixel block). With the pre-pass on, the draw's vertex stage no longer reads transforms, lights or texgen rows from `DrawState`; a run should end only when the fragment-visible part changes (registers, konst, pixel, fog, indirect, ind_cmd, channels where read) rather than when the 1.8 KB block's identity (`uniforms.block()`, `vulkan_renderer.cpp:3033`) changes. | `VKVertexManager.cpp:UploadUniforms` (VS/PS blocks dirty separately) | Up to the 32-33 uniform run ends a frame: at 20-40 us, 0.6-1.3 ms if all join (fewer: many also differ in textures or pipeline). | None, provided the compare covers every field a fragment module reads (desktop MOTION/effects read lights and channels: keep the full block there). |
+| 2.3 | Keep viewport and push constants out of the run key where they cannot differ in effect (S17: 0.7 ms of the HUD's 2.2 ms is viewport/push/dynamic state). Dolphin sets them only on change (`StateTracker::SetViewport` memcmp). | `StateTracker::Bind` | Part of the 0.7 ms on the HUD packet. | None if exact equality is kept. |
+
+## 3. EFB handling: copies, clears, render passes
+
+### What Dolphin does
+
+- **Copies** (`VideoCommon/TextureCacheBase.cpp:CopyRenderTargetToTexture`, whose comment block lays out EFB-to-RAM, EFB-to-texture and the
+  old hybrid): `ResolveFramebufferCopyData` decides `copy_to_vram` and `copy_to_ram` ("Store EFB copies to texture only" =
+  `bSkipEFBCopyToRam`), the size (`bCopyEFBScaled`: at the internal resolution or native), and a linear filter for half-scale copies.
+  `SetupCopyEntry` makes a one-level RGBA8 array texture (one layer per eye). `CopyEFBToCacheEntry` ends the EFB pass and draws one triangle
+  with the copy shader (`TextureConversionShaderGen`: format conversion, gamma, the GX copy filter coefficients, top/bottom clamps) into the
+  copy, its framebuffer bound with a discard load (`SetAndDiscardFramebuffer`). EFB-to-RAM encodes on the GPU and defers the readback
+  (`bDeferEFBCopies`, `m_pending_efb_copies`, `FlushEFBCopies`) until the CPU could see it. `TextureCacheBase::GetVRAMCopyFilterCoefficients`
+  disables the filter on request.
+- **Copy with clear** (`BPStructs.cpp`, PE copy `clear`) -> `BPFunctions.cpp:ClearScreen` -> `VideoBackends/Vulkan/VKGfx.cpp:ClearRegion`: outside
+  a render pass (always the case right after a copy) the clear *becomes the next pass*: `VKFramebuffer::SetAndClear` ->
+  `StateTracker::BeginClearRenderPass`, load op CLEAR, render area = the clear rectangle; the following draws continue in that pass while their
+  viewport stays inside it (`StateTracker::Bind`, `IsViewportWithinRenderArea`), otherwise it ends and a LOAD pass starts. Inside a pass:
+  `vkCmdClearAttachments`; else a quad.
+- **Render passes**: each framebuffer has a load, a discard and a clear variant (`VKTexture.cpp` / `ObjectCache.cpp:GetRenderPass`); colour
+  and depth are always stored, stencil don't-care. Every EFB copy, readback, reinterpret and poke ends the EFB pass. No render-area shrinking,
+  no STORE_OP_NONE, no input attachments.
+- **Peeks/pokes/bbox**: `FramebufferManager.cpp:PeekEFBColor`/`PeekEFBDepth` read back whole tiles of the EFB at native resolution into a
+  cache (`iEFBAccessTileSize`, `RefreshPeekCache`), pokes are batched (`FlushEFBPokes`), "skip EFB access" returns zero without a sync; bounding
+  box is an SSBO written with atomics (`VKBoundingBox.cpp`). Not known to matter here: none of our GX notes (G0, G21) mention peek, poke or
+  bounding-box use, but that is absence of evidence (the gx-vulkan plan still lists "does the game call GXPoke*/peek" as open).
+- **Formats**: EFB RGBA8 for every GX format; depth D32F, **D24_S8 on Qualcomm Vulkan** (`FramebufferManager.cpp:GetEFBDepthFormat`,
+  `BUG_BROKEN_D32F_CLEAR`: 32-bit depth clears had no effect on Adreno).
+- **Bloom-style chains**: nothing special: each copy is a pass break plus one draw; the cheap setting is native-size copies
+  (`bCopyEFBScaled` off), which makes every blur input a native-resolution texture.
+
+### What REUC does
+
+Each packet (the draws between two EFB copies) is one dynamic-rendering pass (`vulkan_renderer.cpp:3592 record_pass`): render area shrunk to the
+draws' viewports/scissors, depth not stored when no draw writes it (STORE_OP_NONE, LOAD_OP_NONE when nothing touches it), copies as blits after
+the pass, copy mips made lazily (`record_copy_mips`), the bloom chain in a 2-points-a-guest-pixel proxy (704806c), HUD and glows in layers, the
+present reading the EFB in place. A copy's clear is its own pass (`vulkan_renderer.cpp:4518 clear_region`: render area = the cleared rectangle,
+DONT_CARE + `vkCmdClearAttachments` + STORE); the next pass then LOADs. So the main scene's pass starts with depth LOADed. S17: the render-stage
+trace counted **no LRZ-killed pixels** with or without static depth state.
+
+### Changes for REUC (ranked)
+
+| # | change | Dolphin reference | expected effect | picture risk |
+|---|---|---|---|---|
+| 3.1 | **Fold a copy's clear into the next pass's load op** (CLEAR over the next pass's render area when the cleared rectangle covers it; the separate clear pass otherwise), for colour and depth. Then check LRZ: Adreno builds its low-resolution depth during binning and rejects hidden fragments for the whole pass, but drivers commonly keep it off for a pass whose depth is LOADed without a valid LRZ state, and for the rest of a pass after a depth-writing draw with discard, a change of compare direction, or ALWAYS/NOT_EQUAL with depth writes (this is driver knowledge, not Dolphin's, and unverified for Qualcomm's driver). The `[gpu-packets] scene draws not order-free` counters already list blending/alpha test/no depth test/compare per scene. | `VKGfx::ClearRegion`, `StateTracker::BeginClearRenderPass`, `VKFramebuffer::SetAndClear` | The clear pass itself is cheap (S17: ~0.1 ms). The gain, if any, is LRZ in the main scene: compare the profiler's shaded-fragment count with the occlusion-query count (8.4 M passing at native). The main scene is fragment-bound at native; whatever overdraw LRZ removes is the size (plausibly 1-2 ms if shaded is ~1.5x passing; nothing if the driver keeps LRZ off for another reason). | None: same clears, same order. |
+| 3.2 | **D24_UNORM_S8 depth on the headset** as an A/B. Dolphin uses it on Adreno for a (possibly old) clear bug; for us it is GX's own 24-bit depth (S17 ruled out D16 for losing it). | `GetEFBDepthFormat` | Unknown: same size in tile memory; compression and LRZ behaviour may differ. Cheap to try with 3.1. | Low: GX depth is 24-bit integer; equal-depth ties and clears map exactly. |
+| 3.3 | Do not adopt Dolphin's copy path: a copy draw instead of our blit moves the same bytes, and Dolphin breaks the pass at every copy as we do. Its one-level copy textures confirm the lazy-mip choice (cdef265): games run without mips on EFB copies in Dolphin. | `SetupCopyEntry` | None. | - |
+| 3.4 | Bloom proxy at 1 point a guest pixel for the blur passes (Dolphin's native-size copies) only after the proxy is measured on the headset (S17: not yet). | `ResolveFramebufferCopyData` (`bCopyEFBScaled`) | A fraction of the chain's remaining ~2.5 ms. | Softer bloom edges; the proxy at 2 points already differs at two bright spots. |
+
+## 4. Mobile / Adreno
+
+### Dolphin's Qualcomm entries (`VideoCommon/DriverDetails.cpp`, `DriverDetails.h`) and what they mean for us
+
+| bug | Dolphin's workaround | relevance to REUC |
+|---|---|---|
+| `BUG_BROKEN_TEV_COLOR_ZERO` (Vulkan, Android, driver >= 0x802bc000) | Specialized TEV shaders miscompile when colour input A or B is ZERO; Dolphin feeds those inputs from `konstLookup[8]`, a uniform kept at zero (`PixelShaderGen.cpp`, around line 1440) | Our folded modules are specialized TEV with ZERO inputs everywhere. Dolphin's TEV is integer, ours float, so the same miscompile may not occur; when the headset captures are compared (tex-merge plan, relaxed precision), look first at stages with A or B = ZERO. If one is wrong, the same trick (a zero from the uniform block) applies. |
+| `BUG_BROKEN_D32F_CLEAR` (Vulkan) | D24_S8 EFB depth | Our D32 clears work today (vkCmdClearAttachments and LOAD_OP_CLEAR); see 3.2 for the format A/B. |
+| `BUG_PRIMITIVE_RESTART` (GL and Vulkan) | No primitive restart: lists | We draw lists only (`valid_pipeline_key`). Keep it so. |
+| `BUG_BROKEN_REVERSED_DEPTH_RANGE` (Vulkan) | No minDepth > maxDepth viewports | We use the GX near/far as given (`vulkan_renderer.cpp:3881`); never introduce a reversed range. |
+| `BUG_SLOW_CACHED_READBACK_MEMORY` (Vulkan) | Coherent, not cached, memory for readbacks | Our captures/readbacks (harness, `keep_frame`): use coherent memory if they ever show in a profile. |
+| `BUG_SLOW_OPTIMAL_IMAGE_TO_BUFFER_COPY` (Vulkan, Android) | Copy to a linear image first (`VKTexture.cpp:VKStagingTexture::Create`) | Same, for capture readbacks only. |
+| `BUG_BROKEN_NEGATED_BOOLEAN` (GL) | `cond == false` instead of `!cond` | GL only; not us. |
+| `BUG_BROKEN_MULTITHREADED_SHADER_PRECOMPILATION` (all Android) | One pre-compile thread | We compile the warm-up keys on several threads (`vulkan_renderer.cpp:1259`); if the Quest ever crashes on the loading screen, this is the known cause. |
+| `BUG_BROKEN_DISCARD_WITH_EARLY_Z` (Apple GPUs, Metal and MoltenVK) | Framebuffer fetch instead of discard under forced early Z (`ApplyDriverBugs`, `UberShaderPixel.cpp:GenPixelShader`) | KosmicKrisp runs on the same Apple GPUs: relevant to 1.1 on the Mac, and possibly to the tex-merge seams S17 traced to early-depth tie order on KosmicKrisp. |
+
+### Android choices
+
+Dolphin's Android defaults are the desktop ones (`Source/Android/.../BooleanSetting.kt`: fast depth on, scaled EFB copies on, bounding box off,
+arbitrary mipmap detection on); Android adds custom Adreno drivers through adrenotools (`VideoBackends/Vulkan/VulkanLoader.cpp`), which the
+Quest cannot use, and treats `VK_SUBOPTIMAL_KHR` as non-fatal (`CommandBufferManager.cpp`). There is no Android or tiler-specific rendering
+path: no GMEM/LRZ awareness, no shading rates, no multiview (stereo is a geometry shader or two layers), no input attachments. Every
+tiler-specific technique REUC has (S17) goes beyond Dolphin; Dolphin's mobile performance comes from 1x internal resolution and the user's
+settings, not from structure.
+
+## 5. Textures
+
+### What Dolphin does
+
+- Decoding: CPU decoders with NEON (`VideoCommon/TextureDecoder_ARM64.cpp`, generic in `TextureDecoder_Common.cpp`), or on the GPU by compute
+  from the raw GX data in a texel buffer (`TextureCacheBase.cpp:DecodeTextureOnGPU`, `TextureConversionShader.cpp:GetDecodingShader`) to save
+  CPU and upload bandwidth.
+- Host formats: RGBA8 for every GX format; host BC/BPTC only for custom (replacement) textures. CMPR is decoded, not passed as DXT1: its
+  3-colour mode differs from DXT1 (`TextureDecoder_Common.cpp`, the note that colour 3 is transparent black in DXT1 but not in CMPR).
+- Invalidation: textures are hashed (XXH) on load, optionally only a sample of texels ("Texture Cache Accuracy",
+  `textureCacheSafetyColorSampleSize` in `GetTexture`); TMEM preloading is emulated (`TMEM.cpp`). EFB copies overlapping RAM textures are
+  patched in place (`DoPartialTextureUpdates`).
+- Sampling (`GetSamplerState`): GX filters and LOD clamps as given; anisotropy only where safe (`IsAnisotropicEnhancementSafe`), and then
+  bilinear/trilinear only; for mip chains that are *not* downscaled copies of the base (`ArbitraryMipmapDetector`, used for distance effects)
+  the LOD bias is raised by log2(internal resolution scale) so the effect starts at the console's distance.
+
+### What REUC does
+
+Native decode on the builder thread (`renderer/gx_textures.cpp`), invalidation by guest write-watch page epochs (`runtime/gx_write_watch.h`, no
+hashing per load: cheaper than Dolphin), RGBA8 / RGB565 on the host, the game's own mips uploaded but almost never sampled (S17: 0.06%
+non-base-level fetches), anisotropy only on mip-filtered samplers.
+
+### Changes for REUC
+
+None with a measurable GPU gain. Notes: (a) an arbitrary-mip LOD bias is irrelevant while the game samples base levels; revisit if a distance
+effect (fog textures, LOD fades) looks closer than on the console at 3.07x; (b) GPU decoding only if the builder thread ever becomes the limit
+(it has half a core free, S17); (c) host block compression stays off: the Quest has no BC, and CMPR to ETC2/ASTC is a lossy re-encode.
+
+## 6. CPU (brief)
+
+### What Dolphin's JitArm64 does
+
+- **FPR layout and precision tracking.** A register is cached as one of `RegType::Register`, `LowerPair`, `Duplicated`, `Single`,
+  `LowerPairSingle`, `DuplicatedSingle` (`PowerPC/JitArm64/JitArm64_RegCache.h`). `PowerPC/PPCAnalyst.cpp` (the forward scan in `Analyze`)
+  marks for each instruction which FPRs hold single-precision values (`fprIsSingle`: after `lfs`, `frsp`, single ops, paired ops, paired
+  loads), which are duplicated, and which can be stored without the careful conversion (`fprIsStoreSafe`). `JitArm64_Paired.cpp:ps_arith`
+  then computes in 32-bit lanes when all inputs are singles, and rounds frC to 25 bits for ps_mul/ps_madd when it is not
+  (`Force25BitPrecision`, the Gekko multiplier quirk); fused multiply-add accuracy is a separate option (`m_accurate_fmadds`).
+- **Quantized loads/stores** (`JitArm64_LoadStorePaired.cpp:psq_lXX`/`psq_stXX`): when a block uses one GQR that is zero at compile time, the
+  block checks it once at entry and then emits plain float accesses (`Jit.cpp:DoJit`, `assumeNoPairedQuantize`); otherwise a call through a
+  table of quantize routines indexed by type (`JitAsm.cpp:GenerateQuantizedLoads`/`GenerateQuantizedStores`, NEON SCVTF/UCVTF with the scale).
+- **FPRF** is not computed by default (`MAIN_FPRF` false); **fastmem** faults are backpatched: the faulting fast access is rewritten into a
+  branch to its slow path (`JitArm64_BackPatch.cpp:HandleFastmemFault`), so a site faults once.
+
+### What REUC does
+
+Paired singles as two-lane double vectors; every paired result goes through double -> float -> double (`runtime/ppc_rt.h:452 ps_result`), so
+each paired op is the double op plus FCVTN and FCVTL. In the Mac build `fn_802647AC` has 52 FCVTN and 67 FCVTL against 33 `fmla.2d` and 15
+`fmul.2d` (otool of `build/game/uc`); its ~800 loads/stores (context and stack) dominate it, as S17 found. psq: a GQR type test per access with the
+float cases inline and the quantized ones out of line (`ppc_rt.h:560 psq_load`, `psq_store`); no FPRF; fastmem emulates the access in the
+signal handler (`runtime/fastmem.cpp`) and the translator's MMIO-base dataflow keeps the hot MMIO sites explicit (0 faults in the fight).
+
+### What an AOT translator could still adopt
+
+1. **Single-precision dataflow for paired arithmetic** (Dolphin's `fprIsSingle`): where the translator can prove both inputs are singles,
+   emit add/sub/mul/div in float lanes. For those four (and sqrt) the result is bit-identical to double-then-round, since 53 >= 2x24+2 makes
+   the double rounding innocuous; keep the double path for the FMA forms (a double FMA then rounding to single is not always the single FMA)
+   and for frC that may not be single (the 25-bit quirk). Effect: two conversions off the dependency chain of every such op; on paired-heavy
+   functions a few percent of instructions and more of the latency. Determinism check as in S17 (`--det-out` over the fightmac replay).
+2. Quantized psq with NEON fixed-point conversion only if `psq_load_slow`/`psq_store_slow` ever show in a profile (they do not today).
+3. Nothing to take from fastmem: our zero-fault fight and the static MMIO marking are the AOT form of backpatching. FPRF: same as Dolphin
+   (off).
+
+## Top 5 recommendations
+
+1. **Small draws on one ubershader pipeline per fixed-function state, with the draw state read by index (2.1).** Start with the HUD
+   packet (measured upper bound 1.3 ms of its 2.2 ms per-draw cost), then a draw-area-gated rollout in the main scene, where pipeline and
+   uniform run ends (~145 a frame) are the per-draw cost that is left; realistic 1-3 ms at native. Picture: same TEV source; check captures.
+2. **Give the tiler its early rejection back (3.1, 3.2, 1.2).** Fold copy clears into the next pass's load op, A/B D24S8, and pre-evaluate
+   the alpha test fully so more pipelines take `EARLY_Z`; then read the trace's LRZ counters and compare shaded vs passing fragments in the
+   main scene. 1-2 ms plausible if LRZ comes on; zero picture risk.
+3. **Honour GX zcomploc and the EFB pixel format (1.1, 1.3).** Both are what the console does; zcomploc puts alpha-tested draws that asked for
+   early Z on early depth tests, RGB8 removes destination-alpha work. Count the draws first (a log of BP 0x43 per packet); check against the
+   G20 Dolphin oracle frame.
+4. **Fragment-only uniform identity for merging (2.2).** Up to ~30 more joins a frame (0.6-1.3 ms at 20-40 us a draw), no picture risk, small
+   change in `vulkan_renderer.cpp` around 3033.
+5. **Destination alpha with blending by dual-source blending (1.4)**, after identifying the ~4 second draws a frame: worth ~0.1 ms if they
+   are small, up to a few ms if any is full screen; exact either way, and it removes the last two-draw path.
+
+CPU, when the GPU no longer dominates: single-precision dataflow for paired add/sub/mul/div (section 6, item 1).
