@@ -334,6 +334,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     if(options.no_vulkan_layers && setenv("VK_LOADER_LAYERS_DISABLE","~implicit~",1)!=0) throw std::runtime_error("cannot disable implicit Vulkan layers");
 #endif   // read by the loader at vkCreateInstance
     uc::intro_init(options.skip_intro);
+#ifdef UC_OPENXR
+    // The headset: without a configured limit the game would step at the original 30 Hz (a frame every two retraces), judder in VR;
+    // default to the retrace-locked 60 Hz. A limit from config.json, the settings menu or --fps-limit still decides.
+    if(!options.fps_limit && !options.unlock_60fps) options.fps_limit=60;
+#endif
     // Network play steps at the session tick whatever the frame limit says; the limit then only caps presents.
     const auto pacing=options.netplay ? uc::PacingMode{options.unlock_60fps,options.game_hz} : uc::pacing_for_limit(options.fps_limit,options.game_hz,options.unlock_60fps);   // see Options::fps_limit
     uc::game_pacing_init(pacing.unlock_60,pacing.game_hz);
