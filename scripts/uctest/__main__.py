@@ -55,8 +55,10 @@ def run_on_quest(name, args):
     game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", str(4 * 3600 if name == "play" else 1800), "--speed", str(args.speed)] + list(args.game_arg)
     # The bot reaches the fight at the original 30 Hz pacing (unlocked, the headset's slow frames gave the game long variable steps and
     # the bot stuck before the wave); the fight itself is measured at the headset's default, the retrace-locked 60 Hz (--fight-fps-limit).
+    # Both through the live settings (set_options), never --fps-limit: a live change only takes effect when it differs from the saved
+    # config.json, which earlier runs left at 60 while the command line held the game at 30 (the switch to 60 was a no-op).
     if "--fps-limit" not in game_args:
-        game_args += ["--fps-limit", "30"]   # the original pacing (else the headset's default, 60)
+        args.reach_fps_limit = 30   # the original pacing (else the headset's default, 60)
         if args.fight_fps_limit is None:
             args.fight_fps_limit = 60
     runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)

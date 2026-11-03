@@ -446,6 +446,8 @@ def reach_fight(g, args):
         pressed_before = down
         return fresh
 
+    if getattr(args, "reach_fps_limit", None) is not None:   # the Quest runner: the bot's pacing (live, so the fight's limit is a real change)
+        g.set_options(fps_limit=args.reach_fps_limit)
     g.set_speed(8)
     reach_gameplay(g, args.chapter)
     bot = Autoplay(g, g.run_dir / "autoplay.jsonl", speed=8, god=True)
@@ -476,8 +478,11 @@ def reach_fight(g, args):
                 draws = len(g.draws())
                 with open(trace_path, "a") as out:
                     out.write(f"{tick // 60},{listed(g.frame)},{alive(g.frame)},{draws}\n")
-                wave_since = (wave_since if wave_since is not None else tick // 60) if listed(g.frame) >= WAVE_ACTORS else None
-                if mark and wave_since is not None and tick // 60 - wave_since >= mark["wave_offset"]:
+                # Only in play: during a movie the enemy list can still hold the wave (the headset's runs slowed down inside MV_001_1, 0 draws)
+                in_play = g.frame.get("context") in ("gameplay", "qte")
+                if in_play:
+                    wave_since = (wave_since if wave_since is not None else tick // 60) if listed(g.frame) >= WAVE_ACTORS else None
+                if in_play and mark and wave_since is not None and tick // 60 - wave_since >= mark["wave_offset"]:
                     break
                 if getattr(args, "slow_at", 0) and tick // 60 >= getattr(args, "slow_at", 0):   # --slow-at: an absolute game second instead of the learned point (e.g. where leeches appear)
                     break
