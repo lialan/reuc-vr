@@ -53,8 +53,12 @@ def run_on_quest(name, args):
     run_dir.mkdir(parents=True, exist_ok=True)
     adb = ["adb", "-s", QUEST_SERIAL]
     game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", str(4 * 3600 if name == "play" else 1800), "--speed", str(args.speed)] + list(args.game_arg)
+    # The bot reaches the fight at the original 30 Hz pacing (unlocked, the headset's slow frames gave the game long variable steps and
+    # the bot stuck before the wave); the fight itself is measured at the headset's default, the retrace-locked 60 Hz (--fight-fps-limit).
     if "--fps-limit" not in game_args:
-        game_args += ["--fps-limit", "0"]   # as on the desktop (client.py): unlocked, else the game paces itself at the original 30 Hz
+        game_args += ["--fps-limit", "30"]   # the original pacing (else the headset's default, 60)
+        if args.fight_fps_limit is None:
+            args.fight_fps_limit = 60
     runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)
                               + [f"--arg={a}" for a in game_args] + [f"--set={s}" for s in getattr(args, "quest_set", [])]
                               + ([f"--saves={SAVE_SOURCE}"] if SAVE_SOURCE and Path(SAVE_SOURCE).is_dir() else []),   # the desktop runs' save snapshot: the menu route needs slot 1
@@ -112,6 +116,7 @@ def main(argv=None):
     run.add_argument("--save-as", help="after the run, keep its saves as checkpoint NAME (build/autotest/checkpoints/NAME)")
     run.add_argument("--wave-offset", type=int, default=None, help="fight: game seconds after the 30-actor wave starts where the run drops to x1 (default: the learned F5 point)")
     run.add_argument("--slow-at", type=int, default=0, help="fight: drop to speed 1 at this game second (retraces / 60) instead of the learned point")
+    run.add_argument("--fight-fps-limit", type=int, default=None, help="fight/play: the frame rate limit set live at the slowdown point (0 = unlocked; --quest default 60)")
     run.add_argument("--mark", action="store_true", help="fight: ignore the saved slowdown point and wait for F5 to set a new one")
     run.add_argument("--at", choices=("fight", "start"), default="fight", help="play: hand over at the heavy train fight (default) or when chapter gameplay starts")
     run.add_argument("--max-minutes", type=float, default=10, help="autoplay wall-time limit")
