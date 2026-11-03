@@ -1,6 +1,10 @@
 #include <cstdlib>
 #include "gx.h"
 #include "gx_scene.h"
+#include "gx_queue.h"
+#include "gx_fifo.h"
+#include "gx_watch_stamp.h"
+#include "host_thread.h"
 #include "guest_call.h"
 #include "hle/os.h"
 #include "gx_audit.h"
@@ -27,11 +31,41 @@
 #include <unordered_map>
 #include "clock.h"
 #include "public_release.h"
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
+// The GX HLE in two halves (gx_queue.h). The guest thread (the front) runs the HLE calls: what the guest can observe (SDK block writes, guest
+// calls, the bytes of a display list being recorded, the draw-done flag and callback), every check that throws, and the immediate-mode data it
+// must copy at call time (matrices, lights and colours loaded from guest pointers, the SDK block a draw sees). For everything else it appends a
+// command. The GX builder (the back: its own thread, or the guest thread itself when the builder is off) runs the commands in order and keeps
+// the renderer's GX state: transforms, materials, bound textures, the recorded display lists' native draws, the mesh and texture caches, the
+// draw queue and the packets it seals.
+//
+// The builder reads vertex arrays, indexed matrices, textures and display lists from guest memory when it runs the command, after the guest has
+// moved on: what the hardware's GPU does too (it reads them from memory when it processes the FIFO). The game cannot reuse that memory before
+// the GPU passed it, and the guest thread only learns that through the draw-done, which the builder's packets produce: live play delivers it
+// when the render thread submits the packet the builder sealed, a replay when the GPU completes it, and network play waits for the builder
+// (request_finish). Everything the guest reads back (the channel words a display list call writes, packet serials) the front computes itself.
 namespace {
 uc::Sched* scheduler;
 gx::Packets* packets;
 gx::Memory memory;
+gx::CommandQueue& queue=*new gx::CommandQueue;   // never destroyed: the builder thread may still run at exit (gx_stop_builder ends it first)
+bool builder_wanted=false;
+
+// ---------------- The SDK block a draw sees (front -> back) ----------------
+// The SDK block span both snapshots read (the highest word is the viewport at +0x55C), copied by the front when a draw is issued and unchanged
+// while the guest does not change it: the builder derives state and material from it instead of from guest memory.
+constexpr size_t kSdkSpan=0x560;
+struct SdkBlock {
+    uint32_t address=0;
+    std::array<std::byte,kSdkSpan> bytes;
+    uint32_t word(uint32_t offset) const { uint32_t raw; std::memcpy(&raw,bytes.data()+offset,4); return uc_bswap32(raw); }
+};
+using SdkRef=std::shared_ptr<const SdkBlock>;
+
+// ================= The builder's state (the back) =================
 gx::State state;
 gx::Transforms transforms;
 // Blocks shared by consecutive draws; each path keeps its own so an interleaved path does not evict the other's.
@@ -48,6 +82,11 @@ uint64_t prompt_batch=0;
 std::vector<gx::PromptDraw> carried_prompts;
 std::atomic<uint64_t> prompt_annotations{},prompt_present{},prompt_fallback{};
 uint32_t mesh_profile_count;
+// --profile: the first mesh the profile reports dumps its textures. The dump named its files after uc::now_ticks(), a deterministic clock read
+// on the guest thread that demos recorded with --profile contain: the front makes those reads (one per dump) once the builder did the dumps.
+std::atomic<uint32_t> mesh_dumps{0};
+uint32_t mesh_dumps_seen=0;
+bool mesh_dumps_settled=false;
 uint32_t copy_profile_count;
 uint32_t channel_profile_count;
 uint32_t texgen_profile_count;
@@ -57,10 +96,9 @@ using TextureSelectors=std::array<uint32_t,8>;
 TextureMatrices texture_matrices;
 using MatrixIndices=std::array<std::optional<uint32_t>,2>;
 MatrixIndices matrix_indices;
-uint32_t known_sdk=0;   // SDK block address last seen by a snapshot; raw display list calls write the texgen words there
 std::array<uint32_t,16> indirect_stages{};
-// Versions of the host-side inputs of snapshot() / material_snapshot() (the rest of their input is the SDK block in guest memory, compared by bytes).
-// Every write to `state`, the recorded input state, `color_uniforms`, `texture_matrices` or `indirect_stages` bumps one (guest baton only).
+// Versions of the host-side inputs of snapshot() / material_snapshot() (the rest of their input is the SDK block, compared by identity or bytes).
+// Every write to `state`, the recorded input state, `color_uniforms`, `texture_matrices` or `indirect_stages` bumps one (builder only).
 uint64_t state_epoch=1,material_epoch=1;
 uint64_t cache_stat[8]={}; uint64_t cache_diff[2][0x560/4]={};   // --profile: snapshot hits/misses, material hits/misses per second
 inline void dirty_state() { ++state_epoch; }
@@ -83,9 +121,6 @@ std::shared_ptr<const gx::TexturePixels> live_texture;
 std::array<std::shared_ptr<const gx::TexturePixels>,7> live_texture_maps;
 struct CopyState { std::array<uint8_t,4> color{0,0,0,255}; uint32_t depth=0xFFFFFF; };
 CopyState copy_state;
-std::array<uint32_t,4> texture_copy_source{};
-uint32_t texture_copy_width=0,texture_copy_height=0;
-uint32_t texture_copy_format=6;
 using CopiedTextures=std::map<uint32_t,std::shared_ptr<const gx::TexturePixels>>;
 CopiedTextures copied_textures;
 struct CopiedTexture { gx::TextureCopy request; bool clear; CopyState clear_state; };
@@ -110,29 +145,41 @@ std::unordered_map<uintptr_t,std::list<MeshCacheEntry>::iterator> mesh_index;
 size_t mesh_cache_bytes=0;
 constexpr size_t mesh_cache_budget=256u<<20;
 std::atomic<uint64_t> geometry_hits{0},geometry_misses{0};
-// Guest baton is the sole writer; atomic load/store lets host readers sample without a locked RMW.
+// One writer (the builder); atomic load/store lets host readers sample without a locked RMW.
 inline void add_guest_stat(std::atomic<uint64_t>& counter,uint64_t amount) {
     counter.store(counter.load(std::memory_order_relaxed)+amount,std::memory_order_relaxed);
 }
 gx::DrawQueue draws;
+// A display-list draw's decoded vertices, kept for the next call: the game records its lists again every frame with the same bytes, and a list's
+// draw decodes the same while its payload, its vertex format and the vertex arrays it indexes stay the same. A recording that replaces one at the
+// same address takes over the decodes of its draws whose payload and format are unchanged (GXEndDisplayList); a call reuses one while the
+// arrays its indices read are bound at the same addresses and no guest store touched them since the decode (and anyway decodes every 256th call).
+struct DecodedDraw {
+    std::array<gx::Array,12> arrays;   // the vertex arrays bound when it was decoded (only the indexed attributes' are compared)
+    std::array<std::optional<gx::Vertices::SourceRange>,12> sources;
+    uint32_t stamp=0, uses=0;
+    std::vector<gx::Vertex> vertices;
+    std::vector<uint32_t> indices;
+};
+std::atomic<uint64_t> list_decodes{0},list_reuses{0};
 struct RecordedDraw {
     gx::State state;
     uint32_t callsite;
     uint8_t primitive, vat;
     uint16_t count;
     size_t expected;
-    std::vector<std::byte> payload;
+    size_t offset=0;   // the payload: `expected` bytes of the list's recorded bytes from here (Resource::list_bytes)
     gx::TevMaterial material;
     gx::DrawUniform uniforms;
     TextureSelectors texture_selectors;
     std::optional<uc::PromptDescription> prompt;
     bool compact=false;
-    size_t filled=0;   // payload bytes written so far (the payload is sized to expected when the primitive starts)
+    mutable std::shared_ptr<DecodedDraw> decoded;   // the builder's cache (see DecodedDraw)
 };
 uint64_t list_stat[2]={};   // --profile: display-list draws imported and their vertices (the game records its lists again every frame: each is called about once)
 struct Resource {
-    std::vector<std::byte> bytes;
-    mutable uint32_t stamp=0,skips=0;   // write-barrier stamp of the last byte comparison (gx_write_watch.h); uses since then
+    std::shared_ptr<const std::vector<std::byte>> list_bytes;   // the bytes the guest recorded (the draws' payloads), shared with the front's copy
+    uint32_t length=0;   // the list's length as GXEndDisplayList returned it
     struct ArrayBinding { size_t attribute; gx::Array array; };
     struct Child { uint32_t address, length; };
     struct Projection { gx::Projection matrix; };
@@ -161,7 +208,7 @@ RecordedDraw* recorded_draw(Resource::Item& item) { auto* held=std::get_if<std::
 const RecordedDraw* recorded_draw(const Resource::Item& item) { auto* held=std::get_if<std::unique_ptr<RecordedDraw>>(&item); return held ? held->get() : nullptr; }
 std::map<uint32_t,std::shared_ptr<const Resource>> resources; // Immutable recordings shared with rollback checkpoints.
 // The game records its display lists again every frame, and a replaced recording (its draws hold ~5 KB of state each) is freed on a helper
-// thread: pure host work the guest thread would otherwise do. The helper empties the pile every few milliseconds (no wake-up per list).
+// thread: pure host work the builder would otherwise do. The helper empties the pile every few milliseconds (no wake-up per list).
 class Graveyard {
 public:
     static Graveyard& instance() { static Graveyard* pile=new Graveyard; return *pile; }   // never destroyed: the helper may run at exit
@@ -180,32 +227,75 @@ private:
     std::mutex mutex_;
     std::vector<std::shared_ptr<const Resource>> dead_;
 };
-struct ListRecording {
-    uint32_t address, capacity, sdk, owner;
-    bool restore, overflow = false;
-    std::array<std::byte,0x600> shadow{};
+// The builder's side of a display list being recorded: its native items and the host state GXEndDisplayList restores.
+struct BackList {
+    bool restore=false;
     gx::DrawUniform color_shadow;
-    std::array<uint32_t,4> texture_copy_source_shadow;
-    uint32_t texture_copy_width_shadow=0,texture_copy_height_shadow=0;
-    uint32_t texture_copy_format_shadow=6;
     TextureMatrices texture_shadow;
     MatrixIndices indices_shadow;
-    std::unique_ptr<std::byte[]> bytes;   // capacity bytes, the first used of them written (gx_fifo_write appends 1-4 bytes at a time)
-    size_t used=0;
     Resource native;
     gx::State input_state;
 };
-std::unique_ptr<ListRecording> recording;
+std::unique_ptr<BackList> brec;
+std::atomic<uint64_t> draw_count{0}, vertex_count{0}, submitted{0}, completed{0}, outside_bytes{0};
+std::atomic<uint64_t> copies{0};
+std::atomic<uint64_t> texture_decodes{0},texture_evictions{0},texture_resident{0};
+uint64_t back_serial=0;   // the builder's view of the last sealed serial (checked against the front's prediction)
+struct PromptMark { uint64_t token; uc::GxPromptCheckpoint at; };
+std::array<PromptMark,64> prompt_marks{};   // gx_prompt_checkpoint() results as the builder saw them, by token
+
+// ================= The front's state (guest thread) =================
+uint32_t known_sdk=0;   // SDK block address last seen by a snapshot; raw display list calls write the texgen words there
+std::array<uint32_t,4> texture_copy_source{};
+uint32_t texture_copy_width=0,texture_copy_height=0;
+uint32_t texture_copy_format=6;
 std::mutex det_finish_m;
 std::map<uint64_t,uint64_t> det_finishes; // serial -> scheduler generation
 std::set<uint64_t> det_early;
 std::map<uint64_t, uint32_t> finishes; // serial -> submitting thread's SDA base; guest baton only
-std::atomic<uint64_t> draw_count{0}, vertex_count{0}, submitted{0}, completed{0}, outside_bytes{0};
-std::atomic<uint64_t> copies{0};
-std::atomic<uint64_t> texture_decodes{0},texture_evictions{0},texture_resident{0};
+uint64_t front_serial=0;   // the serial of the last packet the builder was told to seal (Packets numbers them in that order)
+uint32_t front_stamp=0;    // write-watch stamp given to the commands (gx_watch_stamp.h)
+uint64_t prompt_tokens=0;
+SdkRef sdk_last;           // the last SDK block captured
+// What a recorded display list does that the guest can observe when it is called: the channel words GXCallDisplayList writes back, the
+// packets its texture copies seal, the lists it calls.
+struct FrontEffect { enum Kind : uint8_t { child, num_channels, channel_control, texture_copy } kind; uint32_t a=0, b=0; };
+struct FrontResource {
+    std::shared_ptr<const std::vector<std::byte>> bytes;   // the recorded bytes (the first `length` are the list's)
+    uint32_t length=0;
+    mutable uint32_t stamp=0,skips=0;   // write-barrier stamp of the last byte comparison (gx_write_watch.h); uses since then
+    std::vector<FrontEffect> effects;
+};
+std::map<uint32_t,std::shared_ptr<const FrontResource>> front_resources;
+struct FrontList {
+    uint32_t address, capacity, sdk, owner;
+    bool restore, overflow = false;
+    std::array<std::byte,0x600> shadow{};
+    std::array<uint32_t,4> texture_copy_source_shadow;
+    uint32_t texture_copy_width_shadow=0,texture_copy_height_shadow=0;
+    uint32_t texture_copy_format_shadow=6;
+    std::unique_ptr<std::byte[]> bytes;   // capacity bytes and 8 of slack; written through uc::gx_fifo_window while recording
+    size_t used=0;                        // valid while overflowed (the window is closed then); otherwise the window's position
+    bool prim_open=false;                 // an open recorded primitive: its payload ends at prim_end
+    std::byte* prim_end=nullptr;
+    uint32_t prim_callsite=0;
+    size_t prim_expected=0;
+    std::vector<FrontEffect> effects;
+};
+std::unique_ptr<FrontList> front_list;
+// An open immediate-mode primitive: the FIFO bytes collect here (through the window) until the last one, then go to the builder.
+struct FrontPrimitive {
+    bool active=false;
+    uint32_t producer=0, callsite=0;
+    size_t expected=0;
+    std::vector<std::byte> bytes;
+};
+FrontPrimitive front_prim;
+gx::State front_derived;   // derive_state of the last block (only descriptors and formats are read: encoded sizes)
+SdkRef front_derived_block;
 
 // --profile only: wall time inside the two native draw entry points, printed once per second as "[gxtime]" (per-call figures compare builds
-// far more precisely than a whole-fight FPS, which varies several percent between runs).
+// far more precisely than a whole-fight FPS, which varies several percent between runs). With the builder these are the guest thread's share.
 struct CallTimer {
     static inline uint64_t ns[2]={}, calls[2]={}, last=0;
     int id; bool on; std::chrono::steady_clock::time_point start;
@@ -221,8 +311,8 @@ struct CallTimer {
                 for(int w=0;w<2;++w) { for(int k=0;k<4;++k) { size_t best=0; for(size_t o=0;o<0x560/4;++o) if(cache_diff[w][o]>cache_diff[w][best]) best=o; if(cache_diff[w][best]) { std::fprintf(stderr," +%zX:%llu",best*4,(unsigned long long)cache_diff[w][best]); cache_diff[w][best]=0; } } std::fprintf(stderr,w?" (material)":" |"); }
                 std::fprintf(stderr,"\n"); std::memset(cache_diff,0,sizeof cache_diff); }
             for(auto& v:cache_stat) v=0;
-            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call; list draws %llu, %llu vertices\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0,
-                (unsigned long long)list_stat[0],(unsigned long long)list_stat[1]);
+            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call; list draws %llu, %llu vertices, decoded %llu reused %llu; builder backlog %llu KiB\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0,
+                (unsigned long long)list_stat[0],(unsigned long long)list_stat[1],(unsigned long long)list_decodes.exchange(0),(unsigned long long)list_reuses.exchange(0),(unsigned long long)(queue.backlog()>>10));
             for(auto& v:list_stat) v=0;
             last=t; ns[0]=ns[1]=calls[0]=calls[1]=0;
         }
@@ -240,16 +330,66 @@ uint32_t read32(uint32_t address) {
     for (auto byte : bytes) value = value << 8 | std::to_integer<uint8_t>(byte);
     return value;
 }
-TextureSelectors texture_selectors(uint32_t sdk) {
+
+// ---------------- Front: issuing commands ----------------
+[[noreturn]] void builder_failed() {
+    try { queue.rethrow(); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
+}
+template<class F> void back(F&& f) {
+    try { queue.emit(std::forward<F>(f),front_stamp); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
+}
+void reset_watch();
+// A command whose cache checks compare guest memory (textures, meshes): it records a fresh stamp.
+template<class F> void back_checked(F&& f) {
+    if (queue.threaded()) {
+        if (gx::watch_exhausted()) reset_watch();
+        front_stamp=gx::watch_stamp();
+    }
+    back(std::forward<F>(f));
+}
+void drain() {
+    try { queue.drain(); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
+}
+uint32_t producer() { return scheduler->in_irq() ? UINT32_MAX : uint32_t(scheduler->current()->id); }
+// The SDK block as a draw issued now sees it (the read also checks the whole block's bounds, as the snapshots did).
+SdkRef capture_sdk(uint32_t sdk) {
+    const auto live=memory.read(sdk,0x600);
+    if(sdk_last && sdk_last->address==sdk && std::memcmp(live.data(),sdk_last->bytes.data(),kSdkSpan)==0) return sdk_last;
+    auto block=std::allocate_shared<SdkBlock>(gx::PoolAllocator<SdkBlock>{});
+    block->address=sdk; std::memcpy(block->bytes.data(),live.data(),kSdkSpan);
+    sdk_last=std::move(block);
+    return sdk_last;
+}
+// Live and recorded primitives open a window over their bytes: the inline FIFO path fills it (gx_fifo.h).
+void list_window() {
+    auto& list=*front_list;
+    if(list.overflow) { uc::gx_fifo_window={}; return; }
+    std::byte* end=list.bytes.get()+list.capacity;
+    if(list.prim_open && list.prim_end<end) end=list.prim_end;
+    uc::gx_fifo_window.end=end;
+}
+size_t list_used() { return front_list->overflow ? front_list->used : size_t(uc::gx_fifo_window.at-front_list->bytes.get()); }
+bool recording_primitive() { return front_list && front_list->prim_open; }
+bool live_primitive() { return front_prim.active; }
+// What capture->finish() threw: a primitive whose vertices did not all arrive.
+void finish_primitive() {
+    if(front_prim.active) throw gx::Error(gx::ErrorCode::truncated,front_prim.callsite,front_prim.expected,size_t(uc::gx_fifo_window.at-front_prim.bytes.data()));
+}
+
+// ================= Builder: snapshots =================
+TextureSelectors texture_selectors(const SdkBlock& block) {
     TextureSelectors result{};
-    const auto low=matrix_indices[0].value_or(read32(sdk+0x80)),high=matrix_indices[1].value_or(read32(sdk+0x84));
+    const auto low=matrix_indices[0].value_or(block.word(0x80)),high=matrix_indices[1].value_or(block.word(0x84));
     for(uint32_t i=0;i<8;++i) result[i]=((i<4 ? low : high)>>(i<4 ? 6+i*6 : (i-4)*6))&63;
     return result;
 }
-// NW4R writes XF selectors without changing the SDK cache; a later SDK flush can replace them.
-void set_matrix_index(uint32_t reg,uint32_t value) {
+// NW4R writes XF selectors without changing the SDK cache; a later SDK flush can replace them. `push`: record it into the list being recorded.
+void set_matrix_index(uint32_t reg,uint32_t value,bool push) {
     matrix_indices[reg]=value; dirty_material();
-    if(recording) { if(!recording->overflow) recording->native.geometry.push_back(Resource::MatrixIndex{reg,value}); }
+    if(brec) { if(push) brec->native.geometry.push_back(Resource::MatrixIndex{reg,value}); }
     else if(reg==0) transforms.current=value&63;
 }
 // Texture matrix ids follow GX: 0..61 (GX_IDENTITY 60), post matrices at 64+row (XF 0x500+row*4).
@@ -272,65 +412,66 @@ std::shared_ptr<const gx::TextureBank> texture_bank(const gx::State& state,const
     return last;
 }
 struct MaterialSnapshot { gx::TevMaterial material; gx::DrawUniform uniforms; };
-// The SDK block span both snapshots read (the highest word is the viewport at +0x55C). A snapshot is a pure function of these bytes and the host-side
-// state versioned above, so the last result is reused while neither changed: consecutive meshes of one model draw with identical GX state.
-constexpr size_t kSdkSpan=0x560;
-struct MaterialCache { bool valid=false; uint32_t sdk=0; uint64_t epoch=0; std::array<std::byte,kSdkSpan> raw; MaterialSnapshot result; };
+// A snapshot is a pure function of the SDK block and the host-side state versioned above, so the last result is reused while neither changed:
+// consecutive meshes of one model draw with identical GX state (the front hands the same block on while the guest leaves it alone).
+struct MaterialCache { bool valid=false; uint64_t epoch=0; SdkRef block; MaterialSnapshot result; };
 MaterialCache material_cache;
 // UC_GX_CACHE_VERIFY=1 recomputes every cached snapshot and reports results that differ (debugging aid for a missed version bump).
 const bool cache_verify=std::getenv("UC_GX_CACHE_VERIFY")!=nullptr;
 uint32_t cache_mismatches=0;
-MaterialSnapshot material_snapshot(ppc::Ctx& c,bool use_cache=true) {
-    const auto sdk=read32(c.r[2]-8968); known_sdk=sdk;
-    const auto block=memory.read(sdk,0x600);
-    if(use_cache && material_cache.valid && material_cache.sdk==sdk && material_cache.epoch==material_epoch && std::memcmp(block.data(),material_cache.raw.data(),kSdkSpan)==0) {
+// The front hands the same block on while the guest leaves the bytes alone (capture_sdk), so identity is byte equality.
+bool same_block(const SdkRef& a,const SdkRef& b) { return a==b; }
+MaterialSnapshot material_snapshot(const SdkRef& sdk_block,uint32_t lr,bool use_cache=true) {
+    const SdkBlock& block=*sdk_block;
+    if(use_cache && material_cache.valid && material_cache.epoch==material_epoch && same_block(material_cache.block,sdk_block)) {
         if(cache_verify) {
-            const auto cached=material_cache.result; const auto fresh=material_snapshot(c,false);
+            const auto cached=material_cache.result; const auto fresh=material_snapshot(sdk_block,lr,false);
             if((std::memcmp(&cached.material,&fresh.material,sizeof cached.material) || std::memcmp(&cached.uniforms,&fresh.uniforms,sizeof cached.uniforms)) && cache_mismatches++<8)
-                std::fprintf(stderr,"[gx-cache] material snapshot differs at callsite %08X (epoch %llu)\n",c.lr,(unsigned long long)material_epoch);
+                std::fprintf(stderr,"[gx-cache] material snapshot differs at callsite %08X (epoch %llu)\n",lr,(unsigned long long)material_epoch);
         }
         ++cache_stat[2]; return material_cache.result;
     }
-    if(profile_mesh && material_cache.valid && material_cache.sdk==sdk) {
+    if(profile_mesh && material_cache.valid && material_cache.block && material_cache.block->address==block.address) {
         if(material_cache.epoch!=material_epoch) ++cache_stat[4];
-        else for(size_t o=0;o<kSdkSpan;o+=4) if(std::memcmp(block.data()+o,material_cache.raw.data()+o,4)) { ++cache_diff[1][o/4]; ++cache_stat[5]; break; }
+        else for(size_t o=0;o<kSdkSpan;o+=4) if(std::memcmp(block.bytes.data()+o,material_cache.block->bytes.data()+o,4)) { ++cache_diff[1][o/4]; ++cache_stat[5]; break; }
     }
     ++cache_stat[3]; material_cache.valid=false;
-    const auto selectors=texture_selectors(sdk);
+    const auto selectors=texture_selectors(block);
     MaterialSnapshot result{gx::TevMaterial{},color_uniforms};
     auto& material=result.material; auto& uniforms=result.uniforms;
-    material.stages=((read32(sdk+0x254)>>10)&15)+1;
-    uniforms.pixel[1]=read32(sdk+0x228)&31;
-    uniforms.pixel[2]=read32(sdk+0x224)&511;
-    uniforms.pixel[3]=(read32(sdk+0x254)>>4)&3;
+    auto word=[&](uint32_t offset) { return block.word(offset); };
+    material.stages=((word(0x254)>>10)&15)+1;
+    uniforms.pixel[1]=word(0x228)&31;
+    uniforms.pixel[2]=word(0x224)&511;
+    uniforms.pixel[3]=(word(0x254)>>4)&3;
     for(uint32_t i=0;i<2;++i) for(uint32_t lane=0;lane<4;++lane) {
-        uniforms.materials[i][lane]=((read32(sdk+0xB0+i*4)>>(24-lane*8))&255)/255.f;
-        uniforms.ambient[i][lane]=((read32(sdk+0xA8+i*4)>>(24-lane*8))&255)/255.f;
+        uniforms.materials[i][lane]=((word(0xB0+i*4)>>(24-lane*8))&255)/255.f;
+        uniforms.ambient[i][lane]=((word(0xA8+i*4)>>(24-lane*8))&255)/255.f;
     }
-    for(uint32_t i=0;i<4;++i) uniforms.channels[i]=read32(sdk+0xB8+i*4);
-    for(size_t i=0;i<4;++i) material.swaps[i]=uint8_t((read32(sdk+0x200+i*8)&15)|((read32(sdk+0x204+i*8)&15)<<4));
+    for(uint32_t i=0;i<4;++i) uniforms.channels[i]=word(0xB8+i*4);
+    for(size_t i=0;i<4;++i) material.swaps[i]=uint8_t((word(0x200+uint32_t(i)*8)&15)|((word(0x204+uint32_t(i)*8)&15)<<4));
     for(uint32_t i=0;i<material.stages;++i) {
         auto& stage=material.stage[i];
-        stage.color=read32(sdk+0x180+i*4)&0xFFFFFF; stage.alpha=read32(sdk+0x1C0+i*4)&0xFFFFFF;
-        stage.order=(read32(sdk+0x150+i/2*4)>>((i%2)*12))&0xFFF;
-        stage.konst=(read32(sdk+0x200+i/2*4)>>(4+(i%2)*10))&1023;
+        stage.color=word(0x180+i*4)&0xFFFFFF; stage.alpha=word(0x1C0+i*4)&0xFFFFFF;
+        stage.order=(word(0x150+i/2*4)>>((i%2)*12))&0xFFF;
+        stage.konst=(word(0x200+i/2*4)>>(4+(i%2)*10))&1023;
         stage.indirect=indirect_stages[i];
         uniforms.ind_cmd[i]=stage.indirect;
     }
     for(uint32_t i=0;i<8;++i) {
-        const auto generator=read32(sdk+0xC8+i*4),source=(generator>>7)&31;
-        uniforms.tex_gens[i]=generator; uniforms.tex_posts[i]=read32(sdk+0xE8+i*4); // dual-texture post is always on (XF 0x1012 set once by __GXInitRevisionBits)
+        const auto generator=word(0xC8+i*4),source=(generator>>7)&31;
+        uniforms.tex_gens[i]=generator; uniforms.tex_posts[i]=word(0xE8+i*4); // dual-texture post is always on (XF 0x1012 set once by __GXInitRevisionBits)
         static int unsupported_logs=0;
         if(((generator>>4)&7 || source==2 || source==3 || source==4 || source>12) && unsupported_logs<8 && ++unsupported_logs)
-            std::fprintf(stderr,"[native-texgen] unsupported generator %08X slot %u callsite %08X\n",generator,i,c.lr);
+            std::fprintf(stderr,"[native-texgen] unsupported generator %08X slot %u callsite %08X\n",generator,i,lr);
         const auto id=selectors[i];
         if(profile_mesh && texgen_profile_count<16 && (source<5 || (generator&2))) {
             const bool used=std::any_of(material.stage.begin(),material.stage.begin()+material.stages,[&](const auto& stage){return (stage.order&64) && ((stage.order>>3)&7)==i;});
-            if(used) { ++texgen_profile_count; std::fprintf(stderr,"[native-texgen] callsite %08X slot %u generator %08X matrix %u post %08X\n",c.lr,i,generator,id,read32(sdk+0xE8+i*4)); }
+            if(used) { ++texgen_profile_count; std::fprintf(stderr,"[native-texgen] callsite %08X slot %u generator %08X matrix %u post %08X\n",lr,i,generator,id,word(0xE8+i*4)); }
         }
     }
     resolve_texture_matrices(uniforms,selectors,texture_matrices);
-    material_cache.sdk=sdk; material_cache.epoch=material_epoch; std::memcpy(material_cache.raw.data(),block.data(),kSdkSpan); material_cache.result=result; material_cache.valid=true;
+    material_cache.block=sdk_block; material_cache.epoch=material_epoch; material_cache.result=result; material_cache.valid=true;
     return result;
 }
 uint32_t texture_mask(const gx::TevMaterial& material,const gx::DrawUniform& uniforms) {
@@ -343,7 +484,6 @@ uint32_t texture_mask(const gx::TevMaterial& material,const gx::DrawUniform& uni
     }
     return mask;
 }
-uint32_t producer() { return scheduler->in_irq() ? UINT32_MAX : uint32_t(scheduler->current()->id); }
 // Position and texture loads share XF rows; selectors may start inside another loaded matrix.
 void matrix_rows(TextureMatrices& matrices,gx::Transforms* positions,uint32_t id,const TextureMatrix& matrix,uint32_t rows) {
     constexpr TextureMatrix identity{{{1,0,0,0},{0,1,0,0},{0,0,1,0}}};
@@ -357,12 +497,12 @@ void matrix_rows(TextureMatrices& matrices,gx::Transforms* positions,uint32_t id
         positions->position_rows[row]=matrix[row-id]; positions->loaded_rows.set(row);
     }
 }
-gx::PositionMatrix position_matrix(uint32_t address) {
+gx::PositionMatrix position_matrix(uint32_t address) {   // front (immediate loads) and builder (indexed loads)
     memory.read(address,48);
     gx::PositionMatrix result{};
     for (size_t r=0;r<3;++r) for (size_t col=0;col<4;++col) result[r][col]=std::bit_cast<float>(read32(address+uint32_t(r*16+col*4)));
-    static unsigned reported=0;   // guest thread only
-    if (reported<8 && std::any_of(result.begin(),result.end(),[](const auto& row){ return !std::isfinite(row[0]) || !std::isfinite(row[1]) || !std::isfinite(row[2]) || !std::isfinite(row[3]); })) {
+    static std::atomic<unsigned> reported{0};
+    if (reported.load(std::memory_order_relaxed)<8 && std::any_of(result.begin(),result.end(),[](const auto& row){ return !std::isfinite(row[0]) || !std::isfinite(row[1]) || !std::isfinite(row[2]) || !std::isfinite(row[3]); })) {
         ++reported; std::fprintf(stderr,"[gx] guest loaded a non-finite position matrix from %08X (the hardware drops the vertices it transforms)\n",address);
     }
     return result;
@@ -406,34 +546,32 @@ bool apply_bp(gx::DrawUniform& target,uint32_t reg,uint32_t data) {
 }
 // BP state set by a replaced SDK call: emit the word the SDK writes, then apply it natively (into a recording too, as the SDK does).
 void native_bp(uint32_t word) {
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word);
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word);
     const uint32_t reg=word>>24,data=word&0xFFFFFF;
-    if(apply_bp(color_uniforms,reg,data)) {
-        dirty_material();
-        if(reg>=0x10 && reg<=0x1F) indirect_stages[reg-0x10]=data;
-        if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::BpRegister{reg,data});
+    if((reg>=0xEE && reg<=0xF2) || (reg>=0x06 && reg<=0x0E) || reg==0x27 || reg==0x25 || reg==0x26 || (reg>=0x10 && reg<=0x1F)) {   // the registers apply_bp keeps
+        const bool push=front_list && !front_list->overflow;
+        back([reg,data,push] {
+            apply_bp(color_uniforms,reg,data);
+            dirty_material();
+            if(reg>=0x10 && reg<=0x1F) indirect_stages[reg-0x10]=data;
+            if(brec && push) brec->native.geometry.push_back(Resource::BpRegister{reg,data});
+        });
     }
-}
-bool recording_primitive() {
-    if (!recording || recording->native.geometry.empty()) return false;
-    auto* draw=recorded_draw(recording->native.geometry.back());
-    return draw && draw->filled<draw->expected;
 }
 // The part of a snapshot that the SDK block decides: culling, viewport, scissor, vertex descriptors and attribute formats. The vertex arrays (and the
 // rest of the host state) are not part of it; they are applied fresh on every call.
-struct StateCache { bool valid=false; uint32_t sdk=0; std::array<std::byte,kSdkSpan> raw; gx::State derived; };
-StateCache state_cache;
-void derive_state(uint32_t sdk, gx::State& result) {
-    uint32_t low = read32(sdk + 0x14), high = read32(sdk + 0x18);
-    result.cull=uint8_t((read32(sdk+0x254)>>14)&3);
+void derive_state(const SdkBlock& block, gx::State& result) {
+    auto word=[&](uint32_t offset) { return block.word(offset); };
+    uint32_t low = word(0x14), high = word(0x18);
+    result.cull=uint8_t((word(0x254)>>14)&3);
     std::array<float,6> viewport{};
-    for(uint32_t i=0;i<6;++i) viewport[i]=std::bit_cast<float>(read32(sdk+0x544+i*4));
+    for(uint32_t i=0;i<6;++i) viewport[i]=std::bit_cast<float>(word(0x544+i*4));
     if(viewport[2]!=0 || viewport[3]!=0) {
         for(auto value:viewport) if(!std::isfinite(value)) throw std::invalid_argument("nonfinite native viewport");
         if(viewport[2]<=0 || viewport[3]<=0 || viewport[4]<0 || viewport[4]>1 || viewport[5]<0 || viewport[5]>1) throw std::invalid_argument("invalid native viewport extent/depth");
         result.viewport=viewport;
     }
-    const auto top=read32(sdk+0x148),bottom=read32(sdk+0x14C);
+    const auto top=word(0x148),bottom=word(0x14C);
     if((top>>24)==0x20 && (bottom>>24)==0x21) {
         const auto left=int32_t((top>>12)&2047)-342,upper=int32_t(top&2047)-342;
         const auto right=int32_t((bottom>>12)&2047)-342,lower=int32_t(bottom&2047)-342;
@@ -444,9 +582,9 @@ void derive_state(uint32_t sdk, gx::State& result) {
     for (size_t i = 0; i < 4; ++i) result.descriptors[9 + i] = gx::Mode((low >> (9 + i * 2)) & 3);
     for (size_t i = 0; i < 8; ++i) result.descriptors[13 + i] = gx::Mode((high >> (i * 2)) & 3);
     for (size_t vat = 0; vat < 8; ++vat) {
-        uint32_t a = read32(sdk + 0x1C + uint32_t(vat * 4));
-        uint32_t b = read32(sdk + 0x3C + uint32_t(vat * 4));
-        uint32_t c = read32(sdk + 0x5C + uint32_t(vat * 4));
+        uint32_t a = word(0x1C + uint32_t(vat * 4));
+        uint32_t b = word(0x3C + uint32_t(vat * 4));
+        uint32_t c = word(0x5C + uint32_t(vat * 4));
         auto& formats = result.formats[vat];
         formats[9] = {gx::Type((a >> 1) & 7), uint8_t(2 + (a & 1)), uint8_t((a >> 4) & 31)};
         formats[10] = {gx::Type((a >> 10) & 7), uint8_t((a & 512) ? 9 : 3), 0, gx::Color::rgba8, bool(a >> 31)};
@@ -471,38 +609,50 @@ void apply_derived(gx::State& result, const gx::State& d) {
         for (size_t attr = 13; attr < 21; ++attr) to[attr] = from[attr];
     }
 }
-gx::State snapshot(ppc::Ctx& ctx) {
-    const uint32_t sdk = read32(ctx.r[2] - 8968);
-    const auto block = memory.read(sdk, 0x600);
-    // Only derive_state's inputs invalidate this cache; dirty flags, textures and matrices share the SDK block.
-    if (state_cache.valid && state_cache.sdk == sdk
-        && std::memcmp(block.data() + 0x14, state_cache.raw.data() + 0x14, 0x68) == 0
-        && std::memcmp(block.data() + 0x148, state_cache.raw.data() + 0x148, 8) == 0
-        && std::memcmp(block.data() + 0x254, state_cache.raw.data() + 0x254, 4) == 0
-        && std::memcmp(block.data() + 0x544, state_cache.raw.data() + 0x544, 24) == 0) ++cache_stat[0];
+// derive_state's inputs in the block: only these invalidate a derived state (dirty flags, textures and matrices share the SDK block).
+bool same_derive_inputs(const SdkBlock& a,const SdkBlock& b) {
+    return a.address==b.address && std::memcmp(a.bytes.data()+0x14,b.bytes.data()+0x14,0x68)==0 && std::memcmp(a.bytes.data()+0x148,b.bytes.data()+0x148,8)==0
+        && std::memcmp(a.bytes.data()+0x254,b.bytes.data()+0x254,4)==0 && std::memcmp(a.bytes.data()+0x544,b.bytes.data()+0x544,24)==0;
+}
+struct StateCache { bool valid=false; SdkRef block; gx::State derived; };
+StateCache state_cache;
+gx::State snapshot(const SdkRef& sdk_block,uint32_t lr) {
+    if (state_cache.valid && (state_cache.block==sdk_block || same_derive_inputs(*state_cache.block,*sdk_block))) ++cache_stat[0];
     else {
         ++cache_stat[1]; state_cache.valid = false;
         gx::State fresh;
-        derive_state(sdk, fresh);
-        state_cache.derived = fresh; state_cache.sdk = sdk; std::memcpy(state_cache.raw.data(), block.data(), kSdkSpan); state_cache.valid = true;
+        derive_state(*sdk_block, fresh);
+        state_cache.derived = fresh; state_cache.block = sdk_block; state_cache.valid = true;
     }
-    gx::State result = recording ? recording->input_state : state;
+    gx::State result = brec ? brec->input_state : state;
     apply_derived(result, state_cache.derived);
     if (cache_verify) {
-        gx::State reference = recording ? recording->input_state : state;
-        gx::State check; derive_state(sdk, check); apply_derived(reference, check);
+        gx::State reference = brec ? brec->input_state : state;
+        gx::State check; derive_state(*sdk_block, check); apply_derived(reference, check);
         if (!(reference.cull == result.cull && reference.descriptors == result.descriptors && reference.formats == result.formats && reference.viewport == result.viewport && reference.scissor == result.scissor && reference.arrays == result.arrays) && cache_mismatches++ < 8)
-            std::fprintf(stderr, "[gx-cache] state snapshot differs at callsite %08X\n", ctx.lr);
+            std::fprintf(stderr, "[gx-cache] state snapshot differs at callsite %08X\n", lr);
     }
     return result;
 }
-const Resource& checked_resource(uint32_t address,uint32_t length) {
+// Front: the descriptors and formats a draw issued now has (what its encoded size depends on), and derive_state's errors at the same call.
+// The host part of a snapshot (vertex arrays, the formats derive_state leaves alone) never changes them: those formats keep their defaults.
+const gx::State& front_state(const SdkRef& block) {
+    if (!front_derived_block || (front_derived_block!=block && !same_derive_inputs(*front_derived_block,*block))) {
+        gx::State fresh;
+        derive_state(*block, fresh);
+        gx::State result; apply_derived(result, fresh);
+        front_derived = result; front_derived_block = block;
+    } else front_derived_block = block;
+    return front_derived;
+}
+// Front: a display list's recorded bytes, compared against guest memory only when a store touched the pages since the last comparison, and
+// anyway every 256th use.
+const FrontResource& checked_resource(uint32_t address,uint32_t length) {
     const auto bytes=memory.read(address,length);
-    auto found=resources.find(address & 0x3FFFFFFF);
-    // Compared against guest memory only when a store touched the pages since the last comparison, and anyway every 256th use.
-    const bool known=found!=resources.end() && found->second->bytes.size()==length;
+    auto found=front_resources.find(address & 0x3FFFFFFF);
+    const bool known=found!=front_resources.end() && found->second->length==length;
     const bool clean=known && found->second->skips<256 && !gx::written_since(address,length,found->second->stamp);
-    if (known && !clean && gx::same_bytes(bytes,found->second->bytes)) { found->second->stamp=gx::watch_stamp(); found->second->skips=0; }
+    if (known && !clean && gx::same_bytes(bytes,std::span<const std::byte>(found->second->bytes->data(),length))) { found->second->stamp=gx::watch_stamp(); found->second->skips=0; }
     else if (clean) ++found->second->skips;
     else {
         std::fprintf(stderr,"[native-resource-missing] address %08X length %u prefix",address,length);
@@ -512,9 +662,18 @@ const Resource& checked_resource(uint32_t address,uint32_t length) {
     }
     return *found->second;
 }
-std::shared_ptr<const PaletteData> load_palette(const PaletteSource& source) {
+// Builder: the recording the front checked for this call.
+const Resource& back_resource(uint32_t address,uint32_t length) {
+    const auto found=resources.find(address & 0x3FFFFFFF);
+    if (found==resources.end() || found->second->length!=length) throw gx::Error(gx::ErrorCode::layout,address,length,1);   // the front checked it: the two sides disagree
+    return *found->second;
+}
+void check_palette(const PaletteSource& source) {
     if (!source.entries || source.entries>16384 || uint32_t(source.format)>2)
         throw gx::TextureError(gx::TextureErrorCode::descriptor,"invalid native palette descriptor");
+}
+std::shared_ptr<const PaletteData> load_palette(const PaletteSource& source) {
+    check_palette(source);
     auto bytes=memory.read(source.address,source.entries*2);
     return std::make_shared<const PaletteData>(PaletteData{source.format,{bytes.begin(),bytes.end()}});
 }
@@ -550,12 +709,54 @@ std::shared_ptr<const gx::TexturePixels> snapshot_texture(const std::optional<Te
     texture_decodes=texture_cache.decodes(); texture_evictions=texture_cache.evictions(); texture_resident=texture_cache.resident_bytes();
     return result;
 }
+// The front's view of the state the reticle and prompt handling of a sealed packet reads (the pointer the game consumed when it drew it).
+struct SealInputs {
+    std::array<float,2> aim_consumed{};
+    std::array<std::optional<std::array<float,2>>,2> consumed{};
+    unsigned channel=0;
+    bool exact=false;
+    gx::ReticleStyle style;
+};
+SealInputs seal_inputs() {
+    SealInputs inputs;
+    inputs.aim_consumed=uc::input_consumed_aim();
+    inputs.consumed={uc::input_consumed_aim_of(0),uc::input_consumed_aim_of(1)};
+    inputs.channel=uc::input_aim_channel();
+    inputs.exact=uc::input_aim_exact() || !uc::input_demo_playing();
+    inputs.style=gx::reticle_style();
+    return inputs;
+}
+bool decoded_still_valid(const RecordedDraw& draw,const gx::State& layout) {
+    const auto* cached=draw.decoded.get();
+    if(!cached || cached->uses>=256) return false;
+    for(size_t attr=9;attr<21;++attr) {
+        const auto mode=layout.descriptors[attr];
+        if((mode==gx::Mode::index8 || mode==gx::Mode::index16) && !(cached->arrays[attr-9]==layout.arrays[attr-9])) return false;
+    }
+    for(const auto& range:cached->sources) if(range && gx::written_since(range->address,range->size,cached->stamp)) return false;
+    return true;
+}
+// A new recording of the list at the same address takes over the decodes of the earlier recording's draws that decode the same.
+void inherit_decodes(Resource& fresh,const Resource& previous) {
+    size_t at=0;
+    for(auto& item:fresh.geometry) {
+        auto* draw=recorded_draw(item);
+        if(!draw) continue;
+        while(at<previous.geometry.size() && !recorded_draw(previous.geometry[at])) ++at;
+        if(at==previous.geometry.size()) return;
+        const auto& old=*recorded_draw(previous.geometry[at++]);
+        if(!old.decoded || old.primitive!=draw->primitive || old.vat!=draw->vat || old.count!=draw->count || old.expected!=draw->expected) continue;
+        if(old.state.descriptors!=draw->state.descriptors || !(old.state.formats[draw->vat]==draw->state.formats[draw->vat])) continue;
+        if(std::memcmp(previous.list_bytes->data()+old.offset,fresh.list_bytes->data()+draw->offset,draw->expected)!=0) continue;
+        draw->decoded=old.decoded;
+    }
+}
 void import_resource(uint32_t address,uint32_t length,gx::State& bindings,gx::Transforms& transform_state,CopyState& copy,TextureBindings& textures,Palettes& loaded,gx::BlendState& blend,gx::DrawUniform& colors,TextureMatrices& matrices,MatrixIndices& indices,Imported& imported,CopiedTextures& versions,std::vector<uint32_t>& path) {
     const uint32_t physical=address & 0x3FFFFFFF;
     // shortcut: nesting capped at64; replace traversal if a verified deeper native asset appears (TD-032).
     if (path.size()==64 || std::find(path.begin(),path.end(),physical)!=path.end())
         throw gx::Error(gx::ErrorCode::sequence,address,64,path.size());
-    const auto& resource=checked_resource(address,length);
+    const auto& resource=back_resource(address,length);
     path.push_back(physical);
     for (const auto& item : resource.geometry) {
         if (const auto* source=recorded_draw(item)) {
@@ -564,12 +765,37 @@ void import_resource(uint32_t address,uint32_t length,gx::State& bindings,gx::Tr
             layout.arrays=bindings.arrays;
             const auto& shared_layout=gx::share(import_state,layout);
             ++list_stat[0]; list_stat[1]+=source->count;
-            gx::Vertices vertices(memory);
-            vertices.begin(shared_layout,source->primitive,source->vat,source->count,producer(),source->callsite,replaying);
-            vertices.write_attribute(producer(),source->payload);
-            auto draw=vertices.take_draw();
-            // Replay retains geometry validation and GX state commands, but publishes no graphics.
-            if(replaying) { add_guest_stat(vertex_count,vertices.vertex_count()); add_guest_stat(draw_count,1); continue; }
+            gx::DrawPacket draw;
+            if(!replaying && decoded_still_valid(*source,layout)) {
+                auto& cached=*source->decoded; ++cached.uses; add_guest_stat(list_reuses,1);
+                draw.callsite=source->callsite; draw.primitive=source->primitive; draw.vat=source->vat; draw.state=shared_layout;
+                draw.vertices=cached.vertices; draw.indices=cached.indices;
+                if(cache_verify) {   // UC_GX_CACHE_VERIFY: the reused decode must equal a fresh one
+                    gx::Vertices fresh(memory);
+                    fresh.begin(shared_layout,source->primitive,source->vat,source->count,0,source->callsite);
+                    fresh.write_attribute(0,std::span<const std::byte>(resource.list_bytes->data()+source->offset,source->expected));
+                    const auto check=fresh.take_draw();
+                    bool same=check.indices==draw.indices && check.vertices.size()==draw.vertices.size();
+                    for(size_t i=0;same && i<check.vertices.size();++i) {
+                        const auto& a=check.vertices[i]; const auto& b=draw.vertices[i];
+                        same=!std::memcmp(&a.position,&b.position,sizeof a.position) && !std::memcmp(&a.normal,&b.normal,sizeof a.normal) && a.color==b.color
+                            && !std::memcmp(&a.texcoord,&b.texcoord,sizeof a.texcoord) && a.position_matrix==b.position_matrix && a.texture_matrix==b.texture_matrix;
+                    }
+                    if(!same && cache_mismatches++<8) std::fprintf(stderr,"[gx-cache] reused display-list decode differs at callsite %08X list %08X\n",source->callsite,address);
+                }
+            } else {
+                gx::Vertices vertices(memory,!replaying);
+                vertices.begin(shared_layout,source->primitive,source->vat,source->count,0,source->callsite,replaying);
+                vertices.write_attribute(0,std::span<const std::byte>(resource.list_bytes->data()+source->offset,source->expected));
+                draw=vertices.take_draw();
+                // Replay retains geometry validation and GX state commands, but publishes no graphics.
+                if(replaying) { add_guest_stat(vertex_count,vertices.vertex_count()); add_guest_stat(draw_count,1); continue; }
+                auto cached=std::make_shared<DecodedDraw>();
+                std::copy(layout.arrays.begin(),layout.arrays.begin()+12,cached->arrays.begin());
+                cached->sources=vertices.sources(); cached->stamp=gx::verified_stamp();
+                cached->vertices=draw.vertices; cached->indices=draw.indices;
+                source->decoded=std::move(cached); add_guest_stat(list_decodes,1);
+            }
             draw.transforms=gx::share(import_transforms,transform_state);
             draw.texture=snapshot_texture(textures[0],loaded,versions);
             const auto maps=texture_mask(source->material,source->uniforms);
@@ -628,40 +854,82 @@ void import_resource(uint32_t address,uint32_t length,gx::State& bindings,gx::Tr
     }
     path.pop_back();
 }
-uint64_t submit_batch(bool present,bool clear,uint32_t xfb=0,std::optional<gx::TextureCopy> texture_copy={},std::array<uint32_t,4> display_source={0,0,640,480},bool black=false) {
-    if (!packets) return 0;
-    try {
-        gx::FramePacket frame{0,std::move(draws),present,clear,copy_state.color,copy_state.depth,xfb,std::move(texture_copy),display_source};
-        frame.black_output=black;
-        frame.replay=replaying;
-        frame.aim_consumed=uc::input_consumed_aim();
-        gx::mark_reticle_draws(frame.draws,{uc::input_consumed_aim_of(0),uc::input_consumed_aim_of(1)},uc::input_aim_channel(),uc::input_aim_exact() || !uc::input_demo_playing());
-        gx::apply_reticle_style(frame.draws,gx::reticle_style(),uc::input_aim_channel(),uc::input_consumed_aim_of(1).has_value());   // the menu's Reticle tab
-        for(auto& draw:frame.draws) {
-            if(draw.late_aim) continue;
-            if(profile_mesh && gx::reticle_callsite(draw.callsite) && draw.texture && !draw.texture->levels.empty()) {   // another weapon's reticle texture would show up here
-                static std::set<uint64_t> reported; const auto& level=draw.texture->levels[0];
-                if(reported.insert(uint64_t(draw.callsite)<<32|level.width<<16|level.height).second) std::fprintf(stderr,"[late-aim] reticle callsite %08X draws a %ux%u texture that is not shifted\n",draw.callsite,level.width,level.height);
-            }
-        }
-        if(frame.texture_copy && clear) {
-            // The copy erases the EFB: prompts drawn so far leave with it, originals stay in the copied texture.
-            carried_prompts.clear();
-            for(const auto& draw:frame.draws)if(draw.native_prompt)++prompt_fallback;
-        } else {
-            // EFB content persists across DrawDone/non-clearing copies until the display copy presents it.
-            for(auto& draw:frame.draws)if(draw.native_prompt)carried_prompts.push_back(std::move(*draw.native_prompt));
-            std::erase_if(frame.draws,[](const auto& draw){return draw.native_prompt.has_value();});
-            if(present) {prompt_present+=carried_prompts.size();frame.prompts=std::move(carried_prompts);carried_prompts.clear();}
-        }
-        ++prompt_batch;
-        const uint64_t serial=packets->seal_batch(std::move(frame));
-        draws=gx::DrawQueue{}; return serial;
-    } catch (const gx::Error& error) {
-        if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{};
-        throw;
+// UC_GX_PACKET_HASH=1 (diagnostics): one "[gx-hash]" line per sealed packet, a hash of what the renderer receives (draw geometry, state,
+// transforms, uniforms, material, textures by size, the packet's own fields; =2 adds the decoded texels). A deterministic replay prints the
+// same lines with the builder thread and without it (UC_GX_SYNC=1) unless the builder read guest memory the guest had changed meanwhile.
+const int packet_hash=[] { const char* value=std::getenv("UC_GX_PACKET_HASH"); return value ? std::atoi(value) : 0; }();
+struct Fnv {
+    uint64_t h=1469598103934665603ull;
+    void bytes(const void* data,size_t size) { auto* p=static_cast<const uint8_t*>(data); for(size_t i=0;i<size;++i) { h^=p[i]; h*=1099511628211ull; } }
+    template<class T> void value(const T& v) { static_assert(std::is_trivially_copyable_v<T>); bytes(&v,sizeof v); }
+};
+void hash_packet(const gx::FramePacket& frame,uint64_t serial) {
+    Fnv f;
+    f.value(frame.present); f.value(frame.clear_after_copy); f.value(frame.clear_color); f.value(frame.clear_depth); f.value(frame.xfb);
+    f.value(frame.display_source); f.value(frame.black_output); f.value(frame.replay); f.value(frame.prompts.size());
+    if(frame.texture_copy) { f.value(frame.texture_copy->source); f.value(frame.texture_copy->target->guest_address); }
+    auto texture=[&](const std::shared_ptr<const gx::TexturePixels>& pixels) {
+        if(!pixels) { f.value(0); return; }
+        f.value(pixels->gpu_only); f.value(pixels->guest_address); f.value(pixels->desc_width); f.value(pixels->desc_height);
+        if(packet_hash>1 && !pixels->gpu_only) { pixels->wait(); for(const auto& level:pixels->levels) { f.value(level.width); f.value(level.height); f.bytes(level.rgba.data(),level.rgba.size()); } }
+    };
+    for(const auto& draw:frame.draws) {
+        f.value(draw.callsite); f.value(draw.primitive); f.value(draw.vat);
+        const auto& s=*draw.state;
+        f.value(s.cull); f.value(s.descriptors); f.value(s.formats);
+        for(const auto& array:s.arrays) { f.value(array.address); f.value(array.stride); }
+        f.value(s.viewport.has_value()); if(s.viewport) f.value(*s.viewport);
+        f.value(s.scissor.has_value()); if(s.scissor) f.value(*s.scissor);
+        for(const auto& v:draw.vertex_view()) { f.value(v.position); f.value(v.normal); f.value(v.color); f.value(v.texcoord); f.value(v.position_matrix); f.value(v.texture_matrix); }
+        const auto indices=draw.index_view(); f.bytes(indices.data(),indices.size_bytes());
+        const auto& t=*draw.transforms;
+        f.value(t.projection); f.value(t.position_rows); f.value(t.loaded_rows.to_ullong()); f.value(t.current); f.value(t.normal_rows); f.value(t.loaded_normal_rows.to_ullong());
+        f.value(*draw.uniforms); f.value(draw.material); f.value(draw.blend); f.value(draw.texture_wrap);
+        if(draw.texture_bank) f.value(draw.texture_bank->rows);
+        texture(draw.texture); for(const auto& map:draw.texture_maps) texture(map);
+        f.value(draw.reticle); f.value(draw.late_aim); f.value(draw.layer); f.value(draw.wake);
     }
+    std::fprintf(stderr,"[gx-hash] serial %llu draws %zu hash %016llX\n",(unsigned long long)serial,frame.draws.size(),(unsigned long long)f.h);
 }
+// Builder: seals the draws so far into a packet (the front predicted its serial).
+uint64_t submit_batch(const SealInputs& inputs,bool present,bool clear,uint32_t xfb=0,std::optional<gx::TextureCopy> texture_copy={},std::array<uint32_t,4> display_source={0,0,640,480},bool black=false) {
+    if (!packets) return 0;
+    gx::FramePacket frame{0,std::move(draws),present,clear,copy_state.color,copy_state.depth,xfb,std::move(texture_copy),display_source};
+    frame.black_output=black;
+    frame.replay=replaying;
+    frame.aim_consumed=inputs.aim_consumed;
+    gx::mark_reticle_draws(frame.draws,inputs.consumed,inputs.channel,inputs.exact);
+    gx::apply_reticle_style(frame.draws,inputs.style,inputs.channel,inputs.consumed[1].has_value());   // the menu's Reticle tab
+    for(auto& draw:frame.draws) {
+        if(draw.late_aim) continue;
+        if(profile_mesh && gx::reticle_callsite(draw.callsite) && draw.texture && !draw.texture->levels.empty()) {   // another weapon's reticle texture would show up here
+            static std::set<uint64_t> reported; const auto& level=draw.texture->levels[0];
+            if(reported.insert(uint64_t(draw.callsite)<<32|level.width<<16|level.height).second) std::fprintf(stderr,"[late-aim] reticle callsite %08X draws a %ux%u texture that is not shifted\n",draw.callsite,level.width,level.height);
+        }
+    }
+    if(frame.texture_copy && clear) {
+        // The copy erases the EFB: prompts drawn so far leave with it, originals stay in the copied texture.
+        carried_prompts.clear();
+        for(const auto& draw:frame.draws)if(draw.native_prompt)++prompt_fallback;
+    } else {
+        // EFB content persists across DrawDone/non-clearing copies until the display copy presents it.
+        for(auto& draw:frame.draws)if(draw.native_prompt)carried_prompts.push_back(std::move(*draw.native_prompt));
+        std::erase_if(frame.draws,[](const auto& draw){return draw.native_prompt.has_value();});
+        if(present) {prompt_present+=carried_prompts.size();frame.prompts=std::move(carried_prompts);carried_prompts.clear();}
+    }
+    ++prompt_batch;
+    if(packet_hash) hash_packet(frame,back_serial+1);
+    const uint64_t serial=packets->seal_batch(std::move(frame));
+    draws=gx::DrawQueue{};
+    if(serial!=++back_serial) {
+        static bool reported=false;
+        if(!reported) { reported=true; std::fprintf(stderr,"[gx-builder] sealed packet %llu where %llu was expected\n",(unsigned long long)serial,(unsigned long long)back_serial); }
+        back_serial=serial;
+    }
+    return serial;
+}
+// Front: the serial of the next packet the builder seals.
+uint64_t next_seal() { if (!packets) return 0; return ++front_serial; }
 void post_finish(uc::Sched* sched, uint64_t serial,uint64_t generation) {
     sched->post_external([sched, serial] {
         auto found = finishes.find(serial);
@@ -676,19 +944,27 @@ void post_finish(uc::Sched* sched, uint64_t serial,uint64_t generation) {
     },uc::Sched::EventKind::Gx,generation);
 }
 void request_finish(ppc::Ctx& ctx) {
-    if (recording) throw gx::Error(gx::ErrorCode::sequence,0x802848AC,0,1);
-    capture->finish();
+    if (front_list) throw gx::Error(gx::ErrorCode::sequence,0x802848AC,0,1);
+    finish_primitive();
     auto& sched = *scheduler;
     bool interrupts = sched.set_interrupts(false);
     memory.read(ctx.r[13] - 25328, 1);
     ppc::wr8(ctx, ctx.r[13] - 25328, 0);
     if (packets) {
-        const uint64_t serial=submit_batch(false,false);
+        // Registered before the builder can seal the packet: its completion always finds the request (det_early stays the race of the
+        // unthreaded builder, whose seal happens right here).
+        const uint64_t serial=next_seal();
         finishes.emplace(serial,ctx.r[13]); ++submitted;
+        bool early=false;
+        if(!packets->detached() && sched.deterministic()) {
+            std::lock_guard lock(det_finish_m);
+            if(queue.threaded()) { det_early.erase(det_early.begin(),det_early.lower_bound(serial)); det_finishes.emplace(serial,sched.async_begin()); }
+        }
+        back([inputs=seal_inputs()] { submit_batch(inputs,false,false); });
         if(packets->detached()) {
+            drain();   // network play delivers the draw-done at once: the builder must have read what this frame drew before the guest reuses it
             post_finish(&sched,serial,sched.generation());
-        } else if(sched.deterministic()) {
-            bool early;
+        } else if(sched.deterministic() && !queue.threaded()) {
             { std::lock_guard lock(det_finish_m); early=det_early.erase(serial)>0; det_early.erase(det_early.begin(),det_early.lower_bound(serial)); if(!early) det_finishes.emplace(serial,sched.async_begin()); }
             if(early) post_finish(&sched,serial,sched.generation());
         }
@@ -697,8 +973,101 @@ void request_finish(ppc::Ctx& ctx) {
     sched.set_interrupts(interrupts);
 }
 }
+namespace {
+// ================= Builder: the commands of the draw entry points =================
+// GXBegin outside a display list: the snapshots a live primitive draws with (the front sends the bytes when the last one arrived).
+void live_begin(const SdkRef& block,uint8_t primitive,uint8_t vat,uint16_t count,uint32_t who,uint32_t callsite,uint32_t lr) {
+    capture->begin(gx::share(live_state,snapshot(block,lr)), primitive, vat, count, who, callsite,replaying);
+    if(replaying) return;
+    live_texture=snapshot_texture(bound_textures[0],palettes);
+    const auto [material,uniforms]=material_snapshot(block,lr);
+    live_material=material; gx::share(live_uniforms,uniforms);
+    live_texture_wrap=wraps(bound_textures);
+    live_texture_maps={};
+    const auto maps=texture_mask(material,uniforms);
+    for(uint32_t map=1;map<8;++map) if(maps&(1u<<map)) {
+        live_texture_maps[map-1]=snapshot_texture(bound_textures[map],palettes);
+    }
+    gx::share(live_transforms,transforms);
+    live_blend=blend_state;
+}
+void live_end(uint32_t who,std::span<const std::byte> bytes) {
+    capture->write_attribute(who,bytes);
+    auto draw = capture->take_draw(); add_guest_stat(vertex_count,capture->vertex_count()); add_guest_stat(draw_count,1);
+    if(replaying)return;
+    draw.transforms=live_transforms;
+    draw.texture=live_texture;
+    draw.material=live_material; draw.uniforms=live_uniforms; draw.texture_bank=texture_bank(*draw.state,texture_matrices);
+    draw.texture_maps=live_texture_maps;
+    draw.texture_wrap=live_texture_wrap;
+    draw.blend=live_blend;
+#ifdef UC_TRACE
+    static uint32_t movie_draw_logs=0;
+    if (draw.callsite==0x801619C4 && draw.texture && movie_draw_logs++<8) {
+        draw.texture->wait();
+        std::array<uint8_t,4> low{255,255,255,255},high{};
+        const auto& rgba=draw.texture->levels[0].rgba;
+        for (size_t i=0;i<rgba.size();++i) { low[i%4]=std::min(low[i%4],rgba[i]); high[i%4]=std::max(high[i%4],rgba[i]); }
+        std::fprintf(stderr,"[movie-draw] range %u:%u %u:%u %u:%u %u:%u blend %u %u %u mask %u\n",low[0],high[0],low[1],high[1],low[2],high[2],low[3],high[3],draw.blend.mode,draw.blend.source,draw.blend.destination,draw.blend.color_write);
+        for (const auto& v:draw.vertices) std::fprintf(stderr,"[movie-vertex] %.2f %.2f %.2f rgba %u %u %u %u uv %.3f %.3f mtx %u\n",v.position[0],v.position[1],v.position[2],v.color[0][0],v.color[0][1],v.color[0][2],v.color[0][3],v.texcoord[0][0],v.texcoord[0][1],v.position_matrix);
+    }
+#endif
+    draws.push_back(std::move(draw));
+}
+// GXBegin inside a display list: the recorded draw's state (its payload is the list's bytes from `offset`, known at GXEndDisplayList).
+void record_draw(const SdkRef& block,uint32_t lr,uint32_t callsite,uint8_t primitive,uint8_t vat,uint16_t count,size_t expected,size_t offset) {
+    auto recorded=std::make_unique<RecordedDraw>();   // filled in place: the ~5 KB of state are copied once
+    auto& draw=*recorded;
+    draw.state=snapshot(block,lr);
+    draw.expected=expected;
+    const auto snapped=material_snapshot(block,lr);
+    draw.callsite=callsite; draw.primitive=primitive; draw.vat=vat; draw.count=count;
+    draw.material=snapped.material; draw.uniforms=snapped.uniforms; draw.texture_selectors=texture_selectors(*block);
+    draw.offset=offset;
+    brec->native.geometry.push_back(std::move(recorded));
+}
+bool prompt_attach(uint64_t token,uint32_t who,uint32_t list,bool overflow,const uc::PromptDescription& description,bool compact) {
+    const auto& mark=prompt_marks[token%prompt_marks.size()];
+    if(mark.token!=token) return false;
+    const auto& checkpoint=mark.at;
+    if(checkpoint.batch!=prompt_batch || checkpoint.producer!=who)return false;
+    if(brec) {
+        auto& geometry=brec->native.geometry;
+        if(overflow || checkpoint.list!=list || geometry.size()<=checkpoint.recorded)return false;
+        RecordedDraw* quad=nullptr;
+        for(size_t i=checkpoint.recorded;i<geometry.size();++i)if(auto* draw=recorded_draw(geometry[i])) {
+            if(quad)return false; // More than one primitive: not a single glyph/picture quad.
+            quad=draw;
+        }
+        if(!quad || quad!=recorded_draw(geometry.back()) || quad->primitive!=0x80 || quad->count!=4)return false;
+        quad->prompt=description;quad->compact=compact;return true;
+    }
+    if(checkpoint.list || draws.size()!=checkpoint.draw+1)return false;
+    auto prompt=uc::prompt_from_quad(draws.back(),description);
+    if(!prompt)return false;
+    prompt->compact=compact;draws.back().native_prompt=std::move(*prompt);++prompt_annotations;
+    return true;
+}
+// Front: the write-watch counter is about to wrap: every cache of guest memory compares its bytes again.
+void reset_watch() {
+    drain();
+    gx::watch_reset();
+    for(auto& [address,resource]:front_resources) resource->skips=256;
+    back([] { texture_cache.clear(); mesh_index.clear(); mesh_cache.clear(); mesh_cache_bytes=0; });
+}
+void close_primitive() {
+    auto& prim=front_prim;
+    prim.active=false; uc::gx_fifo_window={};
+    if(prim.expected>gx::CommandQueue::kMaxBytes) {   // more than a chunk: the bytes travel in their own buffer
+        back([who=prim.producer,bytes=std::vector<std::byte>(prim.bytes.begin(),prim.bytes.begin()+std::ptrdiff_t(prim.expected))] { live_end(who,bytes); });
+        return;
+    }
+    try { queue.emit_bytes([who=prim.producer](std::span<const std::byte> bytes) { live_end(who,bytes); },prim.bytes.data(),uint32_t(prim.expected),front_stamp); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
+}
+}
 namespace uc {
-void gx_set_replaying(bool on) { replaying=on; }
+void gx_set_replaying(bool on) { back([on] { replaying=on; }); }
 struct GxSnapshot {
     std::shared_ptr<const gx::SceneSnapshot> scene;
     gx::State state;
@@ -725,12 +1094,16 @@ struct GxSnapshot {
     gx::Vertices vertices;
     gx::DrawQueue draws;
     std::map<uint32_t,std::shared_ptr<const Resource>> resources;
+    std::map<uint32_t,std::shared_ptr<const FrontResource>> front_resources;
     std::map<uint64_t,uint32_t> finishes;
     uint64_t prompt_batch;
     std::vector<gx::PromptDraw> prompts;
 };
 std::shared_ptr<const GxSnapshot> gx_checkpoint() {
-    if(!capture || capture->active() || recording)
+    if(front_prim.active || front_list)
+        throw std::logic_error("GX checkpoint inside a primitive or display-list recording");
+    drain();   // the builder's state is read below
+    if(!capture || capture->active() || brec)
         throw std::logic_error("GX checkpoint inside a primitive or display-list recording");
     std::lock_guard lock(det_finish_m);
     if(!det_finishes.empty()) throw std::logic_error("GX checkpoint has unfinished draw-done requests");
@@ -740,9 +1113,10 @@ std::shared_ptr<const GxSnapshot> gx_checkpoint() {
         live_uniforms,import_uniforms,mesh_uniforms_block,live_material,texture_matrices,matrix_indices,
         known_sdk,indirect_stages,palettes,bound_textures,live_texture_wrap,live_texture,live_texture_maps,
         copy_state,texture_copy_source,texture_copy_width,texture_copy_height,texture_copy_format,
-        copied_textures,*capture,draws,resources,finishes,prompt_batch,carried_prompts});
+        copied_textures,*capture,draws,resources,front_resources,finishes,prompt_batch,carried_prompts});
 }
 void gx_restore(const GxSnapshot& saved) {
+    drain();   // the builder is idle while its state is replaced
     std::lock_guard lock(det_finish_m);
     det_finishes.clear(); det_early.clear();
     if(saved.scene)packets->restore(*saved.scene);
@@ -756,54 +1130,52 @@ void gx_restore(const GxSnapshot& saved) {
     live_texture_wrap=saved.texture_wrap; live_texture=saved.texture; live_texture_maps=saved.texture_maps;
     copy_state=saved.copy; texture_copy_source=saved.copy_source; texture_copy_width=saved.copy_width;
     texture_copy_height=saved.copy_height; texture_copy_format=saved.copy_format; copied_textures=saved.copied;
-    capture=std::make_unique<gx::Vertices>(saved.vertices); recording.reset(); draws=saved.draws;
-    resources=saved.resources; finishes=saved.finishes; prompt_batch=saved.prompt_batch; carried_prompts=saved.prompts;
+    capture=std::make_unique<gx::Vertices>(saved.vertices); brec.reset(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={}; draws=saved.draws;
+    resources=saved.resources; front_resources=saved.front_resources; finishes=saved.finishes; prompt_batch=saved.prompt_batch; carried_prompts=saved.prompts;
     // State/material snapshots belong to the abandoned timeline.
     state_cache.valid=material_cache.valid=false; dirty_state(); dirty_material();
+    sdk_last.reset(); front_derived_block.reset();
     // Retain immutable decoded meshes; marked epochs force descriptor/source byte validation,
     // including RAM restored by bulk writes that bypass the guest store barrier.
     for(auto& epoch:gx::page_epoch) epoch=gx::write_epoch;
     gx::watch_stamp();
+    if(queue.threaded()) front_stamp=gx::watch_stamp();
 }
-bool gx_fifo_in_primitive() { return (capture && capture->active()) || recording_primitive(); }
-bool gx_fifo_recording() { return recording != nullptr; }
+bool gx_fifo_in_primitive() { return live_primitive() || recording_primitive(); }
+bool gx_fifo_recording() { return front_list != nullptr; }
+// The builder evaluates both in command order; the front's result only says the request was passed on (the caller logs rejections).
 GxPromptCheckpoint gx_prompt_checkpoint() {
-    if(recording)return {prompt_batch,draws.size(),producer(),recording->address,recording->native.geometry.size()};
-    return {prompt_batch,draws.size(),producer(),0,0};
+    const uint64_t token=++prompt_tokens;
+    const uint32_t who=producer(),list=front_list ? front_list->address : 0;
+    back([token,who,list] {
+        auto& mark=prompt_marks[token%prompt_marks.size()];
+        mark.token=token; mark.at={prompt_batch,draws.size(),who,list,brec ? brec->native.geometry.size() : 0};
+    });
+    return {token,0,who,list,0};
 }
 bool gx_prompt_attach(GxPromptCheckpoint checkpoint,const PromptDescription& description,bool compact) {
-    if(checkpoint.batch!=prompt_batch || checkpoint.producer!=producer())return false;
-    if(recording) {
-        auto& geometry=recording->native.geometry;
-        if(recording->overflow || checkpoint.list!=recording->address || geometry.size()<=checkpoint.recorded)return false;
-        RecordedDraw* quad=nullptr;
-        for(size_t i=checkpoint.recorded;i<geometry.size();++i)if(auto* draw=recorded_draw(geometry[i])) {
-            if(quad)return false; // More than one primitive: not a single glyph/picture quad.
-            quad=draw;
-        }
-        if(!quad || quad!=recorded_draw(geometry.back()) || quad->primitive!=0x80 || quad->count!=4)return false;
-        quad->prompt=description;quad->compact=compact;return true;
-    }
-    if(checkpoint.list || draws.size()!=checkpoint.draw+1)return false;
-    auto prompt=prompt_from_quad(draws.back(),description);
-    if(!prompt)return false;
-    prompt->compact=compact;draws.back().native_prompt=std::move(*prompt);++prompt_annotations;return true;
+    const uint32_t who=producer(),list=front_list ? front_list->address : 0;
+    const bool overflow=front_list && front_list->overflow;
+    if(!queue.threaded()) return prompt_attach(checkpoint.batch,who,list,overflow,description,compact);
+    back([token=checkpoint.batch,who,list,overflow,description,compact] { prompt_attach(token,who,list,overflow,description,compact); });
+    return true;
 }
-void gx_enable_async_textures() { texture_cache.set_async(true); }
+void gx_enable_async_textures() { back([] { texture_cache.set_async(true); }); }
 void gx_set_texture_budget(size_t bytes) { texture_cache.set_budget(bytes); }
-void gx_hle_init(Sched& sched, uint8_t* base, gx::Packets* queue, bool profile) {
+void gx_hle_init(Sched& sched, uint8_t* base, gx::Packets* packet_queue, bool profile) {
+    queue.stop();   // a builder from an earlier init ends after its commands ran
     replaying=false;
     prompt_batch=0;carried_prompts.clear();
     prompt_annotations=prompt_present=prompt_fallback=0;
-    profile_mesh=profile; mesh_profile_count=0;
+    profile_mesh=profile; mesh_profile_count=0; mesh_dumps=0; mesh_dumps_seen=0; mesh_dumps_settled=false;
     prompt_color_logs=0;
     copy_profile_count=0;
     channel_profile_count=0;
     texgen_profile_count=0;
-    scheduler = &sched; packets = queue;
+    scheduler = &sched; packets = packet_queue;
     memory = {{reinterpret_cast<const std::byte*>(base), 24u << 20}, {reinterpret_cast<const std::byte*>(base + 0x10000000), 64u << 20}, {reinterpret_cast<const std::byte*>(base + 0x20000000), 0x4000}};
     dirty_state(); dirty_material();
-    state = {}; transforms={}; live_transforms=gx::Transforms{}; import_transforms=gx::Transforms{}; mesh_transforms_block=gx::Transforms{}; live_state=gx::State{}; import_state=gx::State{}; mesh_state=gx::State{}; import_uniforms=gx::DrawUniform{}; mesh_uniforms_block=gx::DrawUniform{}; draws.clear(); finishes.clear(); resources.clear(); recording.reset(); capture = std::make_unique<gx::Vertices>(memory);
+    state = {}; transforms={}; live_transforms=gx::Transforms{}; import_transforms=gx::Transforms{}; mesh_transforms_block=gx::Transforms{}; live_state=gx::State{}; import_state=gx::State{}; mesh_state=gx::State{}; import_uniforms=gx::DrawUniform{}; mesh_uniforms_block=gx::DrawUniform{}; draws.clear(); finishes.clear(); resources.clear(); brec.reset(); capture = std::make_unique<gx::Vertices>(memory);
     copy_state={}; copies=0;
     texture_copy_source={}; texture_copy_width=texture_copy_height=0; texture_copy_format=6; copied_textures.clear();
     texture_cache.clear(); texture_decodes=0;
@@ -811,8 +1183,33 @@ void gx_hle_init(Sched& sched, uint8_t* base, gx::Packets* queue, bool profile) 
     blend_state={}; live_blend={}; color_uniforms={}; live_uniforms=gx::DrawUniform{}; live_material={}; texture_matrices={}; matrix_indices={}; indirect_stages={};
     bound_textures={}; palettes.clear(); live_texture.reset(); live_texture_maps={};
     draw_count = 0; vertex_count = 0; submitted = 0; completed = 0; outside_bytes = 0;
+    state_cache={}; material_cache={};
+    known_sdk=0; front_resources.clear(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={};
+    sdk_last.reset(); front_derived_block.reset();
+    { std::lock_guard lock(det_finish_m); det_finishes.clear(); det_early.clear(); }
+    front_serial=back_serial=packets ? packets->next_serial()-1 : 0;
+    front_stamp=0; prompt_tokens=0; prompt_marks={};
 }
-static void store_guest_word(uint32_t address,uint32_t value) {
+void gx_enable_builder() {
+    if(std::getenv("UC_GX_SYNC")) { std::fprintf(stderr,"[gx-builder] off (UC_GX_SYNC): the guest thread builds the draws\n"); return; }
+    front_stamp=gx::watch_stamp();
+    queue.start([] {
+        host_thread_mark_guest();   // the headset registers it with the XR runtime as one of the application's main threads
+#if defined(__APPLE__)
+        pthread_setname_np("gx-builder");
+#elif defined(__linux__)
+        pthread_setname_np(pthread_self(),"gx-builder");
+#endif
+    },[] {
+        // The guest thread may be blocked (waiting for a draw-done the failed builder never seals): an event rethrows the error there.
+        if(scheduler) scheduler->post_external([] { builder_failed(); },uc::Sched::EventKind::Gx);
+    });
+}
+void gx_stop_builder() { queue.stop(); }
+void gx_sync() { if(queue.threaded()) drain(); }
+}
+namespace {
+void store_guest_word(uint32_t address,uint32_t value) {
     const size_t physical=address & 0x3FFFFFFF;
     if(physical+4>memory.mem1.size()) return;
     auto* host=const_cast<std::byte*>(memory.mem1.data())+physical;
@@ -822,7 +1219,7 @@ static void store_guest_word(uint32_t address,uint32_t value) {
 // A raw "call display list" command (0x40, address, length) written straight to the FIFO, as the game's texgen/setup appliers do instead of GXCallDisplayList.
 // The hardware executes it; here the XF texgen words it loads (0x1040+n control, 0x1050+n dual-texture post) are written into the SDK block, which the native
 // texgen reads, so the display list wins until the guest sets that texgen again. Other commands of the list are not interpreted (counted for the log).
-static void raw_display_list(uint32_t address,uint32_t length) {
+void raw_display_list(uint32_t address,uint32_t length) {
     static uint32_t ignored_reports=0;
     if(!known_sdk || length>4096 || (address&3)) return;
     const auto bytes=memory.read(address,length);
@@ -838,7 +1235,7 @@ static void raw_display_list(uint32_t address,uint32_t length) {
                 const uint32_t r=reg+i;
                 if(r>=0x1040 && r<=0x1047) store_guest_word(known_sdk+0xC8+(r-0x1040)*4,word(at));
                 else if(r>=0x1050 && r<=0x1057) store_guest_word(known_sdk+0xE8+(r-0x1050)*4,word(at));
-                else if(r==0x1018 || r==0x1019) set_matrix_index(r-0x1018,word(at));
+                else if(r==0x1018 || r==0x1019) { const uint32_t value=word(at); back([reg=r-0x1018,value] { set_matrix_index(reg,value,false); }); }
             }
             continue;
         }
@@ -846,22 +1243,29 @@ static void raw_display_list(uint32_t address,uint32_t length) {
         return;
     }
 }
+}
+namespace uc {
 void gx_fifo_write(int size, uint32_t value) {
     if (size != 1 && size != 2 && size != 4) throw std::invalid_argument("invalid native GX write width");
-    if (recording) {
-        if (producer() != recording->owner) throw gx::Error(gx::ErrorCode::producer,recording->address,recording->owner,producer());
-        if (recording->overflow) return; // GXEndDisplayList reports this failed recording with length zero
-        if (size_t(size) > recording->capacity - recording->used) { recording->overflow=true; return; }
-        const uint32_t big=uc_bswap32(value<<(32-8*size));   // the size low bytes of value, most significant first
-        if (recording_primitive()) {
-            auto& draw=*recorded_draw(recording->native.geometry.back());
-            if (size_t(size)>draw.expected-draw.filled) throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected-draw.filled,size);
-            std::memcpy(draw.payload.data()+draw.filled,&big,size_t(size)); draw.filled+=size_t(size);
+    const uint32_t big=uc_bswap32(value<<(32-8*size));   // the size low bytes of value, most significant first
+    if (front_list) {
+        auto& list=*front_list;
+        if (producer() != list.owner) throw gx::Error(gx::ErrorCode::producer,list.address,list.owner,producer());
+        if (list.overflow) return; // GXEndDisplayList reports this failed recording with length zero
+        std::byte* at=gx_fifo_window.at;
+        const size_t used=size_t(at-list.bytes.get());
+        if (size_t(size) > list.capacity - used) { list.overflow=true; list.used=used; gx_fifo_window={}; return; }
+        if (list.prim_open) {
+            const size_t left=size_t(list.prim_end-at);
+            if (size_t(size)>left) throw gx::Error(gx::ErrorCode::truncated,list.prim_callsite,left,size);
         }
-        std::memcpy(recording->bytes.get()+recording->used,&big,size_t(size)); recording->used+=size_t(size);
+        std::memcpy(at,&big,size_t(size)); at+=size;
+        gx_fifo_window.at=at;
+        if (list.prim_open && at==list.prim_end) list.prim_open=false;
+        list_window();
         return;
     }
-    if (!capture || !capture->active()) {
+    if (!front_prim.active) {
         static int raw_state=0; static uint32_t raw_address=0;   // a raw display list call is three writes: 0x40, address, length
         if (raw_state==0) { if (size==1 && value==0x40) raw_state=1; }
         else if (raw_state==1) { if (size==4) { raw_address=value; raw_state=2; } else raw_state=0; }
@@ -874,30 +1278,14 @@ void gx_fifo_write(int size, uint32_t value) {
         }
         add_guest_stat(outside_bytes,uint64_t(size)); return;
     } // existing TD-014; all state bytes need owners before game-picture acceptance
-    std::byte bytes[4];
-    for (int i = 0; i < size; ++i) bytes[i] = std::byte(uint8_t(value >> ((size - 1 - i) * 8)));
-    capture->write_attribute(producer(), {bytes, size_t(size)});
-    if (!capture->active()) {
-        auto draw = capture->take_draw(); add_guest_stat(vertex_count,capture->vertex_count()); add_guest_stat(draw_count,1);
-        if(replaying)return;
-        draw.transforms=live_transforms;
-        draw.texture=live_texture;
-        draw.material=live_material; draw.uniforms=live_uniforms; draw.texture_bank=texture_bank(*draw.state,texture_matrices);
-        draw.texture_maps=live_texture_maps;
-        draw.texture_wrap=live_texture_wrap;
-        draw.blend=live_blend;
-#ifdef UC_TRACE
-        static uint32_t movie_draw_logs=0;
-        if (draw.callsite==0x801619C4 && draw.texture && movie_draw_logs++<8) {
-            std::array<uint8_t,4> low{255,255,255,255},high{};
-            const auto& rgba=draw.texture->levels[0].rgba;
-            for (size_t i=0;i<rgba.size();++i) { low[i%4]=std::min(low[i%4],rgba[i]); high[i%4]=std::max(high[i%4],rgba[i]); }
-            std::fprintf(stderr,"[movie-draw] range %u:%u %u:%u %u:%u %u:%u blend %u %u %u mask %u\n",low[0],high[0],low[1],high[1],low[2],high[2],low[3],high[3],draw.blend.mode,draw.blend.source,draw.blend.destination,draw.blend.color_write);
-            for (const auto& v:draw.vertices) std::fprintf(stderr,"[movie-vertex] %.2f %.2f %.2f rgba %u %u %u %u uv %.3f %.3f mtx %u\n",v.position[0],v.position[1],v.position[2],v.color[0][0],v.color[0][1],v.color[0][2],v.color[0][3],v.texcoord[0][0],v.texcoord[0][1],v.position_matrix);
-        }
-#endif
-        draws.push_back(std::move(draw));
-    }
+    auto& prim=front_prim;
+    if (producer() != prim.producer) throw gx::Error(gx::ErrorCode::producer,prim.callsite,prim.producer,producer());
+    std::byte* at=gx_fifo_window.at;
+    const size_t left=size_t(prim.bytes.data()+prim.expected-at);
+    if (size_t(size)>left) throw gx::Error(gx::ErrorCode::truncated,prim.callsite,left,size);
+    std::memcpy(at,&big,size_t(size)); at+=size;
+    gx_fifo_window.at=at;
+    if (size_t(size)==left) close_primitive();
 }
 void gx_completed(uint64_t serial) {
     Sched* sched = scheduler;
@@ -912,74 +1300,82 @@ void gx_completed(uint64_t serial) {
     post_finish(sched, serial,generation);
 }
 std::string gx_state_summary() {   // crash bundle gx.txt: bound arrays (12 = position matrices, 13 = normal matrices), "recorded" while a display list is being built
+    try { drain(); } catch (...) {}   // a failed builder has stopped: its state is still readable
     std::string text; char line[96];
     const auto add = [&](const char* kind, const gx::State& s) {
         for (size_t i = 0; i < s.arrays.size(); ++i) if (s.arrays[i].address) { std::snprintf(line, sizeof line, "%s array %zu address %08X stride %u\n", kind, i, s.arrays[i].address, unsigned(s.arrays[i].stride)); text += line; }
     };
     add("live", state);
-    if (recording) add("recorded", recording->input_state);
+    if (brec) add("recorded", brec->input_state);
     return text;
 }
 GxStats gx_stats() { return {draw_count.load(), vertex_count.load(), submitted.load(), completed.load(), outside_bytes.load(),copies.load(),texture_decodes.load(),geometry_hits.load(),geometry_misses.load(),prompt_annotations.load(),prompt_present.load(),prompt_fallback.load(),texture_evictions.load(),texture_resident.load()}; }
 }
+namespace {
+// The checks every GX call between primitives makes (sequence, producer).
+void matrix_boundary(uint32_t address) {
+    if (live_primitive() || recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,address,0,1);
+    if (front_list && producer()!=front_list->owner) throw gx::Error(gx::ErrorCode::producer,address,front_list->owner,producer());
+}
+bool recording_push() { return front_list && !front_list->overflow; }   // the call is recorded into the open display list
+void front_effect(FrontEffect effect) { if (recording_push()) front_list->effects.push_back(effect); }
+}
 void hle_GXBegin(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80284FD0, c);
-    if (recording) {
+    if (front_list) {
         if (recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,0x80284FD0,0,1);
         const uint32_t primitive=c.r[3], vat=c.r[4], count=c.r[5], sdk=read32(c.r[2]-8968);
         const uint32_t callsite=c.lr ? c.lr-4 : 0x80284FD0;
         if (read32(sdk+0x5FC)) uc::call_guest(c,0x80284D58,{});
         if (!read32(sdk)) uc::call_guest(c,0x8028511C,{});
-        uc::gx_fifo_write(1,uint8_t(primitive) | uint8_t(vat));
-        uc::gx_fifo_write(2,uint16_t(count));
+        uc::gx_fifo_store(1,uint8_t(primitive) | uint8_t(vat));
+        uc::gx_fifo_store(2,uint16_t(count));
         if (!uint16_t(count)) return;   // the list keeps the header; a primitive without vertices draws nothing
-        if (!recording->overflow) {
-            auto recorded=std::make_unique<RecordedDraw>();   // filled in place: the ~5 KB of state are copied once
-            auto& draw=*recorded;
-            draw.state=snapshot(c);
-            draw.expected=gx::encoded_draw_size(draw.state,uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
-            const auto snapped=material_snapshot(c);
-            draw.callsite=callsite; draw.primitive=uint8_t(primitive); draw.vat=uint8_t(vat); draw.count=uint16_t(count);
-            draw.material=snapped.material; draw.uniforms=snapped.uniforms; draw.texture_selectors=texture_selectors(sdk);
-            recorded->payload.resize(draw.expected);   // filled one write at a time by gx_fifo_write
-            recording->native.geometry.push_back(std::move(recorded));
+        if (!front_list->overflow) {
+            const auto block=capture_sdk(sdk);
+            const size_t expected=gx::encoded_draw_size(front_state(block),uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
+            known_sdk=sdk;
+            auto& list=*front_list;
+            const size_t offset=list_used();
+            list.prim_open=true; list.prim_end=list.bytes.get()+offset+expected; list.prim_callsite=callsite; list.prim_expected=expected;
+            if(offset+expected>list.capacity) list.prim_end=list.bytes.get()+list.capacity+1;   // never reached: the recording overflows first
+            list_window();
+            back([block,lr=c.lr,callsite,primitive=uint8_t(primitive),vat=uint8_t(vat),count=uint16_t(count),expected,offset] { record_draw(block,lr,callsite,primitive,vat,count,expected,offset); });
         }
         return;
     }
     const uint32_t sdk=read32(c.r[2]-8968),dirty=read32(sdk+0x5FC);
     if(dirty&0x04000000) {
-        for(uint32_t reg=0;reg<2;++reg) set_matrix_index(reg,read32(sdk+0x80+reg*4));
+        for(uint32_t reg=0;reg<2;++reg) { const uint32_t value=read32(sdk+0x80+reg*4); back([reg,value] { set_matrix_index(reg,value,false); }); }
         ppc::wr32(c,sdk+0x5FC,dirty&~0x04000000u);
     }
     if (!uint16_t(c.r[5])) return;   // a primitive without vertices (an empty quad batch) draws nothing
-    capture->begin(gx::share(live_state,snapshot(c)), uint8_t(c.r[3]), uint8_t(c.r[4]), uint16_t(c.r[5]), producer(), c.lr ? c.lr - 4 : 0x80284FD0,replaying);
-    if(replaying) { known_sdk=sdk; return; }
-    live_texture=snapshot_texture(bound_textures[0],palettes);
-    const auto [material,uniforms]=material_snapshot(c);
-    live_material=material; gx::share(live_uniforms,uniforms);
-    live_texture_wrap=wraps(bound_textures);
-    live_texture_maps={};
-    const auto maps=texture_mask(material,uniforms);
-    for(uint32_t map=1;map<8;++map) if(maps&(1u<<map)) {
-        live_texture_maps[map-1]=snapshot_texture(bound_textures[map],palettes);
-    }
-    gx::share(live_transforms,transforms);
-    live_blend=blend_state;
+    const auto block=capture_sdk(sdk);
+    const uint32_t callsite=c.lr ? c.lr - 4 : 0x80284FD0;
+    const auto& layout=front_state(block);
+    if (front_prim.active) throw gx::Error(gx::ErrorCode::sequence,callsite,0,uint16_t(c.r[5]));
+    const size_t expected=gx::encoded_draw_size(layout,uint8_t(c.r[3]),uint8_t(c.r[4]),uint16_t(c.r[5]),callsite);
+    known_sdk=sdk;
+    const uint32_t who=producer();
+    back_checked([block,who,callsite,lr=c.lr,primitive=uint8_t(c.r[3]),vat=uint8_t(c.r[4]),count=uint16_t(c.r[5])] { live_begin(block,primitive,vat,count,who,callsite,lr); });
+    auto& prim=front_prim;
+    prim.active=true; prim.producer=who; prim.callsite=callsite; prim.expected=expected;
+    if(prim.bytes.size()<expected+8) prim.bytes.resize(expected+8);
+    uc::gx_fifo_window={prim.bytes.data(),prim.bytes.data()+expected};
 }
 void hle_GXSetArray(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802841DC, c);
     uint32_t attr = c.r[3] == 25 ? 10 : c.r[3];
     if (attr < 9 || attr > 24) throw gx::Error(gx::ErrorCode::layout, 0x802841DC, 24, attr);
-    if (recording) {
+    const gx::Array array{c.r[4],uint8_t(c.r[5])};
+    if (front_list) {
         if (recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,0x802841DC,0,1);
-        uc::gx_fifo_write(1,8); uc::gx_fifo_write(1,0xA0+attr-9); uc::gx_fifo_write(4,c.r[4] & 0x3FFFFFFF);
-        uc::gx_fifo_write(1,8); uc::gx_fifo_write(1,0xB0+attr-9); uc::gx_fifo_write(4,c.r[5]);
-        const gx::Array array{c.r[4],uint8_t(c.r[5])};
-        recording->input_state.arrays[attr-9]=array; dirty_state();
-        recording->native.geometry.push_back(Resource::ArrayBinding{attr-9,array});
+        uc::gx_fifo_store(1,8); uc::gx_fifo_store(1,0xA0+attr-9); uc::gx_fifo_store(4,c.r[4] & 0x3FFFFFFF);
+        uc::gx_fifo_store(1,8); uc::gx_fifo_store(1,0xB0+attr-9); uc::gx_fifo_store(4,c.r[5]);
+        back([attr,array] { brec->input_state.arrays[attr-9]=array; dirty_state(); brec->native.geometry.push_back(Resource::ArrayBinding{attr-9,array}); });
         return;
     }
-    state.arrays[attr - 9] = {c.r[4], uint8_t(c.r[5])}; dirty_state();
+    back([attr,array] { state.arrays[attr - 9] = array; dirty_state(); });
 }
 void hle_GXSetDrawDone(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802848AC,c);
@@ -1003,60 +1399,85 @@ void hle_GXDrawDone(ppc::Ctx& c) {
 }
 void hle_GXBeginDisplayList(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80288528,c);
-    if (recording || capture->active()) throw gx::Error(gx::ErrorCode::sequence,0x80288528,0,1);
+    if (front_list || front_prim.active) throw gx::Error(gx::ErrorCode::sequence,0x80288528,0,1);
     const uint32_t address = c.r[3], capacity = c.r[4], sdk = read32(c.r[2]-8968);
     if ((address & 31) || capacity < 32 || (capacity & 31)) throw gx::Error(gx::ErrorCode::layout,address,32,capacity);
     memory.read(address,capacity); memory.read(sdk,0x600);
     if (read32(sdk+0x5FC)) uc::call_guest(c,0x80284D58,{}); // SDK dirty flush occurs before recording
-    auto list = std::make_unique<ListRecording>();
+    auto list = std::make_unique<FrontList>();
     list->address=address; list->capacity=capacity; list->sdk=sdk; list->owner=producer();
-    list->input_state=state;
     list->restore=std::to_integer<uint8_t>(memory.read(sdk+0x5F9,1)[0])!=0;
     if (list->restore) {
         auto shadow=memory.read(sdk,0x600);
         std::copy(shadow.begin(),shadow.end(),list->shadow.begin());
-        list->color_shadow=color_uniforms; list->texture_shadow=texture_matrices;
-        list->indices_shadow=matrix_indices;
         list->texture_copy_source_shadow=texture_copy_source;
         list->texture_copy_width_shadow=texture_copy_width; list->texture_copy_height_shadow=texture_copy_height;
         list->texture_copy_format_shadow=texture_copy_format;
     }
-    list->bytes=std::make_unique_for_overwrite<std::byte[]>(capacity);   // the SDK passes the exact buffer size; gx_fifo_write appends byte by byte
+    list->bytes=std::make_unique_for_overwrite<std::byte[]>(size_t(capacity)+8);   // the SDK passes the exact buffer size; 8 bytes of slack for the inline FIFO path
     ppc::wr8(c,sdk+0x5F8,1);
-    recording=std::move(list); dirty_state();
+    back([restore=list->restore] {
+        auto recording=std::make_unique<BackList>();
+        recording->input_state=state; recording->restore=restore;
+        if (restore) { recording->color_shadow=color_uniforms; recording->texture_shadow=texture_matrices; recording->indices_shadow=matrix_indices; }
+        brec=std::move(recording); dirty_state();
+    });
+    front_list=std::move(list);
+    uc::gx_fifo_window={front_list->bytes.get(),nullptr}; list_window();
 }
 void hle_GXEndDisplayList(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802885D8,c);
-    if (!recording) throw gx::Error(gx::ErrorCode::sequence,0x802885D8,1,0);
-    if (recording->owner!=producer()) throw gx::Error(gx::ErrorCode::producer,recording->address,recording->owner,producer());
-    if (!recording->overflow && recording_primitive()) {
-        const auto& draw=*recorded_draw(recording->native.geometry.back());
-        throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected,draw.filled);
-    }
+    if (!front_list) throw gx::Error(gx::ErrorCode::sequence,0x802885D8,1,0);
+    if (front_list->owner!=producer()) throw gx::Error(gx::ErrorCode::producer,front_list->address,front_list->owner,producer());
+    if (!front_list->overflow && front_list->prim_open)
+        throw gx::Error(gx::ErrorCode::truncated,front_list->prim_callsite,front_list->prim_expected,front_list->prim_expected-size_t(front_list->prim_end-uc::gx_fifo_window.at));
     uc::call_guest(c,0x80284504,{}); // verified GXFlush: dirty state followed by 32 NOP bytes
-    auto list=std::move(recording); dirty_state();
-    const uint32_t length=list->overflow ? 0 : uint32_t(list->used) & ~31u;
+    const size_t used=list_used();
+    auto list=std::move(front_list); uc::gx_fifo_window={};
+    const uint32_t length=list->overflow ? 0 : uint32_t(used) & ~31u;
     if (length) { std::memcpy(c.mem+(list->address & 0x3FFFFFFF),list->bytes.get(),length); gx::note_write_range(list->address,length); }
+    std::shared_ptr<const std::vector<std::byte>> bytes;
     if (length) {
         const uint32_t address=list->address & 0x3FFFFFFF;
         // The recordings never overlap (each one replaced those it overlaps): only the one before address and those starting inside the new one can.
-        auto it=resources.lower_bound(address);
-        if (it!=resources.begin() && uint64_t(std::prev(it)->first)+std::prev(it)->second->bytes.size()>address) --it;
-        while (it!=resources.end() && uint64_t(it->first)<uint64_t(address)+length) {
-            if (uint64_t(address)<uint64_t(it->first)+it->second->bytes.size()) { Graveyard::instance().bury(std::move(it->second)); it=resources.erase(it); }
+        auto it=front_resources.lower_bound(address);
+        if (it!=front_resources.begin() && uint64_t(std::prev(it)->first)+std::prev(it)->second->length>address) --it;
+        while (it!=front_resources.end() && uint64_t(it->first)<uint64_t(address)+length) {
+            if (uint64_t(address)<uint64_t(it->first)+it->second->length) it=front_resources.erase(it);
             else ++it;
         }
-        list->native.bytes.assign(list->bytes.get(),list->bytes.get()+length);
-        list->native.stamp=gx::watch_stamp();
-        resources.emplace(address,std::make_shared<const Resource>(std::move(list->native)));
+        bytes=std::make_shared<const std::vector<std::byte>>(list->bytes.get(),list->bytes.get()+used);
+        auto resource=std::make_shared<FrontResource>();
+        resource->bytes=bytes; resource->length=length; resource->stamp=gx::watch_stamp(); resource->effects=std::move(list->effects);
+        front_resources.emplace(address,std::move(resource));
     }
     uc::gx_audit_recorded_resource(list->address,std::span<const std::byte>(list->bytes.get(),length));
+    back([address=list->address,length,bytes] {
+        auto recording=std::move(brec); dirty_state();
+        if (length) {
+            const uint32_t physical=address & 0x3FFFFFFF;
+            std::shared_ptr<const Resource> replaced_at;   // the earlier recording at this address: its decodes may be reused
+            if(auto same=resources.find(physical);same!=resources.end()) replaced_at=same->second;
+            auto it=resources.lower_bound(physical);
+            if (it!=resources.begin() && uint64_t(std::prev(it)->first)+std::prev(it)->second->length>physical) --it;
+            while (it!=resources.end() && uint64_t(it->first)<uint64_t(physical)+length) {
+                if (uint64_t(physical)<uint64_t(it->first)+it->second->length) { Graveyard::instance().bury(std::move(it->second)); it=resources.erase(it); }
+                else ++it;
+            }
+            recording->native.list_bytes=bytes; recording->native.length=length;
+            if(const auto previous=replaced_at; previous) inherit_decodes(recording->native,*previous);
+            resources.emplace(physical,std::make_shared<const Resource>(std::move(recording->native)));
+            if(replaced_at) Graveyard::instance().bury(std::move(replaced_at));
+        }
+        if (recording->restore) {
+            color_uniforms=recording->color_shadow; texture_matrices=std::move(recording->texture_shadow); dirty_material();
+            matrix_indices=recording->indices_shadow;
+        }
+    });
     if (list->restore) {
         const uint32_t kept=read32(list->sdk+8);
         std::memcpy(c.mem+(list->sdk & 0x3FFFFFFF),list->shadow.data(),list->shadow.size()); gx::note_write_range(list->sdk,list->shadow.size());
         ppc::wr32(c,list->sdk+8,kept);
-        color_uniforms=list->color_shadow; texture_matrices=std::move(list->texture_shadow); dirty_material();
-        matrix_indices=list->indices_shadow;
         texture_copy_source=list->texture_copy_source_shadow;
         texture_copy_width=list->texture_copy_width_shadow; texture_copy_height=list->texture_copy_height_shadow;
         texture_copy_format=list->texture_copy_format_shadow;
@@ -1065,21 +1486,24 @@ void hle_GXEndDisplayList(ppc::Ctx& c) {
     c.r[3]=length;
 }
 
-void hle_GXCallDisplayList(ppc::Ctx& c) {
-    CallTimer timer(0);
-    uc::gx_audit_enter(0x80288684,c);
-    const uint32_t address=c.r[3],length=c.r[4],sdk=read32(c.r[2]-8968);
-    if (capture->active() || recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,0x80288684,0,1);
-    checked_resource(address,length);
-    if (read32(sdk+0x5FC)) uc::call_guest(c,0x80284D58,{});
-    if (!read32(sdk)) uc::call_guest(c,0x8028511C,{});
-    if (recording) {
-        if (producer()!=recording->owner) throw gx::Error(gx::ErrorCode::producer,address,recording->owner,producer());
-        uc::gx_fifo_write(1,0x40); uc::gx_fifo_write(4,address); uc::gx_fifo_write(4,length);
-        if (recording->overflow) return;
-        recording->native.geometry.push_back(Resource::Child{address,length});
-        return;
+namespace {
+// Front: what a call of the list does that the guest observes (the colour channel words written back, the packets its texture copies seal),
+// with the checks the import made (nesting, every child list's bytes).
+void walk_effects(uint32_t address,uint32_t length,uint32_t& channels_count,std::array<uint32_t,4>& channels,uint32_t& texture_copies,std::vector<uint32_t>& path) {
+    const uint32_t physical=address & 0x3FFFFFFF;
+    if (path.size()==64 || std::find(path.begin(),path.end(),physical)!=path.end())
+        throw gx::Error(gx::ErrorCode::sequence,address,64,path.size());
+    const auto& resource=checked_resource(address,length);
+    path.push_back(physical);
+    for (const auto& effect : resource.effects) switch (effect.kind) {
+        case FrontEffect::child: walk_effects(effect.a,effect.b,channels_count,channels,texture_copies,path); break;
+        case FrontEffect::num_channels: channels_count=effect.a; break;
+        case FrontEffect::channel_control: channels[effect.a]=effect.b; break;
+        case FrontEffect::texture_copy: ++texture_copies; break;
     }
+    path.pop_back();
+}
+void call_list(const SdkRef& block,uint32_t lr,uint32_t address,uint32_t length,const SealInputs& inputs) {
     Imported imported;
     auto bindings=state;
     auto transform_state=transforms;
@@ -1087,7 +1511,7 @@ void hle_GXCallDisplayList(ppc::Ctx& c) {
     auto textures=bound_textures;
     auto loaded=palettes;
     auto blend=blend_state;
-    auto colors=material_snapshot(c).uniforms;
+    auto colors=material_snapshot(block,lr).uniforms;
     auto matrices=texture_matrices;
     auto indices=matrix_indices;
     auto versions=copied_textures;
@@ -1097,7 +1521,7 @@ void hle_GXCallDisplayList(ppc::Ctx& c) {
         if(auto* draw=std::get_if<gx::DrawPacket>(&item)) { add_guest_stat(vertex_count,draw->vertices.size()); add_guest_stat(draw_count,1); draws.push_back(std::move(*draw)); }
         else {
             auto& command=std::get<CopiedTexture>(item); copy_state=command.clear_state;
-            submit_batch(false,command.clear,0,std::move(command.request)); ++copies;
+            submit_batch(inputs,false,command.clear,0,std::move(command.request));
         }
     }
     copied_textures=std::move(versions);
@@ -1111,15 +1535,39 @@ void hle_GXCallDisplayList(ppc::Ctx& c) {
     color_uniforms.lights=colors.lights; color_uniforms.fog=colors.fog; color_uniforms.indirect=colors.indirect;
     texture_matrices=std::move(matrices);
     matrix_indices=indices;
-    ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x70u)|(colors.pixel[3]<<4));
-    for(uint32_t i=0;i<4;++i) ppc::wr32(c,sdk+0xB8+i*4,colors.channels[i]);
+}
+}
+void hle_GXCallDisplayList(ppc::Ctx& c) {
+    CallTimer timer(0);
+    uc::gx_audit_enter(0x80288684,c);
+    const uint32_t address=c.r[3],length=c.r[4],sdk=read32(c.r[2]-8968);
+    if (live_primitive() || recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,0x80288684,0,1);
+    checked_resource(address,length);
+    if (read32(sdk+0x5FC)) uc::call_guest(c,0x80284D58,{});
+    if (!read32(sdk)) uc::call_guest(c,0x8028511C,{});
+    if (front_list) {
+        if (producer()!=front_list->owner) throw gx::Error(gx::ErrorCode::producer,address,front_list->owner,producer());
+        uc::gx_fifo_store(1,0x40); uc::gx_fifo_store(4,address); uc::gx_fifo_store(4,length);
+        if (front_list->overflow) return;
+        front_list->effects.push_back({FrontEffect::child,address,length});
+        back([address,length] { brec->native.geometry.push_back(Resource::Child{address,length}); });
+        return;
+    }
+    const auto block=capture_sdk(sdk); known_sdk=sdk;
+    // The colour channel count and controls the guest sees afterwards: the SDK block's, changed by the list's own settings.
+    uint32_t channels_count=(block->word(0x254)>>4)&3;
+    std::array<uint32_t,4> channels{};
+    for(uint32_t i=0;i<4;++i) channels[i]=block->word(0xB8+i*4);
+    uint32_t texture_copies=0;
+    std::vector<uint32_t> path;
+    walk_effects(address,length,channels_count,channels,texture_copies,path);
+    for(uint32_t i=0;i<texture_copies;++i) { next_seal(); ++copies; }
+    back_checked([block,lr=c.lr,address,length,inputs=texture_copies ? seal_inputs() : SealInputs{}] { call_list(block,lr,address,length,inputs); });   // the inputs only serve the packets its copies seal
+    ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x70u)|(channels_count<<4));
+    for(uint32_t i=0;i<4;++i) ppc::wr32(c,sdk+0xB8+i*4,channels[i]);
 }
 
 namespace {
-void matrix_boundary(uint32_t address) {
-    if (capture->active() || recording_primitive()) throw gx::Error(gx::ErrorCode::sequence,address,0,1);
-    if (recording && producer()!=recording->owner) throw gx::Error(gx::ErrorCode::producer,address,recording->owner,producer());
-}
 void projection(ppc::Ctx& c,const std::array<float,6>& p,uint32_t type) {
     matrix_boundary(0x8028873C);
     const auto matrix=gx::make_projection(p,type);
@@ -1128,8 +1576,8 @@ void projection(ppc::Ctx& c,const std::array<float,6>& p,uint32_t type) {
     ppc::wr32(c,sdk+0x528,type);
     for (size_t i=0;i<6;++i) ppc::wr32(c,sdk+0x52C+uint32_t(i*4),std::bit_cast<uint32_t>(p[i]));
     ppc::wr32(c,sdk+0x5FC,read32(sdk+0x5FC)|0x08000000);
-    if (recording) { if (!recording->overflow) recording->native.geometry.push_back(Resource::Projection{matrix}); }
-    else transforms.projection=matrix;
+    const bool push=recording_push();
+    back([matrix,push] { if (brec) { if (push) brec->native.geometry.push_back(Resource::Projection{matrix}); } else transforms.projection=matrix; });
 }
 }
 void hle_GXSetProjection(ppc::Ctx& c) {
@@ -1150,59 +1598,61 @@ void hle_GXSetProjectionv(ppc::Ctx& c) {
 void hle_GXLoadPosMtxImm(ppc::Ctx& c) {
     uc::gx_audit_enter(0x8028882C,c); matrix_boundary(0x8028882C);
     const uint32_t row=c.r[4]; const auto matrix=position_matrix(c.r[3]);
-    auto checked=transforms; gx::set_position_matrix(checked,row,matrix);
-    if (recording) {
-        uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x000B0000|row*4);
-        for (const auto& values : matrix) for (float value : values) uc::gx_fifo_write(4,std::bit_cast<uint32_t>(value));
-        if (!recording->overflow) recording->native.geometry.push_back(Resource::Position{row,matrix});
-    } else { transforms=checked; matrix_rows(texture_matrices,nullptr,row,matrix,3); dirty_material(); }
+    if (row>61) throw gx::Error(gx::ErrorCode::layout,0x8028882C,61,row);   // gx::set_position_matrix's check
+    if (front_list) {
+        uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x000B0000|row*4);
+        for (const auto& values : matrix) for (float value : values) uc::gx_fifo_store(4,std::bit_cast<uint32_t>(value));
+        if (recording_push()) back([row,matrix] { brec->native.geometry.push_back(Resource::Position{row,matrix}); });
+    } else back([row,matrix] { gx::set_position_matrix(transforms,row,matrix); matrix_rows(texture_matrices,nullptr,row,matrix,3); dirty_material(); });
 }
 void hle_GXLoadPosMtxIndx(ppc::Ctx& c) {
     uc::gx_audit_enter(0x8028887C,c); matrix_boundary(0x8028887C);
     const uint16_t index=uint16_t(c.r[3]); const uint32_t row=c.r[4];
     if (row>61) throw gx::Error(gx::ErrorCode::layout,0x8028887C,61,row);
-    if (recording) {
-        uc::gx_fifo_write(1,0x20); uc::gx_fifo_write(4,uint32_t(index)<<16|0xB000|row*4);
-        if (!recording->overflow) recording->native.geometry.push_back(Resource::IndexedPosition{index,row});
-    } else { indexed_position(transforms,texture_matrices,state,index,row); dirty_material(); }
+    if (front_list) {
+        uc::gx_fifo_store(1,0x20); uc::gx_fifo_store(4,uint32_t(index)<<16|0xB000|row*4);
+        if (recording_push()) back([index,row] { brec->native.geometry.push_back(Resource::IndexedPosition{index,row}); });
+    } else back([index,row] { indexed_position(transforms,texture_matrices,state,index,row); dirty_material(); });
 }
 void hle_GXLoadNrmMtxIndx3x3(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80288900,c); matrix_boundary(0x80288900);
     const uint16_t index=uint16_t(c.r[3]); const uint32_t row=c.r[4];
     if (row>61) throw gx::Error(gx::ErrorCode::layout,0x80288900,61,row);
-    if (recording) {
-        uc::gx_fifo_write(1,0x28); uc::gx_fifo_write(4,uint32_t(index)<<16|0x8000|(0x400+row*3));
-        if (!recording->overflow) recording->native.geometry.push_back(Resource::IndexedNormal{index,row});
-    } else indexed_normal(transforms,state,index,row);
+    if (front_list) {
+        uc::gx_fifo_store(1,0x28); uc::gx_fifo_store(4,uint32_t(index)<<16|0x8000|(0x400+row*3));
+        if (recording_push()) back([index,row] { brec->native.geometry.push_back(Resource::IndexedNormal{index,row}); });
+    } else back([index,row] { indexed_normal(transforms,state,index,row); });
 }
 void hle_GXSetCurrentMtx(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80288934,c); matrix_boundary(0x80288934);
     const uint32_t sdk=read32(c.r[2]-8968),row=c.r[3]&63;
     ppc::wr32(c,sdk+0x80,(read32(sdk+0x80)&~63u)|row);
     ppc::wr32(c,sdk+0x5FC,read32(sdk+0x5FC)|0x04000000);
-    if (recording) { if (!recording->overflow) recording->native.geometry.push_back(Resource::Current{row}); }
-    else transforms.current=row;
+    const bool push=recording_push();
+    back([row,push] { if (brec) { if (push) brec->native.geometry.push_back(Resource::Current{row}); } else transforms.current=row; });
 }
 void hle_GXSetMatrixIndex(ppc::Ctx& c) {
     matrix_boundary(0x80288BFC);
     const auto reg=int32_t(c.r[3])<5 ? 0u : 1u,sdk=read32(c.r[2]-8968),value=read32(sdk+0x80+reg*4);
-    uc::gx_fifo_write(1,8); uc::gx_fifo_write(1,0x30+reg*0x10); uc::gx_fifo_write(4,value);
-    uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x1018+reg); uc::gx_fifo_write(4,value);
-    set_matrix_index(reg,value); ppc::wr16(c,sdk+2,1);
+    uc::gx_fifo_store(1,8); uc::gx_fifo_store(1,0x30+reg*0x10); uc::gx_fifo_store(4,value);
+    uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x1018+reg); uc::gx_fifo_store(4,value);
+    const bool push=recording_push();
+    back([reg,value,push] { set_matrix_index(reg,value,push); });
+    ppc::wr16(c,sdk+2,1);
 }
 void hle_ResResetMatrixIndices(ppc::Ctx&) {
     matrix_boundary(0x803740B8);
     constexpr uint32_t values[]={0x3CF3CF00,0x00F3CF3C};
-    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_write(1,8); uc::gx_fifo_write(1,0x30+reg*0x10); uc::gx_fifo_write(4,values[reg]); }
-    uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x00011018);
-    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_write(4,values[reg]); set_matrix_index(reg,values[reg]); }
+    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_store(1,8); uc::gx_fifo_store(1,0x30+reg*0x10); uc::gx_fifo_store(4,values[reg]); }
+    uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x00011018);
+    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_store(4,values[reg]); const bool push=recording_push(); back([reg,value=values[reg],push] { set_matrix_index(reg,value,push); }); }
 }
 void hle_ResTexMatrixIndices(ppc::Ctx& c) {
     matrix_boundary(0x80374114); memory.read(c.r[3],32);
     uint32_t values[2]={};
     for(uint32_t i=0;i<8;++i) values[i/4]|=read32(c.r[3]+i*4)<<(i<4 ? 6+i*6 : (i-4)*6);
-    uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x00011018);
-    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_write(4,values[reg]); set_matrix_index(reg,values[reg]); }
+    uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x00011018);
+    for(uint32_t reg=0;reg<2;++reg) { uc::gx_fifo_store(4,values[reg]); const bool push=recording_push(); back([reg,value=values[reg],push] { set_matrix_index(reg,value,push); }); }
 }
 
 void hle_GXLoadTexObjPreLoaded(ppc::Ctx& c) {
@@ -1230,7 +1680,7 @@ void hle_GXLoadTexObjPreLoaded(ppc::Ctx& c) {
     uint32_t words[]={read32(object),read32(object+4),image0,read32(region),read32(region+4),read32(object+12)};
     for (size_t i=0;i<6;++i) words[i]=(words[i]&0xFFFFFF)|(uint32_t(std::to_integer<uint8_t>(memory.read(c.r[13]-tables[i]+map,1)[0]))<<24);
     // Keep verified SDK byte identity for native resource version checks; no BP interpretation.
-    for (auto word : words) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word); }
+    for (auto word : words) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word); }
     ppc::wr32(c,object,words[0]); ppc::wr32(c,object+4,words[1]); ppc::wr32(c,object+8,words[2]); ppc::wr32(c,object+12,words[5]);
     ppc::wr32(c,region,words[3]); ppc::wr32(c,region+4,words[4]);
     if (!(flags&2)) {
@@ -1240,12 +1690,12 @@ void hle_GXLoadTexObjPreLoaded(ppc::Ctx& c) {
         const auto tag=std::to_integer<uint8_t>(memory.read(c.r[13]-28888+map,1)[0]);
         const auto word=(read32(palette_region+4)&0xFFFFFF)|(uint32_t(tag)<<24);
         ppc::wr32(c,palette_region+4,word);
-        uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word);
+        uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word);
     }
     ppc::wr32(c,sdk+0x564+map*4,words[2]); ppc::wr32(c,sdk+0x584+map*4,words[0]);
     ppc::wr32(c,sdk+0x5FC,read32(sdk+0x5FC)|1); ppc::wr16(c,sdk+2,0);
-    if (recording) { if (!recording->overflow) recording->native.geometry.push_back(Resource::TextureBinding{map,source}); }
-    else bound_textures[map]=source;
+    const bool push=recording_push();
+    back([map,source,push] { if (brec) { if (push) brec->native.geometry.push_back(Resource::TextureBinding{map,source}); } else bound_textures[map]=source; });
 }
 void hle_GXLoadTlut(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80286B80,c); matrix_boundary(0x80286B80);
@@ -1255,16 +1705,19 @@ void hle_GXLoadTlut(ppc::Ctx& c) {
     memory.read(region,16);
     const uint32_t format=read32(object),image=read32(object+4),count_word=read32(object+8);
     const PaletteSource source{(image&0xFFFFFF)<<5,count_word>>16,gx::PaletteFormat((format>>10)&3)};
-    auto loaded=load_palette(source);
+    auto loaded=load_palette(source);   // immediate: the guest may reuse the palette's memory once the TMEM load is in the FIFO
     uc::call_guest(c,0x80287720,{});
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,image);
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,read32(region));
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,image);
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,read32(region));
     uc::call_guest(c,0x80287720,{});
     const uint32_t binding=(format&~1023u)|(read32(region)&1023);
     ppc::wr32(c,region+4,binding); ppc::wr32(c,region+8,image); ppc::wr32(c,region+12,count_word);
     ppc::wr32(c,object,binding);
-    if (recording) { if (!recording->overflow) recording->native.geometry.push_back(Resource::PaletteLoad{region&0x3FFFFFFF,source}); }
-    else palettes[region&0x3FFFFFFF]=std::move(loaded);
+    const bool push=recording_push();
+    back([region=region&0x3FFFFFFF,source,loaded=std::move(loaded),push] {
+        if (brec) { if (push) brec->native.geometry.push_back(Resource::PaletteLoad{region,source}); }
+        else palettes[region]=loaded;
+    });
 }
 void hle_GXSetCopyClear(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802855C8,c); matrix_boundary(0x802855C8);
@@ -1273,17 +1726,17 @@ void hle_GXSetCopyClear(ppc::Ctx& c) {
     for (size_t i=0;i<4;++i) next.color[i]=std::to_integer<uint8_t>(bytes[i]);
     next.depth=c.r[4]&0xFFFFFF;
     const uint32_t sdk=read32(c.r[2]-8968); memory.read(sdk+2,2);
-    if (recording) {
+    if (front_list) {
         const uint32_t words[]={0x4F000000u|next.color[0]|uint32_t(next.color[3])<<8,0x50000000u|next.color[2]|uint32_t(next.color[1])<<8,0x51000000u|next.depth};
-        for (uint32_t word : words) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word); }
-        if (!recording->overflow) recording->native.geometry.push_back(Resource::CopyClear{next});
-    } else copy_state=next;
+        for (uint32_t word : words) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word); }
+        if (recording_push()) back([next] { brec->native.geometry.push_back(Resource::CopyClear{next}); });
+    } else back([next] { copy_state=next; });
     ppc::wr16(c,sdk+2,0);
 }
 void hle_GXCopyDisp(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80285838,c);
-    if (recording) throw gx::Error(gx::ErrorCode::sequence,0x80285838,0,1); // TD-034: recorded copies need a verified native resource boundary
-    capture->finish();
+    if (front_list) throw gx::Error(gx::ErrorCode::sequence,0x80285838,0,1); // TD-034: recorded copies need a verified native resource boundary
+    finish_primitive();
     const uint32_t xfb=c.r[3];
     if (xfb&31) throw gx::Error(gx::ErrorCode::layout,xfb,32,xfb&31);
     memory.read(xfb,32);
@@ -1295,10 +1748,12 @@ void hle_GXCopyDisp(ppc::Ctx& c) {
     std::array<uint32_t,4> source{0,0,640,480};
     if ((origin>>24)==0x49 && (extent>>24)==0x4A) source={origin&1023,(origin>>10)&1023,(extent&1023)+1,((extent>>10)&1023)+1};
     if(source[0]>=640 || source[2]>640-source[0] || source[1]>=480 || source[3]>480-source[1]) throw std::invalid_argument("invalid native display source rectangle");
-    submit_batch(true,clear,xfb,{},source,uc::vi_stats().black); ++copies;
+    next_seal();
+    back([inputs=seal_inputs(),clear,xfb,source,black=uc::vi_stats().black] { submit_batch(inputs,true,clear,xfb,{},source,black); });
+    ++copies;
 }
 void hle_GXSetTexCopySrc(ppc::Ctx& c) {
-    uc::gx_audit_enter(0x80285334,c); capture->finish();
+    uc::gx_audit_enter(0x80285334,c); finish_primitive();
     const auto x=c.r[3],y=c.r[4],width=c.r[5],height=c.r[6],sdk=read32(c.r[2]-8968);
     if(!width || !height || x>=640 || width>640-x || y>=480 || height>480-y) throw std::invalid_argument("invalid native EFB texture source rectangle");
     memory.read(sdk+0x240,8);
@@ -1307,7 +1762,7 @@ void hle_GXSetTexCopySrc(ppc::Ctx& c) {
     ppc::wr32(c,sdk+0x244,0x4A000000u|(width-1)|(height-1)<<10);
 }
 void hle_GXSetTexCopyDst(ppc::Ctx& c) {
-    uc::gx_audit_enter(0x80285398,c); capture->finish();
+    uc::gx_audit_enter(0x80285398,c); finish_primitive();
     const auto width=c.r[3],height=c.r[4],format=c.r[5],half=c.r[6],sdk=read32(c.r[2]-8968);
     if(!width || !height || width>1024 || height>1024 || (format!=4 && format!=6 && format!=0x27) || half>1) {
         std::fprintf(stderr,"[efb-destination-invalid] %ux%u format %08X half %u caller %08X\n",width,height,format,half,c.lr);
@@ -1324,40 +1779,47 @@ void hle_GXSetTexCopyDst(ppc::Ctx& c) {
     texture_copy_format=format;
 }
 void hle_GXCopyTex(ppc::Ctx& c) {
-    uc::gx_audit_enter(0x80285974,c); capture->finish();
+    uc::gx_audit_enter(0x80285974,c); finish_primitive();
     const auto address=c.r[3],sdk=read32(c.r[2]-8968);
     if((address&31) || c.r[4]>1 || !texture_copy_source[2] || !texture_copy_width || !texture_copy_height) throw std::invalid_argument("invalid native EFB texture copy request");
     memory.read(address,gx::encoded_texture_size({texture_copy_width,texture_copy_height,texture_copy_format==0x27 ? gx::TextureFormat::i8 : gx::TextureFormat(texture_copy_format),1}));
     memory.read(sdk,0x254);
     const auto control=(read32(sdk+0x24C)&~0xFF004800u)|0x52000000u|c.r[4]<<11;
-    if(profile_mesh && mesh_profile_count && copy_profile_count<24) {
+    if(profile_mesh) back([clear=c.r[4],source=texture_copy_source,width=texture_copy_width,height=texture_copy_height,blend=read32(sdk+0x220),depth=read32(sdk+0x228)] {
+        if(!mesh_profile_count || copy_profile_count>=24) return;
         ++copy_profile_count;
-        std::fprintf(stderr,"[scene-copy] clear %u source %u:%u:%u:%u target %u:%u color %u:%u:%u:%u blend %08X depth %08X\n",c.r[4],texture_copy_source[0],texture_copy_source[1],texture_copy_source[2],texture_copy_source[3],texture_copy_width,texture_copy_height,copy_state.color[0],copy_state.color[1],copy_state.color[2],copy_state.color[3],read32(sdk+0x220),read32(sdk+0x228));
-    }
-    if(recording) {
-        if(producer()!=recording->owner || recording_primitive()) throw std::invalid_argument("invalid recorded EFB texture copy boundary");
-        if(c.r[4]) for(auto word:{read32(sdk+0x228)|15,read32(sdk+0x220)&~3u}) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word); }
-        for(auto word:{read32(sdk+0x240),read32(sdk+0x244),read32(sdk+0x248),0x4B000000u|((address&0x3FFFFFFF)>>5),control}) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word); }
-        if(c.r[4]) for(auto word:{read32(sdk+0x228),read32(sdk+0x220)}) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word); }
-        if(!recording->overflow) recording->native.geometry.push_back(Resource::TextureCopy{texture_copy_source,address,texture_copy_width,texture_copy_height,c.r[4]!=0,texture_copy_format});
+        std::fprintf(stderr,"[scene-copy] clear %u source %u:%u:%u:%u target %u:%u color %u:%u:%u:%u blend %08X depth %08X\n",clear,source[0],source[1],source[2],source[3],width,height,copy_state.color[0],copy_state.color[1],copy_state.color[2],copy_state.color[3],blend,depth);
+    });
+    if(front_list) {
+        if(producer()!=front_list->owner || recording_primitive()) throw std::invalid_argument("invalid recorded EFB texture copy boundary");
+        if(c.r[4]) for(auto word:{read32(sdk+0x228)|15,read32(sdk+0x220)&~3u}) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word); }
+        for(auto word:{read32(sdk+0x240),read32(sdk+0x244),read32(sdk+0x248),0x4B000000u|((address&0x3FFFFFFF)>>5),control}) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word); }
+        if(c.r[4]) for(auto word:{read32(sdk+0x228),read32(sdk+0x220)}) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word); }
+        if(recording_push()) {
+            front_list->effects.push_back({FrontEffect::texture_copy});
+            back([copy=Resource::TextureCopy{texture_copy_source,address,texture_copy_width,texture_copy_height,c.r[4]!=0,texture_copy_format}] { brec->native.geometry.push_back(copy); });
+        }
         ppc::wr32(c,sdk+0x24C,control); ppc::wr16(c,sdk+2,0);
         return;
     }
-    auto target=make_copy_texture(address,texture_copy_width,texture_copy_height,texture_copy_format);
-    const auto [entry,inserted]=copied_textures.try_emplace(address&0x3FFFFFFF);
-    try { submit_batch(false,c.r[4]!=0,0,gx::TextureCopy{texture_copy_source,target}); }
-    catch(...) { if(inserted) copied_textures.erase(entry); throw; }
-    entry->second=std::move(target);
+    next_seal();
+    back([inputs=seal_inputs(),address,width=texture_copy_width,height=texture_copy_height,format=texture_copy_format,source=texture_copy_source,clear=c.r[4]!=0] {
+        auto target=make_copy_texture(address,width,height,format);
+        const auto [entry,inserted]=copied_textures.try_emplace(address&0x3FFFFFFF);
+        try { submit_batch(inputs,false,clear,0,gx::TextureCopy{source,target}); }
+        catch(...) { if(inserted) copied_textures.erase(entry); throw; }
+        entry->second=std::move(target);
+    });
     ppc::wr32(c,sdk+0x24C,control);
     ppc::wr16(c,sdk+2,0); ++copies;
 }
 namespace {
 void publish_blend(ppc::Ctx& c,uint32_t sdk,uint32_t word) {
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,word);
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,word);
     ppc::wr32(c,sdk+0x220,word); ppc::wr16(c,sdk+2,0);
     gx::BlendState blend{uint8_t(word&0x800 ? 3 : word&2 ? 2 : word&1 ? 1 : 0),uint8_t((word>>8)&7),uint8_t((word>>5)&7),uint8_t((word>>12)&15),bool(word&8),bool(word&16)};
-    if (recording) { if (!recording->overflow) recording->native.geometry.push_back(Resource::Blend{blend}); }
-    else blend_state=blend;
+    const bool push=recording_push();
+    back([blend,push] { if (brec) { if (push) brec->native.geometry.push_back(Resource::Blend{blend}); } else blend_state=blend; });
 }
 }
 void hle_GXSetBlendMode(ppc::Ctx& c) {
@@ -1390,7 +1852,14 @@ void hle_ResTevApply(ppc::Ctx& c) {
         for(auto byte:bytes) std::fprintf(stderr," %02X",std::to_integer<unsigned>(byte));
         std::fprintf(stderr,"\n"); throw;
     }
-    color_uniforms.indirect[9]=parsed.indirect_order; dirty_material();
+    {
+        std::array<uint32_t,16> stages{};
+        for(uint32_t i=0;i<count && i<16;++i) stages[i]=parsed.stage[i].indirect;
+        back([order=parsed.indirect_order,stages,count] {
+            color_uniforms.indirect[9]=order; dirty_material();
+            for(uint32_t i=0;i<count && i<16;++i) { indirect_stages[i]=stages[i]; dirty_material(); }
+        });
+    }
     ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x3C00u)|((count-1)<<10));
     for(size_t i=0;i<4;++i) {
         for(size_t lane=0;lane<2;++lane) {
@@ -1400,7 +1869,6 @@ void hle_ResTevApply(ppc::Ctx& c) {
     }
     for(uint32_t i=0;i<count;++i) {
         const auto& stage=parsed.stage[i];
-        indirect_stages[i]=stage.indirect; dirty_material();
         ppc::wr32(c,sdk+0x180+i*4,(0xC0+i*2)<<24|stage.color);
         ppc::wr32(c,sdk+0x1C0+i*4,(0xC1+i*2)<<24|stage.alpha);
         const auto at=sdk+0x150+i/2*4,shift=(i%2)*12;
@@ -1421,17 +1889,20 @@ void hle_ResColorApply(ppc::Ctx& c) {
         for(auto byte:bytes) std::fprintf(stderr," %02X",std::to_integer<unsigned>(byte));
         std::fprintf(stderr,"\n"); throw;
     }
-    if(recording) {
-        uc::gx_fifo_write(1,0x40); uc::gx_fifo_write(4,read32(c.r[3])); uc::gx_fifo_write(4,128);
+    if(front_list) {
+        uc::gx_fifo_store(1,0x40); uc::gx_fifo_store(4,read32(c.r[3])); uc::gx_fifo_store(4,128);
     }
-    for(uint32_t i=0;i<3;++i) {
-        color_uniforms.registers[i+1]=parsed.registers[i]; dirty_material();
-        if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::TevColor{i+1,false,parsed.registers[i]});
-    }
-    for(uint32_t i=0;i<4;++i) {
-        color_uniforms.konst[i]=parsed.konst[i]; dirty_material();
-        if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::TevColor{i,true,parsed.konst[i]});
-    }
+    const bool push=recording_push();
+    back([parsed,push] {
+        for(uint32_t i=0;i<3;++i) {
+            color_uniforms.registers[i+1]=parsed.registers[i]; dirty_material();
+            if(brec && push) brec->native.geometry.push_back(Resource::TevColor{i+1,false,parsed.registers[i]});
+        }
+        for(uint32_t i=0;i<4;++i) {
+            color_uniforms.konst[i]=parsed.konst[i]; dirty_material();
+            if(brec && push) brec->native.geometry.push_back(Resource::TevColor{i,true,parsed.konst[i]});
+        }
+    });
     ppc::wr16(c,sdk+2,0);
 }
 void hle_ResPixelApply(ppc::Ctx& c) {
@@ -1439,7 +1910,7 @@ void hle_ResPixelApply(ppc::Ctx& c) {
     const auto object=read32(c.r[3]),sdk=read32(c.r[2]-8968);
     const auto pixel=gx::import_pixel_material(memory.read(object,32));
     memory.read(sdk,0x600);
-    color_uniforms.pixel={pixel.alpha,pixel.depth,pixel.destination_alpha,0}; dirty_material();
+    back([pixel] { color_uniforms.pixel={pixel.alpha,pixel.depth,pixel.destination_alpha,0}; dirty_material(); });
     ppc::wr32(c,sdk+0x228,0x40000000|pixel.depth);
     ppc::wr32(c,sdk+0x224,0x42000000|pixel.destination_alpha);
     const auto blend=(read32(sdk+0x220)&~0xFFE3u)|(pixel.blend&0xFFE3u);
@@ -1449,8 +1920,8 @@ void hle_GXSetAlphaCompare(ppc::Ctx& c) {
     matrix_boundary(0x80287B80);
     if(c.r[3]>7 || c.r[4]>255 || c.r[5]>3 || c.r[6]>7 || c.r[7]>255) throw std::invalid_argument("invalid native alpha compare");
     const auto word=c.r[4]|c.r[7]<<8|c.r[3]<<16|c.r[6]<<19|c.r[5]<<22;
-    color_uniforms.pixel[0]=word; dirty_material();
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,0xF3000000|word);
+    back([word] { color_uniforms.pixel[0]=word; dirty_material(); });
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,0xF3000000|word);
     ppc::wr16(c,read32(c.r[2]-8968)+2,0);
 }
 namespace {
@@ -1465,7 +1936,7 @@ std::span<const std::byte> mesh_resource(ppc::Ctx& c,uint32_t descriptor,uint32_
 void hle_ResMeshSetup(ppc::Ctx& c) {
     uc::gx_audit_enter(0x80366D3C,c);
     matrix_boundary(0x80366D3C);
-    if(recording) throw std::invalid_argument("recorded native mesh setup requires implementation");
+    if(front_list) throw std::invalid_argument("recorded native mesh setup requires implementation");
     const auto bytes=mesh_resource(c,24,c.r[5] ? 32 : 0);
     if(bytes.size()<96 || bytes.size()>224 || (bytes.size()&31)) {
         std::fprintf(stderr,"[mesh-setup-variant] object %08X size %zu skip %u hex",read32(c.r[3]),bytes.size(),c.r[5] ? 32u : 0u);
@@ -1476,8 +1947,10 @@ void hle_ResMeshSetup(ppc::Ctx& c) {
     const auto sdk=read32(c.r[2]-8968); memory.read(sdk,0x600);
     if(parsed.descriptors) { ppc::wr32(c,sdk+0x14,parsed.low); ppc::wr32(c,sdk+0x18,parsed.high); }
     ppc::wr32(c,sdk+0x1C,parsed.vat[0]); ppc::wr32(c,sdk+0x3C,parsed.vat[1]); ppc::wr32(c,sdk+0x5C,parsed.vat[2]);
-    for(size_t i=0;i<12;++i) if(parsed.arrays&(1u<<i)) state.arrays[i]={parsed.addresses[i],uint8_t(parsed.strides[i])};
-    dirty_state();
+    back([arrays=parsed.arrays,addresses=parsed.addresses,strides=parsed.strides] {
+        for(size_t i=0;i<12;++i) if(arrays&(1u<<i)) state.arrays[i]={addresses[i],uint8_t(strides[i])};
+        dirty_state();
+    });
 }
 namespace {
 uint32_t guest_address(const std::byte* host) {
@@ -1504,7 +1977,7 @@ std::shared_ptr<const CachedMesh> native_mesh(std::span<const std::byte> bytes,c
             if(!gx::same_bytes(current,source.bytes)) { valid=false; break; }
         }
         if(valid) {
-            if(clean) ++cached.skips; else { cached.stamp=gx::watch_stamp(); cached.skips=0; }
+            if(clean) ++cached.skips; else { cached.stamp=gx::verified_stamp(); cached.skips=0; }
             add_guest_stat(geometry_hits,1); mesh_cache.splice(mesh_cache.begin(),mesh_cache,found->second); return found->second->mesh;
         }
     }
@@ -1544,8 +2017,8 @@ std::shared_ptr<const CachedMesh> native_mesh(std::span<const std::byte> bytes,c
         if(opcode!=0x80 && opcode!=0x90 && opcode!=0x98 && opcode!=0xA0) throw std::invalid_argument("unsupported native mesh triangle primitive");
         const auto length=gx::encoded_draw_size(layout,opcode,0,count,0x80366E14);
         if(length>bytes.size()-at) throw gx::Error(gx::ErrorCode::truncated,0x80366E14,length,bytes.size()-at);
-        decoder.begin(layout,opcode,0,count,producer(),0x80366E14);
-        decoder.write_attribute(producer(),bytes.subspan(at,length)); at+=length;
+        decoder.begin(layout,opcode,0,count,0,0x80366E14);
+        decoder.write_attribute(0,bytes.subspan(at,length)); at+=length;
         auto draw=decoder.take_draw();
         for(size_t i=0;i<sources.size();++i) if(const auto& incoming=decoder.sources()[i];incoming) {
             auto& range=sources[i];
@@ -1566,7 +2039,7 @@ std::shared_ptr<const CachedMesh> native_mesh(std::span<const std::byte> bytes,c
         const auto current=memory.read(range->address,range->size);
         result->sources.push_back({range->address,{current.begin(),current.end()}});
     }
-    result->stamp=gx::watch_stamp();
+    result->stamp=gx::verified_stamp();
     result->size=sizeof(CachedMesh)+result->bytes.capacity()+result->operations.capacity()*sizeof(decltype(result->operations)::value_type)+result->sources.capacity()*sizeof(CachedMesh::Source);
     for(const auto& source:result->sources) result->size+=source.bytes.capacity();
     for(const auto& operation:result->operations) if(const auto* geometry=std::get_if<MeshGeometry>(&operation)) result->size+=geometry->buffers->vertices.capacity()*sizeof(gx::Vertex)+geometry->buffers->indices.capacity()*sizeof(uint32_t);
@@ -1580,19 +2053,13 @@ std::shared_ptr<const CachedMesh> native_mesh(std::span<const std::byte> bytes,c
     }
     return result;
 }
-}
-void hle_ResMeshDraw(ppc::Ctx& c) {
-    CallTimer timer(1);
-    uc::gx_audit_enter(0x80366E14,c);
-    matrix_boundary(0x80366E14);
-    if(recording) throw std::invalid_argument("recorded native mesh draw requires implementation");
-    scheduler->safe_point(); // Service audio/VI between complete native mesh calls.
-    const auto bytes=mesh_resource(c,36,0);
-    const auto layout=snapshot(c);
+// The builder's half of hle_ResMeshDraw: the mesh bytes at `address` as the front checked them, the SDK block as the call saw it.
+void mesh_draw(const SdkRef& block,uint32_t lr,uint32_t object,uint32_t address,uint32_t size) {
+    const auto bytes=memory.read(address,size);
+    const auto layout=snapshot(block,lr);
     const auto misses_before=geometry_misses.load();
     const auto cached=native_mesh(bytes,layout);
     if(replaying) {
-        known_sdk=read32(c.r[2]-8968);
         // Matrix loads affect later draws; immutable vertex buffers and material packets do not.
         for(const auto& operation:cached->operations) {
             if(const auto* texture=std::get_if<MeshTexture>(&operation)) {
@@ -1607,13 +2074,13 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
         }
         return;
     }
-    auto [material,uniforms]=material_snapshot(c);
+    auto [material,uniforms]=material_snapshot(block,lr);
     std::array<std::shared_ptr<const gx::TexturePixels>,8> textures{};
     const bool profile_this_mesh=profile_mesh && mesh_profile_count<256 && geometry_misses.load()!=misses_before;
     if(profile_this_mesh) {
         ++mesh_profile_count;
-        const auto sdk=read32(c.r[2]-8968);
-        std::fprintf(stderr,"[mesh-material] object %08X stages %u channels %u descriptors %08X:%08X ambient %08X:%08X material %08X:%08X control %08X:%08X:%08X:%08X\n",c.r[3],material.stages,(read32(sdk+0x254)>>4)&7,read32(sdk+0x14),read32(sdk+0x18),read32(sdk+0xA8),read32(sdk+0xAC),read32(sdk+0xB0),read32(sdk+0xB4),read32(sdk+0xB8),read32(sdk+0xBC),read32(sdk+0xC0),read32(sdk+0xC4));
+        auto word=[&](uint32_t offset) { return block->word(offset); };
+        std::fprintf(stderr,"[mesh-material] object %08X stages %u channels %u descriptors %08X:%08X ambient %08X:%08X material %08X:%08X control %08X:%08X:%08X:%08X\n",object,material.stages,(word(0x254)>>4)&7,word(0x14),word(0x18),word(0xA8),word(0xAC),word(0xB0),word(0xB4),word(0xB8),word(0xBC),word(0xC0),word(0xC4));
         for(uint32_t i=0;i<material.stages;++i) std::fprintf(stderr,"[mesh-stage] %u color %06X alpha %06X order %03X konst %03X indirect %06X\n",i,material.stage[i].color,material.stage[i].alpha,material.stage[i].order,material.stage[i].konst,material.stage[i].indirect);
         for(uint32_t i=0;i<8;++i) {
             const auto& light=uniforms.lights[i];
@@ -1635,7 +2102,7 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
         try {
             const auto directory=std::filesystem::path("debug");   // profiling dump: relative to the working directory
             std::filesystem::create_directories(directory);
-            const auto path=directory/("mesh-map-"+std::to_string(map)+"-"+std::to_string(uc::now_ticks())+".ppm");
+            const auto path=directory/("mesh-map-"+std::to_string(map)+"-"+std::to_string(++mesh_dumps)+".ppm");
             std::ofstream file(path,std::ios::binary);
             file.exceptions(std::ios::badbit|std::ios::failbit);
             file<<"P6\n"<<level.width<<' '<<level.height<<"\n255\n";
@@ -1646,8 +2113,8 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
         } catch(const std::exception& error) { std::fprintf(stderr,"mesh texture dump failed: %s\n",error.what()); }
     }
     const size_t first_draw=draws.size();   // appended in place; removed again if the mesh fails midway
-    // Edited in place: a failure below ends the guest thread, so the half-updated state is never observed.
-    const auto selectors=texture_selectors(read32(c.r[2]-8968));
+    // Edited in place: a failure below stops the builder, and the guest thread ends, so the half-updated state is never observed.
+    const auto selectors=texture_selectors(*block);
     gx::share(mesh_state,layout);
     bool uniforms_dirty=true,transforms_dirty=true;   // changed since the shared block was last compared (that comparison is a memcmp of 2 KB per draw)
     const auto texture_wrap=wraps(bound_textures);
@@ -1684,7 +2151,7 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
         for(size_t d=first_draw;d<draws.size();++d) for(const auto& vertex:draws[d].vertex_view()) for(size_t channel=0;channel<4;++channel) {
             low_color[channel]=std::min(low_color[channel],vertex.color[0][channel]); high_color[channel]=std::max(high_color[channel],vertex.color[0][channel]);
         }
-        std::fprintf(stderr,"[mesh-color-range] object %08X rgba %u:%u %u:%u %u:%u %u:%u mode %u\n",c.r[3],low_color[0],high_color[0],low_color[1],high_color[1],low_color[2],high_color[2],low_color[3],high_color[3],unsigned(layout.descriptors[11]));
+        std::fprintf(stderr,"[mesh-color-range] object %08X rgba %u:%u %u:%u %u:%u %u:%u mode %u\n",object,low_color[0],high_color[0],low_color[1],high_color[1],low_color[2],high_color[2],low_color[3],high_color[3],unsigned(layout.descriptors[11]));
         for(size_t map=0;map<2;++map) {
             std::array<float,2> low{INFINITY,INFINITY},high{-INFINITY,-INFINITY};
             for(size_t d=first_draw;d<draws.size();++d) for(const auto& vertex:draws[d].vertex_view()) for(size_t axis=0;axis<2;++axis) {
@@ -1694,6 +2161,25 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
         }
     }
     for(size_t d=first_draw;d<draws.size();++d) { add_guest_stat(vertex_count,draws[d].vertex_view().size()); add_guest_stat(draw_count,1); }
+}
+}
+void hle_ResMeshDraw(ppc::Ctx& c) {
+    CallTimer timer(1);
+    uc::gx_audit_enter(0x80366E14,c);
+    matrix_boundary(0x80366E14);
+    if(front_list) throw std::invalid_argument("recorded native mesh draw requires implementation");
+    scheduler->safe_point(); // Service audio/VI between complete native mesh calls.
+    const auto bytes=mesh_resource(c,36,0);
+    const uint32_t sdk=read32(c.r[2]-8968);
+    const auto block=capture_sdk(sdk);
+    front_state(block);   // derive_state's errors at the call
+    known_sdk=sdk;
+    back_checked([block,lr=c.lr,object=c.r[3],address=guest_address(bytes.data()),size=uint32_t(bytes.size())] { mesh_draw(block,lr,object,address,size); });
+    if(profile_mesh && !mesh_dumps_settled) {   // until the profile's first mesh: whether it dumped decides the clock reads below
+        drain();
+        for(;mesh_dumps_seen<mesh_dumps.load();++mesh_dumps_seen) uc::now_ticks();
+        mesh_dumps_settled=mesh_profile_count>=1;
+    }
 }
 namespace {
 void native_tev_color(ppc::Ctx& c,bool signed_color,bool konst) {
@@ -1707,13 +2193,16 @@ void native_tev_color(ppc::Ctx& c,bool signed_color,bool konst) {
         if(signed_color && (v< -1024 || v>1023)) throw gx::Error(gx::ErrorCode::layout,pointer,1023,size_t(v));
         value[i]=v/255.f; channels[i]=uint32_t(v)&0x7FF;
     }
-    if(konst) color_uniforms.konst[id]=value; else color_uniforms.registers[id]=value;
-    dirty_material();
     const auto low=((0xE0+id*2)<<24)|(konst ? 0x800000u : 0u)|channels[0]|channels[3]<<12;
     const auto high=((0xE1+id*2)<<24)|(konst ? 0x800000u : 0u)|channels[2]|channels[1]<<12;
-    uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,low);
-    for(size_t i=0;i<(konst ? 1 : 3);++i) { uc::gx_fifo_write(1,0x61); uc::gx_fifo_write(4,high); }
-    if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::TevColor{id,konst,value});
+    uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,low);
+    for(size_t i=0;i<(konst ? 1 : 3);++i) { uc::gx_fifo_store(1,0x61); uc::gx_fifo_store(4,high); }
+    const bool push=recording_push();
+    back([id,konst,value,push] {
+        if(konst) color_uniforms.konst[id]=value; else color_uniforms.registers[id]=value;
+        dirty_material();
+        if(brec && push) brec->native.geometry.push_back(Resource::TevColor{id,konst,value});
+    });
     ppc::wr16(c,sdk+2,0);
 }
 }
@@ -1811,7 +2300,7 @@ void hle_GXSetFog(ppc::Ctx& c) {
 }
 void hle_ResChannelApply(ppc::Ctx& c) {
     matrix_boundary(0x80376148);
-    if(recording) throw std::invalid_argument("recorded native channel resource requires implementation");
+    if(front_list) throw std::invalid_argument("recorded native channel resource requires implementation");
     const auto data=read32(c.r[3]),sdk=read32(c.r[2]-8968);
     struct { std::array<std::pair<uint32_t,uint32_t>,16> items; size_t size=0;
         void emplace_back(uint32_t address,uint32_t value) { items[size++]={address,value}; }   // at most 13 updates
@@ -1877,7 +2366,7 @@ void hle_ResGenerationMode(ppc::Ctx& c) {
     if(native_cull>3) throw std::invalid_argument("invalid native cull conversion");
     const auto word=tex|(channels<<4)|((tev-1)<<10)|(indirect<<16)|(uint32_t(native_cull)<<14);
     ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x7FC3Fu)|(word&0x7FC3Fu));
-    if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::NumChannels{channels});
+    if(recording_push()) { front_effect({FrontEffect::num_channels,channels}); back([channels] { brec->native.geometry.push_back(Resource::NumChannels{channels}); }); }
 }
 void hle_GXSetNumChans(ppc::Ctx& c) {
     matrix_boundary(0x80286190);
@@ -1886,7 +2375,7 @@ void hle_GXSetNumChans(ppc::Ctx& c) {
     memory.read(sdk,0x600);
     ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x70u)|(count<<4));
     ppc::wr32(c,sdk+0x5FC,read32(sdk+0x5FC)|0x01000004u);
-    if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::NumChannels{count});
+    if(recording_push()) { front_effect({FrontEffect::num_channels,count}); back([count] { brec->native.geometry.push_back(Resource::NumChannels{count}); }); }
 }
 void hle_GXSetChanCtrl(ppc::Ctx& c) {
     matrix_boundary(0x802861B4);
@@ -1898,7 +2387,7 @@ void hle_GXSetChanCtrl(ppc::Ctx& c) {
     const auto publish=[&](uint32_t index) {
         ppc::wr32(c,sdk+0xB8+index*4,control);
         ppc::wr32(c,sdk+0x5FC,read32(sdk+0x5FC)|(0x1000u<<index));
-        if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::ChannelControl{index,control});
+        if(recording_push()) { front_effect({FrontEffect::channel_control,index,control}); back([index,control] { brec->native.geometry.push_back(Resource::ChannelControl{index,control}); }); }
     };
     publish(channel&3);
     if(channel>=4) publish((channel&1)+2);
@@ -1917,13 +2406,13 @@ void hle_GXLoadLightObjImm(ppc::Ctx& c) {
         if(!std::isfinite(value)) throw std::invalid_argument("nonfinite native light");
         (*fields[field])[lane]=value;
     }
-    color_uniforms.lights[id]=light; dirty_material();
-    if(recording) {
-        uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x000F0600|id*16);
-        for(uint32_t i=0;i<3;++i) uc::gx_fifo_write(4,0);
-        for(uint32_t i=3;i<16;++i) uc::gx_fifo_write(4,read32(pointer+i*4));
-        if(!recording->overflow) recording->native.geometry.push_back(Resource::Light{id,light});
+    if(front_list) {
+        uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x000F0600|id*16);
+        for(uint32_t i=0;i<3;++i) uc::gx_fifo_store(4,0);
+        for(uint32_t i=3;i<16;++i) uc::gx_fifo_store(4,read32(pointer+i*4));
     }
+    const bool push=recording_push();
+    back([id,light,push] { color_uniforms.lights[id]=light; dirty_material(); if(brec && push) brec->native.geometry.push_back(Resource::Light{id,light}); });
     ppc::wr16(c,read32(c.r[2]-8968)+2,1);
 }
 void hle_GXLoadNrmMtxImm(ppc::Ctx& c) {
@@ -1931,12 +2420,12 @@ void hle_GXLoadNrmMtxImm(ppc::Ctx& c) {
     const auto pointer=c.r[3],row=c.r[4]; memory.read(pointer,44);
     gx::NormalMatrix normal{};
     for(uint32_t i=0;i<9;++i) normal[i/3][i%3]=ppc::rdf32(c,pointer+(i/3)*16+(i%3)*4);
-    auto checked=transforms; gx::set_normal_matrix(checked,row,normal);
-    if(recording) {
-        uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,0x00080400|row*3);
-        for(const auto& values:normal) for(auto value:values) uc::gx_fifo_write(4,std::bit_cast<uint32_t>(value));
-        if(!recording->overflow) recording->native.geometry.push_back(Resource::Normal{row,normal});
-    } else transforms=checked;
+    if (row>61) throw gx::Error(gx::ErrorCode::layout,0x802888A8,61,row);   // gx::set_normal_matrix's check
+    if(front_list) {
+        uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,0x00080400|row*3);
+        for(const auto& values:normal) for(auto value:values) uc::gx_fifo_store(4,std::bit_cast<uint32_t>(value));
+        if(recording_push()) back([row,normal] { brec->native.geometry.push_back(Resource::Normal{row,normal}); });
+    } else back([row,normal] { gx::set_normal_matrix(transforms,row,normal); });
 }
 void hle_GXLoadTexMtxImm(ppc::Ctx& c) {
     matrix_boundary(0x80288954);
@@ -1946,9 +2435,12 @@ void hle_GXLoadTexMtxImm(ppc::Ctx& c) {
     memory.read(pointer,count*4);
     TextureMatrix matrix{};
     for(size_t i=0;i<count;++i) matrix[i/4][i%4]=std::bit_cast<float>(read32(pointer+uint32_t(i*4)));   // non-finite words are guest data, loaded as the hardware does
-    matrix_rows(texture_matrices,recording ? nullptr : &transforms,id,matrix,count/4); dirty_material();
     const auto address=id>=64 ? 0x500+(id-64)*4 : id*4;
-    uc::gx_fifo_write(1,0x10); uc::gx_fifo_write(4,(count-1)<<16|address);
-    for(uint32_t i=0;i<count;++i) uc::gx_fifo_write(4,read32(pointer+i*4));
-    if(recording && !recording->overflow) recording->native.geometry.push_back(Resource::TextureTransform{id,matrix,count/4});
+    uc::gx_fifo_store(1,0x10); uc::gx_fifo_store(4,(count-1)<<16|address);
+    for(uint32_t i=0;i<count;++i) uc::gx_fifo_store(4,read32(pointer+i*4));
+    const bool push=recording_push();
+    back([id,matrix,count,push] {
+        matrix_rows(texture_matrices,brec ? nullptr : &transforms,id,matrix,count/4); dirty_material();
+        if(brec && push) brec->native.geometry.push_back(Resource::TextureTransform{id,matrix,count/4});
+    });
 }

@@ -41,6 +41,8 @@ private:
 };
 
 MmioBus& mmio_bus();
-// Stores to the GX FIFO port (0xCC008000) are the hottest MMIO access (every immediate-mode vertex word): they skip the range search of the bus.
-void mmio_set_gx_fifo(MmioDevice* device);
+// Stores to the GX FIFO port (0xCC008000) are the hottest MMIO access (every immediate-mode vertex word and display-list byte): they skip the
+// range search of the bus. direct: they go straight to uc::gx_fifo_store (gx_fifo.h) instead of the device (which keeps the audit hooks).
+void mmio_set_gx_fifo(MmioDevice* device, bool direct = false);
+uint64_t mmio_gx_fifo_direct_bytes();   // bytes the direct path took (the device counts its own)
 }  // namespace uc

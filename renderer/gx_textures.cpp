@@ -1,6 +1,6 @@
 #include "gx_textures.h"
 #include "texture_replacement.h"
-#include "../runtime/gx_write_watch.h"
+#include "../runtime/gx_watch_stamp.h"
 #include <cstdio>
 #include <algorithm>
 #include <array>
@@ -174,7 +174,7 @@ std::shared_ptr<const TexturePixels> TextureCache::snapshot(uint32_t address, co
     if (pixels.size() < required) throw TextureError(TextureErrorCode::truncated, "truncated GX texture mip chain");
     pixels = pixels.first(required);
     address &= 0x3FFFFFFF;
-    if (watch_exhausted()) { watch_reset(); clear(); }
+    if (!on_builder_thread() && watch_exhausted()) { watch_reset(); clear(); }   // the GX builder thread never touches the counter (gx.cpp resets it)
     if (const auto generation = replacement_generation(); generation != seen_generation_) {   // mods were switched on or off: textures built with the old table are stale
         seen_generation_ = generation;
         by_address_.clear(); entries_.clear(); resident_ = 0;
@@ -187,7 +187,7 @@ std::shared_ptr<const TexturePixels> TextureCache::snapshot(uint32_t address, co
     // 256th use as a net for native writers that miss the barrier.
     const auto current = [&](Entry& entry) {
         if (!written_since(address, required, entry.stamp) && entry.skips < 256) { ++entry.skips; return true; }
-        if (same_bytes(entry.encoded, pixels)) { entry.stamp = watch_stamp(); entry.skips = 0; return true; }
+        if (same_bytes(entry.encoded, pixels)) { entry.stamp = verified_stamp(); entry.skips = 0; return true; }
         return false;
     };
     // The two most recently used entries first (the list is in use order): a draw's textures are mostly the previous draw's. An entry that
@@ -257,7 +257,7 @@ std::shared_ptr<const TexturePixels> TextureCache::snapshot(uint32_t address, co
             }
             resident_ -= entries_.back().bytes; entries_.pop_back(); ++evictions_;
         }
-        entries_.push_front({address, desc, palette.format, {pixels.begin(), pixels.end()}, {palette.bytes.begin(), palette.bytes.end()}, result, bytes, watch_stamp(), 0});
+        entries_.push_front({address, desc, palette.format, {pixels.begin(), pixels.end()}, {palette.bytes.begin(), palette.bytes.end()}, result, bytes, verified_stamp(), 0});
         try {
             by_address_.emplace(address, entries_.begin());
         } catch (...) {

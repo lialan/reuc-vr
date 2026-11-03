@@ -250,7 +250,7 @@ struct GuestRunner {
             catch (const std::exception& error) { uc::fatal("scheduler coordinator failed: %s", error.what()); }
         });
     }
-    void stop() { sched.shutdown(); packets.cancel(); if (coordinator.joinable()) coordinator.join(); }
+    void stop() { sched.shutdown(); packets.cancel(); if (coordinator.joinable()) coordinator.join(); uc::gx_stop_builder(); }
     ~GuestRunner() { stop(); }
 };
 }  // namespace
@@ -454,11 +454,12 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     uc::os_hle_init(sched, boot.mem, 0x817F0000);
     sched.irq_ctx().r[1] = 0x817EFF00;
     uc::vi_hle_init(sched, uc::kViPeriodNtsc, [&] {
-        g_fifo_snapshot.store(g_fifo.bytes, std::memory_order_relaxed);
+        g_fifo_snapshot.store(g_fifo.bytes + uc::mmio_gx_fifo_direct_bytes(), std::memory_order_relaxed);
         const uint64_t retraces = uc::vi_stats().retraces;
         if (det_trace) det_trace->on_retrace(retraces);
         if (deterministic && retraces % 60 == 0) {   // identical work per game second: the wall time and guest cycles between marks are what builds are compared on
             static auto last = std::chrono::steady_clock::now(); static uint64_t last_draws = 0, last_cycles = 0;
+            uc::gx_sync();   // the builder thread counts the draws: the count of a game second is the same as without it
             const auto now = std::chrono::steady_clock::now(); const uint64_t draws = uc::gx_stats().draws, cycles = sched.guest_cycles();
             static uint64_t last_insns = 0; const uint64_t insns = ppc::g_guest_insns;   // nonzero only in a --count-insns generation
             std::fprintf(stderr, "[detbench] retrace %llu draws %llu guest_mcycles %.2f wall_ms %.2f", (unsigned long long)retraces, (unsigned long long)(draws - last_draws), (cycles - last_cycles) / 1e6, std::chrono::duration<double, std::milli>(now - last).count());
@@ -702,8 +703,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     uc::audio_hle_init(sched,[&audio](std::span<const int16_t> pcm) { if (audio) audio->write(pcm); },options.profile);
     gx::Packets packets{bool(network)};
     uc::gx_hle_init(sched, boot.mem, options.headless ? nullptr : &packets, options.profile);
+    // Guest FIFO stores go straight to the GX HLE unless an audit watches them (FifoSink).
+    uc::mmio_set_gx_fifo(&g_fifo, !options.gx_audit && !options.gx_gaps);
     if (!options.headless) {
         uc::gx_enable_async_textures();
+        uc::gx_enable_builder();   // draws are built on their own thread (UC_GX_SYNC=1: on the guest thread)
         // Replacement textures (BC7 .dds named like the dumped PNGs) sit next to the exe; nothing happens without the folder.
         if (const auto count = gx::texture_replacements().load_index(exe_dir() / "textures")) {
             std::fprintf(stderr, "texture replacements: %zu files\n", count);
@@ -1414,7 +1418,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         renderer.shutdown();
     }
     if (options.validation && renderer.validation_errors()) result = 4;
-    g_fifo_snapshot.store(g_fifo.bytes);
+    g_fifo_snapshot.store(g_fifo.bytes + uc::mmio_gx_fifo_direct_bytes());
     std::fprintf(stderr, "runtime stopped; all guest and file workers joined\n");
     if (options.gx_gaps) {
         std::error_code error; fs::create_directories(exe_dir() / "debug", error);
