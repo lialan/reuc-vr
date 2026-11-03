@@ -40,13 +40,20 @@ namespace {
 constexpr size_t kTevWords=68, kDrawUniformBytes=sizeof(gx::DrawUniform)+kTevWords*sizeof(uint32_t);
 constexpr size_t kStereoBlockBytes=128;   // smoke.slang StereoBlock: two eyes x four rows
 const std::shared_ptr<const gx::TexturePixels>& draw_texture(const gx::DrawPacket& draw,size_t map) { return map ? draw.texture_maps[map-1] : draw.texture; }
-// The fragment shading rate of a draw of the game's bloom chain: a 2D quad (outside the scene, drawn the same in both eyes) whose every
-// texture is magnified onto it: EFB copies of at most 320x180 (the half- and quarter-size blur chain) at no more than one texel per guest
-// pixel, other textures (the lens masks) at two guest pixels a texel or more. Such a draw is shaded on a grid of 1.5 points per guest
-// pixel or finer on each axis (on the Quest's 3.2 x 6.1 EFB scale: 2x4), not at the EFB's full scale; anything else at 1x1.
-VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, bool eligible) {
+// The fragment shading rate of a draw whose textures are all magnified onto it, so that coarse shading only drops texels that are not
+// there. Two kinds, outside the scene:
+// - the game's bloom chain and lens glows: a 2D quad drawn the same in both eyes (stereo class pass or fill), its EFB copies of at most
+//   320x180 (the half- and quarter-size blur chain) at no more than one texel per guest pixel, other textures (the lens masks) at two
+//   guest pixels a texel or more;
+// - translucent world sprites (smoke, heat haze, glows: blended, no depth write, no EFB copy) whose textures cover two guest pixels a
+//   texel or more (by the draw's box in the game's camera). UC_NO_VRS_WORLD=1 leaves them at 1x1.
+// Such a draw is shaded on a grid of 1.5 points per guest pixel or finer on each axis (on the Quest's 3.2 x 6.1 EFB scale: 2x4), not at
+// the EFB's full scale; anything else at 1x1.
+VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, bool flat_eligible, bool world_eligible, bool depth_write) {
     const VkExtent2D full{1,1};
-    if (!eligible || draw.reticle || draw.late_aim || draw.transforms->projection[3][3]==0) return full;
+    static const bool no_world=std::getenv("UC_NO_VRS_WORLD")!=nullptr;
+    const bool perspective=draw.transforms->projection[3][3]==0;
+    if (draw.reticle || draw.late_aim || !(perspective ? !no_world && world_eligible && draw.blend.mode==1 && !depth_write : flat_eligible)) return full;
     const auto box=gx::draw_bounds_ndc(draw);
     if (!box) return full;
     const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
@@ -56,8 +63,8 @@ VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, boo
         const auto& texture=draw_texture(draw,map);
         if (!texture || texture->levels.empty()) continue;
         const float w=float(texture->levels[0].width), h=float(texture->levels[0].height);
-        if (texture->gpu_only ? (w>320 || w>width*1.05f || h>height*1.05f) : (w*2>width || h*2>height)) return full;
-        any|=texture->gpu_only;
+        if (texture->gpu_only ? (perspective || w>320 || w>width*1.05f || h>height*1.05f) : (w*2>width || h*2>height)) return full;
+        any|=texture->gpu_only || perspective;
     }
     if (!any) return full;
     const auto axis=[](double scale) { return scale/4>=1.5 ? 4u : scale/2>=1.5 ? 2u : 1u; };
@@ -3035,6 +3042,17 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
             DrawPush push=run.push;
             apply_rate(run.rate);
+            {   // UC_GPU_PACKETS: how many issued runs shade coarsely, flat (bloom chain, glows) and world (sprites)
+                static const bool rate_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
+                if (rate_stats) {
+                    static uint64_t flat=0, world=0, all=0; static auto since=std::chrono::steady_clock::now();
+                    ++all; if (run.rate.width*run.rate.height>1) ++(draw.transforms->projection[3][3]==0 ? world : flat);
+                    if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
+                        std::fprintf(stderr,"[vrs] runs shaded coarsely: %llu flat, %llu world, of %llu\n",(unsigned long long)flat,(unsigned long long)world,(unsigned long long)all);
+                        flat=world=all=0; since=std::chrono::steady_clock::now();
+                    }
+                }
+            }
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
             const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
             if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
@@ -3241,7 +3259,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 push.motion=0;   // the stereo shaders read the eye block from the set, not this index
                 const auto& x=xform_draws[d];
                 Run run{d,info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
-                        set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL)) : VkExtent2D{1,1}};
+                        set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1}};
                 const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
                 const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && set_keys[pending->set]==set_keys[run.set] &&
                     std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0 &&
@@ -3266,7 +3284,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 continue;
             }
             if (set_shading_rate_) {
-                const VkExtent2D rate=bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL));
+                const VkExtent2D rate=bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1);
                 if (rate.width!=bound_rate.width || rate.height!=bound_rate.height) {
                     const VkFragmentShadingRateCombinerOpKHR keep[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
                     set_shading_rate_(slot.command,&rate,keep); bound_rate=rate;
@@ -3419,6 +3437,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         else if (!packet.draws.empty() || (copy_target && packet.clear_after_copy)) scene_restore_copy_.reset();
     }
     bool ui_layer=false;   // HDR: the overlays went to the slot's UI layer, the encode composites them
+    // The headset reads the presented EFB region in place: the copy into the slot image (2 x 2064x2208 at the native scale, 1.35 ms on the
+    // Quest) is made only for a frame that may be captured (keep_frame), held for the reticle layer or blanked. UC_XR_VIA_SLOT=1: always copy.
+    static const bool xr_via_slot=std::getenv("UC_XR_VIA_SLOT")!=nullptr;
+#ifdef UC_OPENXR
+    const bool xr_direct=xr_ && xr_frame_ && packet.present && display && !overlay_frame && !packet.black_output && !hold && !keep_frame_ && !xr_via_slot;
+#else
+    const bool xr_direct=false; (void)xr_via_slot;
+#endif
     if (packet.present && display && !overlay_frame) {
         const bool prompts=layers_==1 && !packet.prompts.empty() && !packet.black_output, menu=layers_==1 && bool(menu_build_);   // the headset has HOTD4's panel instead
         ui_layer=hdr_active_ && (prompts || menu);
@@ -3442,7 +3468,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if(packet.black_output) {
             const VkClearColorValue black{}; const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,VK_REMAINING_ARRAY_LAYERS};
             vkCmdClearColorImage(slot.command,slot.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&range);
-        } else vkCmdBlitImage(slot.command,efb_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,slot.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy,VK_FILTER_NEAREST);
+        } else if (!xr_direct) vkCmdBlitImage(slot.command,efb_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,slot.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy,VK_FILTER_NEAREST);
         const auto record_overlays=[&](VkImageView view,VkAttachmentLoadOp load) {
             VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};color.imageView=view;color.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;color.loadOp=load;color.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo ui{VK_STRUCTURE_TYPE_RENDERING_INFO};ui.renderArea.extent=extent_;ui.layerCount=1;ui.colorAttachmentCount=1;ui.pColorAttachments=&color;
@@ -3463,6 +3489,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             barrier(slot.command,slot.ui_image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         }
     }
+#ifdef UC_OPENXR
+    if (xr_direct) {   // before the clear after the present empties the region: the displayed rectangle of the EFB, in texture coordinates
+        const float u0=float(uint64_t(display_source[0])*efb_extent_.width/640), v0=float(uint64_t(display_source[1])*efb_extent_.height/480);
+        const float u1=float(std::max<uint64_t>(uint64_t(u0)+1,uint64_t(display_source[0]+display_source[2])*efb_extent_.width/640));
+        const float v1=float(std::max<uint64_t>(uint64_t(v0)+1,uint64_t(display_source[1]+display_source[3])*efb_extent_.height/480));
+        const float w=float(efb_extent_.width), h=float(efb_extent_.height);
+        xr_->record(slot.command, efb_, efb_view_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {u0/w, v0/h, (u1-u0)/w, (v1-v0)/h});
+    }
+#endif
     if (hold) {   // keep the finished picture (without the reticle) and the reticle draws that belong on it: the overlay frame after this one presents them
         const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
         barrier(slot.command,held_.image,held_.image_ready ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -3531,7 +3566,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (packet.present && upscaler_ && !scene_only) scene_clear_={true,packet.display_source,packet.clear_color,packet.clear_depth};
     }
 #ifdef UC_OPENXR
-    if (xr_ && xr_frame_ && packet.present && display) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (xr_ && xr_frame_ && packet.present && display && !xr_direct) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 #endif
     if(present_image) {
         const auto present_layout=fsr_presentation_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : streamline_swapchain() ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -3608,8 +3643,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if(detached_copies_ && packet.texture_copy->target->guest_address)latest_copies_[packet.texture_copy->target->guest_address]=packet.texture_copy->target;
     }
     for (auto& texture : slot.textures) texture->initialized=true;
+    if (packet.present && display) keep_frame_=false;
     if (packet.present && !overlay_frame) { frame_start_=true; ++frame_index_; scene_restore_copy_.reset(); dlss5_scene_.ready=false; frame_reticle_.clear(); }
-    slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display; slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
+    slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display && !xr_direct; slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
 #ifdef UC_OPENXR
     if (xr_ && packet.present && display && xr_->frame_open()) { xr_->end_frame(xr_frame_); if (xr_frame_) ++presentations_; xr_frame_ = false; }
 #endif

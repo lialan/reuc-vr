@@ -57,7 +57,8 @@ public:
     void detach();
     bool begin_frame();
     // The finished game picture (layout `layout`, left in it again) on the screen plane in both eyes. Call only after begin_frame() true.
-    void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout);
+    // rect: the part of the picture the eyes show, in texture coordinates (the whole picture, or the EFB's displayed region read in place)
+    void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect = {0, 0, 1, 1});
     void end_frame(bool rendered);
     bool frame_open() const { return frame_open_; }
     bool exiting() const { return exiting_; }

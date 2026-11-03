@@ -808,6 +808,8 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             const auto render_start=std::chrono::steady_clock::now();
             const bool display=!pending->replay && frame_limit.ready(pending->present,render_start);
             const auto prior_presents=renderer.presentation_count();
+            static const bool scene_dumps=std::getenv("UC_SCENE_DUMP")!=nullptr;
+            renderer.keep_frame(debug_capture_requested || options.gx_audit || scene_dumps);   // a capture reads this frame's slot image
             const bool rendered=renderer.render(*pending,display,pending_serial);
             profile_retries+=!rendered;
             const auto render_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-render_start).count();

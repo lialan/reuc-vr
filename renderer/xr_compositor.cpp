@@ -25,8 +25,8 @@ void vk(VkResult result, const char* what) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("XR: ") + what + " failed: VkResult " + std::to_string(result));
 }
 // The screen pass's push constants: per eye the four columns of the Vulkan clip transform of the quad -1..1.
-struct EyeConstants { float columns[2][16]; };
-static_assert(sizeof(EyeConstants) == 128);
+struct EyeConstants { float columns[2][16]; float rect[4]; };   // rect: the picture's part the eyes show (u, v, width, height in texture coordinates)
+static_assert(sizeof(EyeConstants) == 144);
 // UC_XR_TIMING=1: where the render thread waits on the runtime, every 300 frames (LINDBERGH_XR_TIMING in HOTD4).
 void xr_time(int what, std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     static const bool on = [] { const auto* v = std::getenv("UC_XR_TIMING"); return v && *v == '1'; }();
@@ -265,7 +265,7 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
                                                      {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &sampler_}};
     VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set.bindingCount = 2; set.pBindings = bindings;
     vk(vkCreateDescriptorSetLayout(device_, &set, nullptr, &set_layout_), "descriptor layout");
-    const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(EyeConstants)};
+    const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EyeConstants)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout_; layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
     vk(vkCreatePipelineLayout(device_, &layout, nullptr, &layout_), "pipeline layout");
     // xr_screen.slang constant 0: edge smoothing as the picture is magnified onto the eye (UC_XR_FXAA=0 turns it off, for comparison)
@@ -422,7 +422,7 @@ void XrCompositor::observe(const gx::Projection& projection) {
     lens_seen_ = true;
 }
 
-void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout) {
+void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect) {
     if (!acquired_) throw std::logic_error("XR: record without an acquired eye array");
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (const auto& bound : bound_) if (bound.view == picture_view) set = bound.set;
@@ -474,7 +474,8 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     // Each eye's layer covers that eye: the renderer drew it in the eye's space already.
     EyeConstants constants{};
     for (int eye = 0; eye < 2; ++eye) { const auto unit = xr::identity(); std::memcpy(constants.columns[eye], unit.data(), sizeof constants.columns[eye]); }
-    vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof constants, &constants);
+    std::copy(rect.begin(), rect.end(), constants.rect);
+    vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof constants, &constants);
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());
     vkCmdEndRendering(command);

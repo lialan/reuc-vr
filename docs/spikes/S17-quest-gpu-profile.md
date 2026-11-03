@@ -213,3 +213,29 @@ Next steps, by size: the present (4.8 ms: an EFB -> slot blit, then the FXAA scr
 saves the blit, FXAA at native scale is a quality call: `UC_XR_FXAA=0` took the present 4.8 -> 4.0 ms); the full-screen passes' floor (~2 ms each: composite, colour pass, glows) only
 moves with fewer pixels (a lower EFB scale for the whole post/HUD part or fragment density maps); the particle packet (copy 320x180,
 50-199 perspective draws, ~5.5 ms) and the transparent effects packet belong to the scene work.
+
+### On the merged build (134f541 + ccc8f61, 2026-11-03)
+
+After the main-scene work (vertex pre-pass, merged draw runs) the frame is ~37.4 ms GPU at 3.07x (640 MHz; 20 fps presented, the
+GPU 75-80% busy). Two more changes on this branch (ccc8f61):
+- **The eyes read the EFB in place.** The present copied the displayed EFB region into the slot image and the XR screen pass sampled
+  that copy. The screen pass now samples the region of the EFB itself (`xr_screen.slang` gets the shown rect; taps clamp to its texel
+  centres as the copy's edge did), recorded before the clear after the present. The copy is made only for a frame a capture may read
+  (`GameRenderer::keep_frame`: a screenshot request, the GX audit, `UC_SCENE_DUMP`), a held reticle-layer frame or a blanked one.
+  `UC_XR_VIA_SLOT=1` restores the copy. Present 4.94 -> 4.00 ms (A/B on the merged build).
+- **Translucent world sprites shade coarsely too**: perspective, blended, no depth write, no EFB copy, every texture covering two guest
+  pixels a texel or more by the draw's box (the fight's smoke, dust and heat-haze quads, 64x64 sprites with ~6x overdraw). The particle
+  packet (`copy 320x180`, 50-199 draws) 4.7 -> 2.8 ms; ~400 world runs coarse per 2 s. `UC_NO_VRS_WORLD=1` leaves them at 1x1.
+
+Where the post-scene part stands (GPU ms per presented frame, run uctest-fight-20261103-031309): HUD packet 4.5 (per-draw cost of
+~55 tiny HUD quads ~2.2 ms, lens glows ~1.1 ms coarse), present 4.0 (screen pass over 2 x 2064x2208 reading the EFB, FXAA 0.8 of it),
+particles 2.8, colour pass 2.7, transparent effects 2.2, composite + full copy 1.3, the rest of the chain ~3.
+
+Measured and dropped: the clear after the present costs ~0.1 ms (skipping it, a diagnostic, changed nothing); shrinking the HUD pass's
+render area to the displayed rows (no gain, as for the post chain).
+
+Per-draw cost (found on the HUD packet, handed to the scene work): ~40 us per tiny draw on the Quest; binding the pipeline once for the
+whole packet (a diagnostic) saved 1.3 of the 2.2 ms, viewport/push constants/dynamic state 0.7, descriptor sets nothing.
+
+Harness note: frame captures accumulate in the app's private folder on the headset across runs (3.8 GB here); past ~600 MB the pull
+in `scripts/quest/run.py` times out and runs come back without `captures.tar`. Clear `files/.codex-xr-<id>/captures` now and then.

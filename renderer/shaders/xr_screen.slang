@@ -2,7 +2,7 @@
 // already drawn in its eye's space (the renderer's per-draw reprojection: world per eye, HUD on HOTD4's screen plane); the quad covers the
 // eye through the transform pushed for it (GL clip convention, column-major), converted to Vulkan clip space afterwards as HOTD4's shader
 // wrapper does: Y flipped, depth -w..w to 0..w.
-struct Eyes { float4 columns[2][4]; };
+struct Eyes { float4 columns[2][4]; float4 rect; };   // rect: the part of the picture shown (u, v, width, height): the whole slot image, or the EFB's displayed region
 [[vk::push_constant]] ConstantBuffer<Eyes> eyes;
 [[vk::binding(0, 0)]] Texture2DArray picture;
 [[vk::binding(1, 0)]] SamplerState linear;
@@ -17,7 +17,7 @@ VOut vertexMain(uint id : SV_VertexID, uint view : SV_ViewID) {
     const float4 clip = eyes.columns[view][0] * xy.x + eyes.columns[view][1] * xy.y + eyes.columns[view][3];
     VOut o;
     o.position = float4(clip.x, -clip.y, 0.5 * (clip.z + clip.w), clip.w);
-    o.uv = float2(0.5 + 0.5 * xy.x, 0.5 - 0.5 * xy.y);   // clip +y is the picture's top row
+    o.uv = eyes.rect.xy + float2(0.5 + 0.5 * xy.x, 0.5 - 0.5 * xy.y) * eyes.rect.zw;   // clip +y is the picture's top row
     return o;
 }
 
@@ -26,7 +26,11 @@ VOut vertexMain(uint id : SV_VertexID, uint view : SV_ViewID) {
 // the picture's own texels and its stored (sRGB-encoded) colours, as FXAA expects. Specialization constant 0 = 0 turns it off (UC_XR_FXAA=0).
 [[vk::constant_id(0)]] const uint fxaaOn = 1;
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
-float3 tap(float2 uv, float layer) { return picture.SampleLevel(linear, float3(uv, layer), 0).rgb; }
+float3 tap(float2 uv, float layer) {   // clamped to the shown rect's texel centres, as a picture of exactly that size clamps to its edge
+    uint width, height, layers; picture.GetDimensions(width, height, layers);
+    const float2 half = 0.5 / float2(width, height);
+    return picture.SampleLevel(linear, float3(clamp(uv, eyes.rect.xy + half, eyes.rect.xy + eyes.rect.zw - half), layer), 0).rgb;
+}
 float3 fxaa(float2 uv, float layer) {
     uint width, height, layers; picture.GetDimensions(width, height, layers);
     const float2 texel = float2(1.0 / width, 1.0 / height);
