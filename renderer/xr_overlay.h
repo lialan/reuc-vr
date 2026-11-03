@@ -15,6 +15,7 @@ public:
     static constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
     void initialize(VkPhysicalDevice physical, VkDevice device, VkFormat color_format, uint32_t width, uint32_t height, const std::filesystem::path& shaders);
     void shutdown();
+    void set_fovea_support(bool on) { fovea_support_ = on; }   // before initialize(): the eye pass may bind a foveation map (the overlay ignores it)
     VkImageView depth_view() const { return depth_view_; }
     VkImage depth_image() const { return depth_; }
     // Before the eye pass, outside any rendering: the panel pictures that changed (null: unchanged).
@@ -31,6 +32,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
     uint32_t width_ = 0, height_ = 0;
+    bool fovea_support_ = false;
     VkImage depth_ = VK_NULL_HANDLE; VkDeviceMemory depth_memory_ = VK_NULL_HANDLE; VkImageView depth_view_ = VK_NULL_HANDLE;
     struct Mesh { VkDeviceSize offset = 0; uint32_t vertices = 0; float rail = 0; };
     std::array<Mesh, 9> meshes_{};

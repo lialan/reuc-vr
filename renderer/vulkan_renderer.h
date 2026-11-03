@@ -387,6 +387,23 @@ private:
     bool keep_frame_=false;   // keep_frame(): the next presented frame keeps its slot image (captures read it)
     bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
     PFN_vkCmdSetFragmentShadingRateKHR set_shading_rate_=nullptr;   // VK_KHR_fragment_shading_rate (pipeline rate) enabled: the bloom chain's draws shade coarsely
+    // The headset's fixed foveation (renderer/fovea_map.h): an attachment shading-rate image over the EFB, one layer per eye, coarser
+    // towards each eye's periphery, bound to every EFB pass while the level (vr.cfg "foveation", UC_VR_FOVEATION) is above 0. The draws
+    // it applies to (world draws of the eyes' scene, full-screen fades, 2D passes over full-size copies) take its rate; the HUD, the
+    // reticle, the bloom chain's coarse draws and pictures drawn for a small copy keep their own. UC_NO_FOVEATION=1: no attachment rate.
+    bool fovea_supported_=false, fovea_layered_=false, fovea_max_op_=false;
+    VkExtent2D fovea_texel_{16,16};
+    uint32_t fovea_largest_=4;   // the largest square rate the device has (1, 2 or 4)
+    int fovea_level_=0;          // the level the maps hold (0: none bound)
+    // A map: the EFB's (every EFB pass) and the eye image's (the compositor's screen pass, UC_NO_EYE_FOVEATION=1: none).
+    struct FoveaMap { VkImage image=VK_NULL_HANDLE; VkDeviceMemory memory=VK_NULL_HANDLE; VkImageView view=VK_NULL_HANDLE; VkExtent2D extent{}; std::vector<float> key; };
+    FoveaMap fovea_efb_, fovea_eye_;
+    std::array<float,4> fovea_shown_{0,0,640,360};   // the last presented display region, in guest pixels
+    void update_fovea();
+    bool update_fovea_map(FoveaMap& map, VkExtent2D extent, const std::array<float,4>& shown, const std::array<std::array<float,4>,2>& tangents, int level, uint32_t largest);
+    void destroy_fovea();
+    void destroy_fovea_map(FoveaMap& map);
+    int wanted_fovea_level() const;
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
     HdrPass hdr_pass_;

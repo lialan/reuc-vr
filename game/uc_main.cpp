@@ -504,6 +504,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     }
     double render_aspect=16.0/9;
     bool native_eye_scale=false;   // the headset without an explicit render_scale: each eye's scene at the eye image's size (every renderer restart)
+    bool scale_from_vr=false;      // the headset without an explicit render_scale: vr.cfg's render_scale (native or a multiplier), read at every renderer start
     // Native ultrawide (renderer/ultrawide.h): the packets are scaled for the shape of the output, whatever shape the EFB was created in.
     int view_width=0,view_height=0;   // the last output size the factors were made for (a change of the interface position remakes them)
     const auto view_for_output=[&options,&view_width,&view_height,&network,deterministic](int width,int height) {
@@ -530,6 +531,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         renderer.allow_dlss5(options.dlss5_enabled);
 #ifdef UC_OPENXR
         renderer.use_xr(xr.get());
+        if(scale_from_vr) {   // the panel may have changed it since the last start (the renderer applies a change live)
+            const float chosen=xr->render_scale();
+            native_eye_scale=!(chosen>0);
+            options.render_scale=native_eye_scale ? 1.0 : chosen;   // native: 1.0 is only the placeholder the renderer replaces
+        }
         renderer.set_native_eye_scale(native_eye_scale);
 #endif
         renderer.initialize(window.get(), options.validation, exe_dir() / "data" / "shaders", options.render_scale,render_aspect,options.window_mode==uc::WindowMode::exclusive);
@@ -595,7 +601,8 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         // there on the Quest 3 (GPU about 82% busy); 1.07x, the 720p window's own, ran at 20-24. render_scale in config.json overrides it.
         // Native VR: without an explicit render_scale the renderer gives each eye's scene exactly the eye image's size (2064x2208 on the
         // Quest 3; VulkanRenderer::initialize); 1.0 is only the placeholder it replaces.
-        if(xr && !options.render_scale) { options.render_scale=1.0; native_eye_scale=true; }
+        // Without one, vr.cfg's render_scale (the settings panel's "Render scale", native by default) decides, at every renderer start.
+        if(xr && !options.render_scale) { scale_from_vr=true; options.render_scale=1.0; native_eye_scale=true; }
 #endif
         video.emplace();
         const auto display=SDL_GetPrimaryDisplay();

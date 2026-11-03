@@ -336,3 +336,91 @@ EFB-copy maps in `GXCallDisplayList`, a cheaper state snapshot, an LRU without l
 - Guest threads on one host thread (fibres instead of a host thread each): the ~19 us baton handoff, ~920 a second live.
 - The replay bench: without `UC_GPU_PACKETS` (or with the per-packet area estimate made cheap) its render thread stops inflating the
   draw-done wait; `UC_FINISH_AT_SUBMIT=1` measures the guest+render CPU path as live play has it.
+
+
+## Foveation and render scale options (2026-11-03, branch quest-foveation)
+
+The owner's ask: foveated rendering to cut the GPU's work, switchable and with a strength, and a render scale, both settable in the
+headset.
+
+### What the Quest's GPU offers
+
+The Adreno 740 driver (`[vulkan] shading rates` line) has VK_KHR_fragment_shading_rate with pipeline, primitive and **attachment**
+rates: attachment texels of exactly 8x8, layered attachments (multiview takes each eye's layer by its view index), the non-trivial
+combiners (MAX), rates 1x1 1x2 2x1 2x2 4x2 4x4. The runtime's eye fields of view (tangents left/right/down/up): left eye 1.376 /
+0.839 / 1.428 / 0.966 (54 / 40 / 55 / 44 degrees), the right eye mirrored: each eye's centre of projection lies 1/8 of the picture
+off its middle towards the nose, and above the middle.
+
+### The approach: a shading-rate attachment over the EFB and the eye images
+
+`renderer/fovea_map.h` makes the map: for each 8x8 texel the angle from the eye's forward direction (through that eye's tangents onto
+the shown rectangle), 1x1 inside a first angle, 2x2 to a second, 4x4 beyond and outside the shown rows. Levels (vr.cfg `foveation`):
+
+| level | 1x1 up to | 2x2 up to | eye pixels at 1x1 / 2x2 / 4x4 (the Quest 3's fields of view, `[vr] foveation` lines) |
+|---|---|---|---|
+| Low | 35 deg | 50 deg | 29 / 43 / 28% |
+| Medium | 30 deg | 42 deg | 20 / 28 / 52% |
+| High | 25 deg | 36 deg | 13 / 18 / 69% |
+
+In tangent space (the eye image) the periphery takes most pixels, which is why even Low coarsens 70% of them: a full-screen pass's
+fragment work falls to about 41 / 30 / 22%.
+
+- **EFB**: one map, a layer per eye, bound (`VkRenderingFragmentShadingRateAttachmentInfoKHR`) to every EFB pass while a level is on.
+  Which draws take it (combiner MAX with their own pipeline rate, so the bloom chain's 2x4 stays at least 2x4): world draws of the
+  eyes' scene (not a perspective picture for a small copy), full-screen fades (FILL) and 2D passes over full-size copies (composite,
+  colour pass). The HUD (text stays sharp), the aim reticle and late-aimed quads keep 1x1; packets that draw a picture for a small
+  copy (the bloom chain's 320x180 / 160x90 corners) keep their own rate, since what is drawn there is not what the eye sees there.
+- **Eye images**: a second map of the eye image (2064x2208), bound to the compositor's screen pass (its pipeline: REPLACE); the
+  overlay pipelines (guns, beams, panels) have no rate state and ignore it. `UC_NO_EYE_FOVEATION=1` leaves the screen pass at 1x1.
+- Every EFB pipeline is created with `VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR` when the device has
+  attachments, so the level changes live with no pipeline rebuild; level off binds no map. A map is rebuilt (device idle, ~0.1 MB
+  upload) only when the level, the EFB size, the shown rectangle or the eye tangents change.
+- Diagnostics: `UC_VR_FOVEATION=0..3` overrides vr.cfg (the harness), `UC_NO_FOVEATION=1` disables the attachment entirely,
+  `UC_VR_FOVEA_CAP=0` lifts the cap below native (below), `UC_VR_SCALE_SWITCH=<frame>:<scale>,...` changes the render scale live as
+  the panel does; `[vr] foveation level N (coarsest WxH): map ...` logs each map with its shares, `[vrs]` (UC_GPU_PACKETS) counts the
+  foveated runs.
+
+The subsampled fragment-density-map variant was not needed: the attachment route works and needs no change to how the EFB is copied or
+sampled (subsampled images would have to be read through subsampled samplers by every copy and by the screen pass).
+
+### Measured (fightvr replay, GPU ms per presented frame, all at 545 MHz)
+
+| render scale | off | Low | Medium | High |
+|---|---|---|---|---|
+| native 3.07x (2064x2208 an eye) | 43.6 / 43.9 | 32.7 | 30.7 | 29.0 |
+| 1.5x (1010x1080 an eye) | 19.3 | | 15.3 (14.8 uncapped) | 15.0 |
+| 1.0x (673x720 an eye) | 15.2 | | | 14.1 (eye images only: present 3.7 -> 2.5) |
+
+- The foveation build with the level off: 43.5 ms (the pipeline flag costs nothing). The final build (with the cap) repeats native
+  Medium at 30.9 ms. Medium at native without the eye-image map:
+  31.2 ms (the eye map takes the present 4.0 -> 3.3 ms).
+- Per packet at native (off -> Low / Medium / High): main scene 13.4 -> 11.2 / 10.8 / 10.6 (the rest is its per-draw floor), HUD
+  and overlay packet (lens glows, transparent effects) 9.4 -> 5.4 / 4.7 / 4.0, particles (`copy 320x180`: a full view copied at half
+  size) 8.0 -> 5.3 / 4.7 / 4.3, present 4.0 -> 3.4 / 3.3 / 3.2, composite + full-size copy 2.6 -> 1.8 / 1.6 / 1.5.
+- At 1.5x Medium (off -> on): main scene 7.0 -> 6.6, present 3.7 -> 2.6, particles 2.7 -> 1.9, HUD/overlay 2.8 -> 1.6.
+
+The coarsest EFB rate is capped below native (`[vr] foveation level N (coarsest WxH)`): a shading point covers at most about 4 eye
+pixels per axis, as 4x4 does at native. Uncapped, 4x4 at 1.5x spans 8 eye pixels and the replay's captures showed 8-pixel stair
+steps on the train's railings at the eyes' lower edges; capped (2x2 at most at 1.5x and 2x, none at 1x and 1.25x, where an EFB
+pixel already spans 2.4-3 eye pixels) the periphery is hard to tell from level off in the same captures, for 0.5 ms of the 4.5 ms
+gained (`UC_VR_FOVEA_CAP=0` lifts the cap). At 1x only the eye images' screen pass is foveated.
+
+Pictures (UC_CAPTURE_RETRACES=8700,9060,9300 in the replay; the captures are the EFB's shown region, before the screen pass): the
+centre of each eye, the HUD, its text and the reticle are identical to level off at every level; at native High the lower corners
+show 4x4 blocks in the train roof's texture when the capture is viewed 1:1, geometry edges stay sharp (coverage stays per pixel).
+Whether the periphery is acceptable through the lenses is the owner's call; Low already takes a quarter off the frame at native.
+
+Live switching (`UC_VR_SCALE_SWITCH=<frame>:<scale>,...`, a diagnostic that does what the panel does, with vr.cfg's keys set through
+`LINDBERGH_XR_SET=foveation=high,render_scale=1.5`): 1.5x -> native -> 1x in one replay, the EFB and both maps remade, the 1x capture
+after the switches identical to a run started at 1x.
+
+### The settings panel
+
+HOTD4's VR panel has "Resolution per eye" (on restart) and "Foveation" (Off / Low / Medium / High: the runtime's FB swapchain
+foveation, which this game's build never enabled, so the row did nothing). Here:
+- **Foveation** (same row, names and order as HOTD4): now this map; applied the next frame; vr.cfg `foveation off|low|medium|high`,
+  default off (the panel's saved vr.cfg files say off already).
+- **Render scale** (new row after "Resolution per eye"): Native (3.07x) -> 2x -> 1.5x -> 1.25x -> 1x -> Native; applied live (the
+  renderer's set_render_scale remakes the EFB between two packets, no restart); vr.cfg `render_scale native|<720p multiplier>`.
+  An explicit `render_scale` in config.json or `--render-scale` still decides at start (the harness uses it); otherwise vr.cfg does,
+  at every renderer start.

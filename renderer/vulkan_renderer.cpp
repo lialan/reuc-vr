@@ -26,6 +26,7 @@
 #include <atomic>
 #include <bit>
 #include "vr_cull.h"
+#include "fovea_map.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -373,7 +374,38 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
             vkGetPhysicalDeviceFeatures2(physical_, &query);
             if (shading_rate.pipelineFragmentShadingRate) {
                 device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
-                shading_rate.primitiveFragmentShadingRate = shading_rate.attachmentFragmentShadingRate = VK_FALSE;
+                // The headset's foveation: the attachment rate as well, when the device has it (multiview selects each eye's layer).
+                VkPhysicalDeviceFragmentShadingRatePropertiesKHR limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; properties.pNext = &limits;
+                vkGetPhysicalDeviceProperties2(physical_, &properties);
+                std::string rates;
+                if (const auto list = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(vkGetInstanceProcAddr(instance_, "vkGetPhysicalDeviceFragmentShadingRatesKHR"))) {
+                    uint32_t count = 0; list(physical_, &count, nullptr);
+                    std::vector<VkPhysicalDeviceFragmentShadingRateKHR> found(count, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+                    list(physical_, &count, found.data());
+                    fovea_largest_ = 1;
+                    for (const auto& rate : found) {
+                        rates += " " + std::to_string(rate.fragmentSize.width) + "x" + std::to_string(rate.fragmentSize.height);
+                        if ((rate.sampleCounts & VK_SAMPLE_COUNT_1_BIT) && rate.fragmentSize.width == rate.fragmentSize.height && rate.fragmentSize.width <= 4)
+                            fovea_largest_ = std::max(fovea_largest_, rate.fragmentSize.width);
+                    }
+                }
+                std::fprintf(stderr, "[vulkan] shading rates: pipeline %d primitive %d attachment %d, texel %ux%u..%ux%u (aspect %u), layered %d, non-trivial combiners %d, with depth writes %d; rates%s\n",
+                             int(shading_rate.pipelineFragmentShadingRate), int(shading_rate.primitiveFragmentShadingRate), int(shading_rate.attachmentFragmentShadingRate),
+                             limits.minFragmentShadingRateAttachmentTexelSize.width, limits.minFragmentShadingRateAttachmentTexelSize.height,
+                             limits.maxFragmentShadingRateAttachmentTexelSize.width, limits.maxFragmentShadingRateAttachmentTexelSize.height,
+                             limits.maxFragmentShadingRateAttachmentTexelSizeAspectRatio, int(limits.layeredShadingRateAttachments),
+                             int(limits.fragmentShadingRateNonTrivialCombinerOps), int(limits.fragmentShadingRateWithShaderDepthStencilWrites), rates.c_str());
+                fovea_supported_ = layers_ > 1 && shading_rate.attachmentFragmentShadingRate && !std::getenv("UC_NO_FOVEATION") && fovea_largest_ > 1;
+                if (fovea_supported_) {   // 16x16 texels when the device allows, else its nearest size
+                    const auto pick = [](uint32_t want, uint32_t low, uint32_t high) { return std::clamp(want, std::max(1u, low), std::max(std::max(1u, low), high)); };
+                    fovea_texel_ = {pick(16, limits.minFragmentShadingRateAttachmentTexelSize.width, limits.maxFragmentShadingRateAttachmentTexelSize.width),
+                                    pick(16, limits.minFragmentShadingRateAttachmentTexelSize.height, limits.maxFragmentShadingRateAttachmentTexelSize.height)};
+                    fovea_layered_ = limits.layeredShadingRateAttachments;
+                    fovea_max_op_ = limits.fragmentShadingRateNonTrivialCombinerOps;
+                }
+                shading_rate.primitiveFragmentShadingRate = VK_FALSE;
+                shading_rate.attachmentFragmentShadingRate = fovea_supported_;
                 shading_rate.pNext = features13.pNext; features13.pNext = &shading_rate; shading_rate_wanted = true;
             }
         }
@@ -437,7 +469,8 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     vk_check(through_streamline ? streamline_->create_device(instance_, physical_, device_info, device) : vkCreateDevice(physical_, &device_info, nullptr, &device), "vkCreateDevice");
     vk_android_load_device(device);   // Android: the 1.2/1.3 functions called directly come from this device (vulkan_android_entry.cpp)
     if (shading_rate_wanted) set_shading_rate_ = reinterpret_cast<PFN_vkCmdSetFragmentShadingRateKHR>(vkGetDeviceProcAddr(device, "vkCmdSetFragmentShadingRateKHR"));
-    std::fprintf(stderr, "[vulkan] fragment shading rate %s\n", set_shading_rate_ ? "on (bloom chain)" : "off");
+    std::fprintf(stderr, "[vulkan] fragment shading rate %s; foveation %s (texel %ux%u, %s, largest %ux%u)\n", set_shading_rate_ ? "on (bloom chain)" : "off",
+                 fovea_supported_ ? "available" : "unavailable", fovea_texel_.width, fovea_texel_.height, fovea_layered_ ? "a layer per eye" : "one layer for both eyes", fovea_largest_, fovea_largest_);
     if (through_streamline) {
         base_present_=streamline_->present_functions(device);
         present_.present=base_present_.present;   // SR/RR also need Streamline's per-present tag recycling and garbage collection.
@@ -511,6 +544,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     start_workers();
 #ifdef UC_OPENXR
     if (xr_) {   // the headset: the session and its swapchain; the game's picture keeps its own size (the screen plane scales it)
+        xr_->set_fovea_support(fovea_supported_);   // the screen pass may shade by the eye image's foveation map
         xr_->attach(instance_, physical_, device, family_, shaders_);
         stereo_ = &xr_->scene();
         // Each eye's picture has the shape of its eye image, so the screen pass maps it 1:1 onto the eye's view (a 16:9 picture stretched
@@ -1071,6 +1105,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         create.pInputAssemblyState = &assembly; create.pViewportState = &viewport; create.pRasterizationState = &raster; create.pMultisampleState = &samples;
         create.pColorBlendState = &blending; create.pDynamicState = &dynamic; create.layout = layout_;
         create.pDepthStencilState=&depth;
+        if (fovea_supported_) create.flags|=VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   // EFB passes may bind the foveation map
         vk_check(vkCreateGraphicsPipelines(device, pipeline_cache_, 1, &create, nullptr, &pipeline), "graphics pipeline");
     }
     return pipeline;
@@ -1907,6 +1942,107 @@ void VulkanRenderer::make_attachment(VkImage& target,VkDeviceMemory& memory,VkIm
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; view.image = target; view.viewType = layers>1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; view.format = image.format; view.subresourceRange = {VkImageAspectFlags(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, layers};
     vk_check(vkCreateImageView(device, &view, nullptr, &target_view), "attachment view");
 }
+void VulkanRenderer::destroy_fovea_map(FoveaMap& map) {
+    if (map.view) vkDestroyImageView(device,map.view,nullptr);
+    if (map.image) vkDestroyImage(device,map.image,nullptr);
+    if (map.memory) vkFreeMemory(device,map.memory,nullptr);
+    map=FoveaMap{};
+}
+void VulkanRenderer::destroy_fovea() { destroy_fovea_map(fovea_efb_); destroy_fovea_map(fovea_eye_); fovea_level_=0; }
+// The foveation level asked for: UC_VR_FOVEATION=0..3 (tests, the preview), else the headset's vr.cfg / settings panel.
+int VulkanRenderer::wanted_fovea_level() const {
+    static const int forced=std::getenv("UC_VR_FOVEATION") ? std::atoi(std::getenv("UC_VR_FOVEATION")) : -1;
+    if (forced>=0) return std::min(forced,3);
+#ifdef UC_OPENXR
+    if (xr_) return std::clamp(xr_->foveation_level(),0,3);
+#endif
+    return 0;
+}
+// One map for a target of `extent` pixels whose rectangle `shown` (target pixels) each eye sees: made again only when the level, the
+// extent, the rectangle or the eyes' fields of view change (the device idles for the upload, so no frame in flight reads it meanwhile).
+bool VulkanRenderer::update_fovea_map(FoveaMap& map, VkExtent2D extent, const std::array<float,4>& shown, const std::array<std::array<float,4>,2>& tangents, int level, uint32_t largest) {
+    std::vector<float> key{float(level),float(largest),shown[0],shown[1],shown[2],shown[3]};
+    for (const auto& eye:tangents) for (float t:eye) key.push_back(std::round(t*1000)/1000);   // the runtime's angles jitter in the last digits
+    if (map.view && map.extent.width==extent.width && map.extent.height==extent.height && key==map.key) return false;
+    const uint32_t layers=fovea_layered_ ? layers_ : 1;
+    const uint32_t width=(extent.width+fovea_texel_.width-1)/fovea_texel_.width, height=(extent.height+fovea_texel_.height-1)/fovea_texel_.height;
+    vk_check(present_.wait_idle(device),"foveation map idle");
+    if (!map.view || map.extent.width!=extent.width || map.extent.height!=extent.height) {
+        destroy_fovea_map(map);
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; image.imageType=VK_IMAGE_TYPE_2D; image.format=VK_FORMAT_R8_UINT;
+        image.extent={width,height,1}; image.mipLevels=1; image.arrayLayers=layers; image.samples=VK_SAMPLE_COUNT_1_BIT; image.tiling=VK_IMAGE_TILING_OPTIMAL;
+        image.usage=VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        vk_check(vkCreateImage(device,&image,nullptr,&map.image),"foveation map image");
+        VkMemoryRequirements requirements; vkGetImageMemoryRequirements(device,map.image,&requirements);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; allocate.allocationSize=requirements.size; allocate.memoryTypeIndex=memory_type(requirements.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vk_check(vkAllocateMemory(device,&allocate,nullptr,&map.memory),"foveation map memory"); vk_check(vkBindImageMemory(device,map.image,map.memory,0),"bind foveation map");
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; view.image=map.image; view.viewType=layers>1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; view.format=image.format;
+        view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,layers};
+        vk_check(vkCreateImageView(device,&view,nullptr,&map.view),"foveation map view");
+        map.extent=extent;
+    }
+    const auto texels=fovea_map(level,extent.width,extent.height,fovea_texel_.width,fovea_texel_.height,shown,tangents,layers,largest);
+    Buffer staging=make_buffer(texels.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memcpy(staging.mapped,texels.data(),texels.size());
+    const bool first=map.key.empty();
+    run_commands([&](VkCommandBuffer command) {
+        barrier(command,map.image,first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,0,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{}; copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,layers}; copy.imageExtent={width,height,1};
+        vkCmdCopyBufferToImage(command,staging.buffer,map.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+        barrier(command,map.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR,VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR);
+    });
+    destroy_buffer(staging);
+    // the shares of the shown rectangle's texels (what the eyes see) at each rate
+    size_t counts[3]{}, inside=0;
+    for (uint32_t layer=0;layer<layers;++layer) for (uint32_t y=0;y<height;++y) for (uint32_t x=0;x<width;++x) {
+        const float cx=(x+.5f)*fovea_texel_.width, cy=(y+.5f)*fovea_texel_.height;
+        if (cx<shown[0] || cx>=shown[2] || cy<shown[1] || cy>=shown[3]) continue;
+        const uint8_t t=texels[(size_t(layer)*height+y)*width+x]; ++inside;
+        ++counts[t==0 ? 0 : t==fovea_texel(2,2) ? 1 : 2];
+    }
+    inside=std::max<size_t>(inside,1);
+    std::fprintf(stderr,"[vr] foveation level %d (coarsest %ux%u): map %ux%u x%u (texel %ux%u) for a %ux%u target, shown %.0f,%.0f..%.0f,%.0f: 1x1 %.0f%%, 2x2 %.0f%%, coarser %.0f%%; eye tangents L %.3f %.3f %.3f %.3f R %.3f %.3f %.3f %.3f\n",
+                 level,largest,largest,width,height,layers,fovea_texel_.width,fovea_texel_.height,extent.width,extent.height,shown[0],shown[1],shown[2],shown[3],
+                 100.0*counts[0]/inside,100.0*counts[1]/inside,100.0*counts[2]/inside,
+                 tangents[0][0],tangents[0][1],tangents[0][2],tangents[0][3],tangents[1][0],tangents[1][1],tangents[1][2],tangents[1][3]);
+    map.key=std::move(key);
+    return true;
+}
+// Before a packet's passes are recorded: the maps for the current level, the EFB's size and shown region, the eye image and the eyes'
+// fields of view.
+void VulkanRenderer::update_fovea() {
+    if (!fovea_supported_ || !efb_) return;
+    const int level=wanted_fovea_level();
+    if (!level) { if (fovea_level_) { std::fprintf(stderr,"[vr] foveation off\n"); fovea_level_=0; } return; }
+    std::array<std::array<float,4>,2> tangents{};
+    if (stereo_) tangents=stereo_->tangents();
+    if (!(tangents[0][0]>0) || !(tangents[1][0]>0)) {   // before the first frame's views: the Quest 3's (preview_publish)
+        const float outer=std::tan(52.f*.017453292f), inner=std::tan(41.f*.017453292f), down=std::tan(50.f*.017453292f), up=std::tan(42.f*.017453292f);
+        tangents={std::array<float,4>{outer,inner,down,up},std::array<float,4>{inner,outer,down,up}};
+    }
+    const float sx=float(efb_extent_.width)/640, sy=float(efb_extent_.height)/480;
+    const std::array<float,4> shown{fovea_shown_[0]*sx,fovea_shown_[1]*sy,(fovea_shown_[0]+fovea_shown_[2])*sx,(fovea_shown_[1]+fovea_shown_[3])*sy};
+    // Below native scale an EFB pixel covers several eye pixels: the EFB's coarsest rate is capped so that a shading point spans no more
+    // eye pixels than 4x4 does at native (1.5x: 2x2 at most; 1x: none, only the eye image's screen pass is foveated). UC_VR_FOVEA_CAP=0: no cap.
+    uint32_t largest=fovea_largest_;
+#ifdef UC_OPENXR
+    static const bool capped=!(std::getenv("UC_VR_FOVEA_CAP") && *std::getenv("UC_VR_FOVEA_CAP")=='0');
+    if (xr_ && capped && xr_->eye_width() && shown[2]>shown[0]) {
+        const float eye_pixels=float(xr_->eye_width())/(shown[2]-shown[0]);   // eye pixels across one EFB pixel
+        while (largest>1 && largest*eye_pixels>5.f) largest/=2;
+    }
+#endif
+    if (largest>1) update_fovea_map(fovea_efb_,efb_extent_,shown,tangents,level,largest);
+    else if (fovea_efb_.view) { vk_check(present_.wait_idle(device),"foveation map idle"); destroy_fovea_map(fovea_efb_); }
+#ifdef UC_OPENXR
+    static const bool no_eye=std::getenv("UC_NO_EYE_FOVEATION")!=nullptr;
+    if (xr_ && !no_eye && xr_->eye_width() && xr_->eye_height())
+        update_fovea_map(fovea_eye_,{xr_->eye_width(),xr_->eye_height()},{0,0,float(xr_->eye_width()),float(xr_->eye_height())},tangents,level,fovea_largest_);
+#endif
+    fovea_level_=level;
+}
 void VulkanRenderer::rebuild() {
     if (fsr_presentation_) fsr_g_->release_context();
     if (swapchain_ && !fsr_presentation_ && !streamline_swapchain()) retire_for_resize(); else retire_images(true);
@@ -2103,11 +2239,45 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     const auto& display_source=packet.display_source;
     if(packet.present && (!display_source[2] || !display_source[3] || display_source[0]>=640 || display_source[2]>640-display_source[0] || display_source[1]>=480 || display_source[3]>480-display_source[1])) throw std::invalid_argument("invalid native display source rectangle");
+#ifdef UC_OPENXR
+    if (xr_ && xr_->take_render_scale_change()) {   // the settings panel's Render scale: the EFB is remade at the next rebuild (below), no restart
+        const float chosen=xr_->render_scale();
+        native_eye_scale_=!(chosen>0);
+        set_render_scale(native_eye_scale_ ? std::clamp(xr_->eye_height()/720.0,0.5,6.0) : double(chosen));
+        std::fprintf(stderr,"[vr] render scale %.3f (%s) from the settings panel\n",configured_scale_,native_eye_scale_ ? "native" : "chosen");
+    }
+#endif
+    if (layers_>1) {   // diagnostics: UC_VR_SCALE_SWITCH=<frame>:<scale>[,...] changes the scale live at those presented frames, as the panel does (0: native)
+        static std::vector<std::pair<uint64_t,double>> switches=[] {
+            std::vector<std::pair<uint64_t,double>> list;
+            if (const char* text=std::getenv("UC_VR_SCALE_SWITCH")) for (const char* at=text;*at;) {
+                char* end=nullptr; const auto frame=std::strtoull(at,&end,10); if (end==at || *end!=':') break;
+                const double scale=std::strtod(end+1,&end); list.emplace_back(frame,scale); at=*end==',' ? end+1 : end;
+            }
+            std::reverse(list.begin(),list.end());
+            return list;
+        }();
+        if (!switches.empty() && frame_index_>=switches.back().first) {
+            const double scale=switches.back().second; switches.pop_back();
+            native_eye_scale_=!(scale>0);
+#ifdef UC_OPENXR
+            const double native=xr_ ? std::clamp(xr_->eye_height()/720.0,0.5,6.0) : 3.0;
+#else
+            const double native=3.0;
+#endif
+            set_render_scale(native_eye_scale_ ? native : scale);
+            std::fprintf(stderr,"[vr] render scale %.3f at frame %u (UC_VR_SCALE_SWITCH)\n",configured_scale_,frame_index_);
+        }
+    }
     const bool has_output = swapchain_ != VK_NULL_HANDLE || (xr_ && efb_);   // the headset has no window swapchain: its output is the XR swapchain
     if (const auto now = std::chrono::steady_clock::now(); uc::rebuild_due(resized_, has_output, now, last_rebuild_)) {
         last_rebuild_ = now; rebuild();        if (resized_) return false;
     }
     if (!swapchain_ && !(xr_ && efb_)) return false;   // while a resize storm postpones the rebuild the old swapchain keeps presenting
+    if (fovea_supported_) {   // the headset's foveation map: the region the eyes see is the last presented one
+        if (packet.present) fovea_shown_={float(display_source[0]),float(display_source[1]),float(display_source[2]),float(display_source[3])};
+        update_fovea();
+    }
     const bool overlay_frame=packet.overlay_only;
     const bool layer_on=reticle_layer_active();   // the reticle quads leave the game's frame and are drawn over a held copy of it (reticle_layer_ready)
     if (overlay_frame && !reticle_layer_ready()) return false;
@@ -2912,6 +3082,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         }
     }
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea = render_area; rendering.layerCount = 1; rendering.viewMask = layers_>1 ? 0b11u : 0u; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachments = colors;
+    // The headset's foveation map on every EFB pass while a level is on. A packet that draws a picture for a small copy (the bloom chain's
+    // 320x180 / 160x90 corners, a render-to-texture) is not what the eyes see where it is drawn: its draws keep their own rate.
+    VkRenderingFragmentShadingRateAttachmentInfoKHR fovea_attachment{VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+    const bool foveated=fovea_level_ && fovea_efb_.view && target.color==efb_;
+    const bool fovea_packet=foveated && !(copy_target && packet.texture_copy->source[2]<300);
+    if (foveated) {
+        fovea_attachment.imageView=fovea_efb_.view; fovea_attachment.imageLayout=VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        fovea_attachment.shadingRateAttachmentTexelSize=fovea_texel_; rendering.pNext=&fovea_attachment;
+    }
     const VkImageLayout depth_before=!initialized ? VK_IMAGE_LAYOUT_UNDEFINED : scene ? scene_depth_layout_ : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     barrier(slot.command,target.depth,depth_before,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             initialized ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,initialized ? VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
@@ -3029,11 +3208,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         // The pre-pass (xform_): consecutive draws that differ only in their vertices (same pipeline, textures, samplers, uniform block, eye
         // block, push constants, viewport, scissor; consecutive in the rebased index buffer) are one draw. UC_NO_MERGE=1: a draw each.
         static const bool no_merge=std::getenv("UC_NO_MERGE")!=nullptr;
-        struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; };   // rate: the fragment shading rate (a run joins only draws of one rate)
-        const auto apply_rate=[&](VkExtent2D rate) {
-            if (!set_shading_rate_ || (rate.width==bound_rate.width && rate.height==bound_rate.height)) return;
-            const VkFragmentShadingRateCombinerOpKHR keep[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
-            set_shading_rate_(slot.command,&rate,keep); bound_rate=rate;
+        struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; bool fovea; };   // rate: the fragment shading rate, fovea: whether the foveation map applies (a run joins only draws of one rate and kind)
+        bool bound_fovea=false;
+        // The rate of a draw: its own (pipeline rate), and with the foveation map the coarser of both (MAX), or the map's where the draw's own
+        // is 1x1 (REPLACE) on a device without the non-trivial combiners.
+        const auto apply_rate=[&](VkExtent2D rate,bool fovea) {
+            if (!set_shading_rate_ || (rate.width==bound_rate.width && rate.height==bound_rate.height && fovea==bound_fovea)) return;
+            VkFragmentShadingRateCombinerOpKHR ops[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
+            if (fovea) ops[1]=fovea_max_op_ ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR : rate.width*rate.height==1 ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+            set_shading_rate_(slot.command,&rate,ops); bound_rate=rate; bound_fovea=fovea;
         };
         std::optional<Run> pending;
         const auto issue_run=[&](const Run& run) {
@@ -3046,15 +3229,16 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (layers_>1) bind_draw_set(run.set,true);
             else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
             DrawPush push=run.push;
-            apply_rate(run.rate);
-            {   // UC_GPU_PACKETS: how many issued runs shade coarsely, flat (bloom chain, glows) and world (sprites)
+            apply_rate(run.rate,run.fovea);
+            {   // UC_GPU_PACKETS: how many issued runs shade coarsely, flat (bloom chain, glows) and world (sprites), and how many take the foveation map
                 static const bool rate_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
                 if (rate_stats) {
-                    static uint64_t flat=0, world=0, all=0; static auto since=std::chrono::steady_clock::now();
+                    static uint64_t flat=0, world=0, foveated_runs=0, all=0; static auto since=std::chrono::steady_clock::now();
                     ++all; if (run.rate.width*run.rate.height>1) ++(draw.transforms->projection[3][3]==0 ? world : flat);
+                    foveated_runs+=run.fovea;
                     if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
-                        std::fprintf(stderr,"[vrs] runs shaded coarsely: %llu flat, %llu world, of %llu\n",(unsigned long long)flat,(unsigned long long)world,(unsigned long long)all);
-                        flat=world=all=0; since=std::chrono::steady_clock::now();
+                        std::fprintf(stderr,"[vrs] runs shaded coarsely: %llu flat, %llu world, of %llu; %llu foveated (level %d)\n",(unsigned long long)flat,(unsigned long long)world,(unsigned long long)all,(unsigned long long)foveated_runs,fovea_level_);
+                        flat=world=foveated_runs=all=0; since=std::chrono::steady_clock::now();
                     }
                 }
             }
@@ -3143,6 +3327,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             }
             bool culled=false;   // the headset: neither eye sees this draw
             int stereo_kind=-1;   // the draw's stereo class (headset), for the shading rate below
+            bool draw_offscreen=false;   // the class's offscreen fact: a perspective picture for a small copy or a 2D pass over copies
             if (layers_>1 && stereo_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
                 bool texture_view=false;
                 for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
@@ -3212,7 +3397,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 // The aim reticle (and its wake) marks a place in the world: it stays on HOTD4's world-locked screen when the HUD follows the head.
                 if (kind==LG_STEREO_HUD && (draw.reticle || draw.late_aim || draw.wake)) kind=xr::LG_STEREO_HUD_AIM;
-                stereo_kind=kind;
+                stereo_kind=kind; draw_offscreen=facts.offscreen;
                 const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
                 float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*stereo_stride_);
                 for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
@@ -3261,16 +3446,20 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
             }
             if (culled) continue;
+            // The foveation map: the eyes' scene (world draws that are not a picture for a copy), full-screen fades over it and the 2D passes
+            // over full-size copies (the composite, the colour pass) shade by it; the HUD and the aim keep their rate (text stays sharp).
+            const bool fovea_draw=fovea_packet && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer &&
+                ((stereo_kind==LG_STEREO_WORLD && !draw_offscreen) || stereo_kind==LG_STEREO_FILL || stereo_kind==LG_STEREO_PASS);
             if (xform_) {   // join the pending run when nothing but the vertex range differs, else draw the pending run and start a new one
                 push.motion=0;   // the stereo shaders read the eye block from the set, not this index
                 const auto& x=xform_draws[d];
                 Run run{d,info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
-                        set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1}};
+                        set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
                 const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
                 const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && set_keys[pending->set]==set_keys[run.set] &&
                     std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0 &&
                     same_push(pending->push,run.push) && std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)==0 &&
-                    pending->first+pending->count==run.first && pending->rate.width==run.rate.width && pending->rate.height==run.rate.height && pending->positions_end==x.positions && pending->attributes_end==x.attributes;
+                    pending->first+pending->count==run.first && pending->rate.width==run.rate.width && pending->rate.height==run.rate.height && pending->fovea==run.fovea && pending->positions_end==x.positions && pending->attributes_end==x.attributes;
                 static const bool why=std::getenv("UC_MERGE_WHY")!=nullptr;   // diagnostics: what ends the runs, per 2 s
                 if (why && pending && !joins) {
                     static uint64_t reasons[8]{}; static auto since=std::chrono::steady_clock::now();
@@ -3291,10 +3480,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             }
             if (set_shading_rate_) {
                 const VkExtent2D rate=bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1);
-                if (rate.width!=bound_rate.width || rate.height!=bound_rate.height) {
-                    const VkFragmentShadingRateCombinerOpKHR keep[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
-                    set_shading_rate_(slot.command,&rate,keep); bound_rate=rate;
-                }
+                apply_rate(rate,fovea_draw);
                 static const bool rate_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
                 if (rate_stats) {
                     static uint64_t coarse=0, all=0; static VkExtent2D coarse_rate{1,1}; static auto since=std::chrono::steady_clock::now();
@@ -3501,7 +3687,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const float u1=float(std::max<uint64_t>(uint64_t(u0)+1,uint64_t(display_source[0]+display_source[2])*efb_extent_.width/640));
         const float v1=float(std::max<uint64_t>(uint64_t(v0)+1,uint64_t(display_source[1]+display_source[3])*efb_extent_.height/480));
         const float w=float(efb_extent_.width), h=float(efb_extent_.height);
-        xr_->record(slot.command, efb_, efb_view_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {u0/w, v0/h, (u1-u0)/w, (v1-v0)/h});
+        xr_->record(slot.command, efb_, efb_view_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {u0/w, v0/h, (u1-u0)/w, (v1-v0)/h}, fovea_level_ ? fovea_eye_.view : VK_NULL_HANDLE, fovea_texel_);
     }
 #endif
     if (hold) {   // keep the finished picture (without the reticle) and the reticle draws that belong on it: the overlay frame after this one presents them
@@ -3572,7 +3758,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (packet.present && upscaler_ && !scene_only) scene_clear_={true,packet.display_source,packet.clear_color,packet.clear_depth};
     }
 #ifdef UC_OPENXR
-    if (xr_ && xr_frame_ && packet.present && display && !xr_direct) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (xr_ && xr_frame_ && packet.present && display && !xr_direct) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {0, 0, 1, 1}, fovea_level_ ? fovea_eye_.view : VK_NULL_HANDLE, fovea_texel_);
 #endif
     if(present_image) {
         const auto present_layout=fsr_presentation_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : streamline_swapchain() ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -3732,6 +3918,7 @@ void VulkanRenderer::shutdown() {
         if (efb_) vkDestroyImage(device,efb_,nullptr);
         if (efb_memory_) vkFreeMemory(device,efb_memory_,nullptr);
         efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; efb_extent_={};
+        destroy_fovea();
         dlss_g_.reset();
         fsr_g_.reset();   // its swapchain context was emptied by retire_images; the contexts go before the device
         for (int i=0;i<2;++i) {

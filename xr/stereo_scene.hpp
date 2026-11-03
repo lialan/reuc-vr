@@ -57,6 +57,7 @@ public:
     void finish_frame();
     size_t transform_builds() const { return builds_; }
     const std::array<float,2> &screen_lens() const { return lens_; }
+    const std::array<std::array<float,4>,2> &tangents() const { return tangents_; }   // each eye's half-angle tangents (left, right, down, up); zero before the first publish
     void set_screen_lens(std::array<float,2> lens) { lens_=lens; }   // the game's own lens before any frame was observed
     // Whether the head-following HUD applies now (gameplay; settings().hud_fit): set once a frame before its draws.
     void set_hud_fit(bool on) { if(on!=fit_on_) { fit_on_=on; cache_.clear(); last_=0; } }

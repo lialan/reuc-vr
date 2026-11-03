@@ -184,6 +184,7 @@ void XrOverlay::initialize(VkPhysicalDevice physical, VkDevice device, VkFormat 
         pipeline.stageCount = 2; pipeline.pStages = stages; pipeline.pVertexInputState = &input; pipeline.pInputAssemblyState = &assembly;
         pipeline.pViewportState = &viewport; pipeline.pRasterizationState = &raster; pipeline.pMultisampleState = &multisample; pipeline.pDepthStencilState = &depth;
         pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic; pipeline.layout = state == kPanel ? panel_pipeline_layout_ : uniform_pipeline_layout_;
+        if (fovea_support_) pipeline.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   // no rate state: 1x1, the map ignored
         vk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipelines_[state]), "overlay pipeline");
     }
 }

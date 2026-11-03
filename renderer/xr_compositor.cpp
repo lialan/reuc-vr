@@ -242,6 +242,7 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
             views_array_.push_back(created);
         }
         create_screen_pass(shaders);
+        overlay_.set_fovea_support(fovea_support_);
         overlay_.initialize(physical, device_, render_format_, width_, height_, shaders);
         panel_.set_eye_size(int(width_), int(height_));
         overlay_depth_image_ = overlay_.depth_image();
@@ -289,6 +290,10 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext = &rendering;
     pipeline.stageCount = 2; pipeline.pStages = stages; pipeline.pVertexInputState = &vertices; pipeline.pInputAssemblyState = &assembly; pipeline.pViewportState = &viewport;
     pipeline.pRasterizationState = &raster; pipeline.pMultisampleState = &multisample; pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic; pipeline.layout = layout_;
+    // The renderer's foveation map, when bound, sets the screen pass's rate (REPLACE); the overlay's pipelines ignore it (no rate state: KEEP).
+    VkPipelineFragmentShadingRateStateCreateInfoKHR rate{VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
+    rate.fragmentSize = {1, 1}; rate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+    if (fovea_support_) { rate.pNext = rendering.pNext; rendering.pNext = &rate; pipeline.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR; }
     vk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_), "screen pipeline");
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32}, {VK_DESCRIPTOR_TYPE_SAMPLER, 32}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets = 32; pool.poolSizeCount = 2; pool.pPoolSizes = sizes;
@@ -410,7 +415,8 @@ void XrCompositor::controller_frame(bool tracked) {
     const unsigned effects = panel_.update(settings, scene_, controls_, focused ? sample : xr::ControllerSample{}, frame_.predictedDisplayTime, focused, refresh_rates_);
     if (effects & XP_SAVE) xr_settings_save(&settings);
     if (effects & XP_RATE_CHANGED) request_refresh(float(settings.refresh));
-    if (effects & XP_FOVEATION_CHANGED) set_foveation(settings.foveation);
+    if (effects & XP_FOVEATION_CHANGED) set_foveation(settings.foveation);   // the runtime's (a swapchain made with foveation); the renderer's map reads foveation_level()
+    if (effects & XP_SCALE_CHANGED) render_scale_changed_ = true;
     if (effects & XP_RECENTER) recenter();
     if ((effects & XP_RESTART) && config_.restart) config_.restart();
     const auto& haptics = panel_.haptics();
@@ -422,7 +428,7 @@ void XrCompositor::observe(const gx::Projection& projection) {
     lens_seen_ = true;
 }
 
-void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect) {
+void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect, VkImageView fovea, VkExtent2D texel) {
     if (!acquired_) throw std::logic_error("XR: record without an acquired eye array");
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (const auto& bound : bound_) if (bound.view == picture_view) set = bound.set;
@@ -466,6 +472,11 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     }
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea.extent = {width_, height_}; rendering.layerCount = 1; rendering.viewMask = 0b11;
     rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &color; rendering.pDepthAttachment = &depth;
+    VkRenderingFragmentShadingRateAttachmentInfoKHR rate{VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+    if (fovea && fovea_support_) {   // the renderer's map of the eye image: the screen pass coarser towards each eye's periphery
+        rate.imageView = fovea; rate.imageLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR; rate.shadingRateAttachmentTexelSize = texel;
+        rendering.pNext = &rate;
+    }
     vkCmdBeginRendering(command, &rendering);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set, 0, nullptr);

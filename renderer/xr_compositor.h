@@ -58,7 +58,11 @@ public:
     bool begin_frame();
     // The finished game picture (layout `layout`, left in it again) on the screen plane in both eyes. Call only after begin_frame() true.
     // rect: the part of the picture the eyes show, in texture coordinates (the whole picture, or the EFB's displayed region read in place)
-    void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect = {0, 0, 1, 1});
+    // fovea: the renderer's foveation map of the eye image (null: none), texel its texel size; the screen pass shades by it, the overlay not.
+    void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect = {0, 0, 1, 1},
+                VkImageView fovea = VK_NULL_HANDLE, VkExtent2D texel = {});
+    // Before attach(): the device can shade by a foveation map (the screen and overlay pipelines are made to accept one).
+    void set_fovea_support(bool on) { fovea_support_ = on; }
     void end_frame(bool rendered);
     bool frame_open() const { return frame_open_; }
     bool exiting() const { return exiting_; }
@@ -74,6 +78,10 @@ public:
     void rumble(int hand, float amplitude, int milliseconds);
     void recenter() { if (config_.anchor_head) anchor_pending_ = true; }
     void set_foveation(int level);
+    int foveation_level() const { return config_.settings.foveation; }   // vr.cfg / the panel: the renderer's foveation map (0 off .. 3 high)
+    float render_scale() const { return config_.settings.render_scale; }   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
+    // The panel changed the render scale since the last call: the renderer applies it at its next frame (no restart).
+    bool take_render_scale_change() { const bool changed = render_scale_changed_; render_scale_changed_ = false; return changed; }
     void request_refresh(float hz);
     const std::vector<float>& refresh_rates() const { return refresh_rates_; }
     uint32_t eye_width() const { return width_; }
@@ -93,7 +101,7 @@ private:
     bool anchor_pending_ = true;
     XrSwapchain swapchain_ = XR_NULL_HANDLE;
     XrFoveationProfileFB profile_ = XR_NULL_HANDLE;
-    bool running_ = false, exiting_ = false, frame_open_ = false, acquired_ = false;
+    bool running_ = false, exiting_ = false, frame_open_ = false, acquired_ = false, render_scale_changed_ = false, fovea_support_ = false;
     uint32_t width_ = 0, height_ = 0, image_ = 0;
     XrSessionState session_state_ = XR_SESSION_STATE_UNKNOWN;
     XrFrameState frame_{XR_TYPE_FRAME_STATE};

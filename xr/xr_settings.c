@@ -16,6 +16,8 @@ void xr_settings_save(const LgXrSettings *c)
             LASER_NAME[c->laser], c->auto_coins ? "auto" : "manual",
             SIGHT_NAME[c->sight], c->crosshair ? "on" : "off", c->show_gun ? "on" : "off", c->hud_pitch, c->dual ? "on" : "off", c->show_stats ? "on" : "off",
             FOVEATION_NAME[c->foveation < 0 || c->foveation > 3 ? 3 : c->foveation], c->version);
+    if (c->render_scale > 0) fprintf(f, "render_scale %g\n", c->render_scale);
+    else fprintf(f, "render_scale native\n");
     fclose(f);
 }
 
@@ -78,6 +80,10 @@ void xr_settings_set(LgXrSettings *c,const char *key,const char *val)
         else if (!strcmp(key, "dual")) c->dual = !strcmp(val, "on");
         else if (!strcmp(key, "stats") || !strcmp(key, "fps")) c->show_stats = !strcmp(val, "on");   /* "fps": before it was the stats panel */
         else if (!strcmp(key, "version")) c->version = atoi(val);
+        else if (!strcmp(key, "render_scale")) {   /* "native" (0) or a 720p multiplier 0.5..6 */
+            const float scale = !strcmp(val, "native") ? 0.0f : (float)atof(val);
+            c->render_scale = scale >= 0.5f && scale <= 6.0f ? scale : 0.0f;
+        }
         else if (!strcmp(key, "foveation")) {
             for (int i = 0; i < 4; i++) if (!strcmp(val, FOVEATION_NAME[i])) c->foveation = i;
         }
