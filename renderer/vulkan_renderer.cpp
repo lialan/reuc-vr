@@ -2402,7 +2402,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             draw_uniform[i]=uint32_t(uniform_offset/uniform_stride_);
             if (xform_) {   // what the draw's set holds besides its eye block: draws with the same can share one set (and one draw)
                 auto& key=set_keys[i];
-                for (size_t map=0;map<8;++map) { key[map]=uint64_t(image[map].imageView); key[8+map]=uint64_t(samplers[map].sampler); }
+                // only the maps the draw's TEV stages sample (and their indirect maps) count: the others are never read
+                const auto& pk=gpu_draws[i].key; const auto& u=*packet.draws[i].uniforms;
+                uint32_t maps=pk[1]==0 ? 1u : 0u;
+                for (uint32_t stage=0;stage<std::min<uint32_t>(pk[1],16);++stage) {
+                    const uint32_t order=pk[5+4*stage];
+                    if (order&64) maps|=1u<<(order&7);
+                    if (u.ind_cmd[stage]) maps|=1u<<((u.indirect[9]>>((u.ind_cmd[stage]&3)*6))&7);
+                }
+                for (size_t map=0;map<8;++map) { const bool used=(maps>>map)&1; key[map]=used ? uint64_t(image[map].imageView) : 0; key[8+map]=used ? uint64_t(samplers[map].sampler) : 0; }
                 key[16]=uniform_offset;
             }
             const VkDescriptorBufferInfo xform_positions{slot.xform_positions.buffer,0,VK_WHOLE_SIZE}, xform_attributes{slot.xform_attributes.buffer,0,VK_WHOLE_SIZE};
@@ -3055,6 +3063,20 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0 &&
                     same_push(pending->push,run.push) && std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)==0 &&
                     pending->first+pending->count==run.first && pending->positions_end==x.positions && pending->attributes_end==x.attributes;
+                static const bool why=std::getenv("UC_MERGE_WHY")!=nullptr;   // diagnostics: what ends the runs, per 2 s
+                if (why && pending && !joins) {
+                    static uint64_t reasons[8]{}; static auto since=std::chrono::steady_clock::now();
+                    const auto& a=set_keys[pending->set]; const auto& b=set_keys[run.set];
+                    const bool textures=!std::equal(a.begin(),a.begin()+16,b.begin()), uniform=a[16]!=b[16];
+                    ++reasons[pending->pipeline!=run.pipeline || !(gpu_draws[pending->d].key==info.key) ? 0 : textures ? 1 : uniform ? 2 :
+                              std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes) ? 3 :
+                              !same_push(pending->push,run.push) ? 4 : (std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport) || std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)) ? 5 : 6];
+                    if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
+                        std::fprintf(stderr,"[merge-why] runs ended by: pipeline %llu, textures %llu, uniform block %llu, eye block %llu, push %llu, viewport %llu, not consecutive %llu\n",
+                                     (unsigned long long)reasons[0],(unsigned long long)reasons[1],(unsigned long long)reasons[2],(unsigned long long)reasons[3],(unsigned long long)reasons[4],(unsigned long long)reasons[5],(unsigned long long)reasons[6]);
+                        std::memset(reasons,0,sizeof reasons); since=std::chrono::steady_clock::now();
+                    }
+                }
                 if (joins) { pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_; }
                 else { if (pending) issue_run(*pending); pending=run; }
                 continue;
