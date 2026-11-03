@@ -1,9 +1,12 @@
 #include "ppc_rt.h"
+#include "fastmem.h"
 #include <cstdio>
 #include <cstdlib>
 
 uint32_t g_mmio_last_addr, g_mmio_last_val;
 int g_mmio_last_size;
+// fastmem builds: a guest access to the hardware registers whose address the compiler cannot see faults; the handler routes it to the hooks below.
+[[maybe_unused]] static const bool g_fastmem_installed = (uc::fastmem_install(), true);
 
 namespace ppc {
 uint32_t mmio_read(uint32_t ea, int size) { g_mmio_last_addr = ea; g_mmio_last_size = size; return 0xA5A5A5A5u; }

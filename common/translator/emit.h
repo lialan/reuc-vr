@@ -16,6 +16,7 @@ struct EmitStats {
     size_t cr_dead_compares = 0, cr_fused_branches = 0, cr_dropped_records = 0;   // condition-register writes that were never read
     size_t reg_entry_loads = 0, reg_flushes = 0, reg_reloads = 0;                  // register-cache copies emitted
     size_t reg_leaf_calls = 0, reg_leaves = 0;                                     // calls that sync only what a leaf callee touches, such callees
+    size_t mmio_sites = 0;                                                         // loads/stores from a hardware-register base (explicit MMIO test)
 };
 
 struct Program {
@@ -55,6 +56,7 @@ struct CrHints {
     // call takes the full_flush/full_reload form instead. after_call: an edge flush on the call's own path (both forms).
     bool leaf_call = false;
     std::string full_flush, full_reload, after_call;
+    bool io = false;   // a load/store whose base register may hold a hardware-register address: ppc::op_*<true> (explicit MMIO test)
 };
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t word, EmitStats& st, const CrHints* hints = nullptr);

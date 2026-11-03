@@ -6,6 +6,7 @@
 #include "host_backtrace.h"
 #include "path_print.h"
 #include "clock.h"
+#include "fastmem.h"
 #include "client_update_lock.h"
 #include "cpu_topology.h"
 #include "compile_screen.h"
@@ -171,6 +172,7 @@ void print_stats() {
     std::fprintf(stderr, "stats: retraces %llu  dvd opens %llu  dvd reads %llu (%llu bytes)  fifo bytes %llu  unmapped mmio %zu\n",
                  (unsigned long long)vi.retraces, (unsigned long long)d.opens, (unsigned long long)d.reads, (unsigned long long)d.bytes,
                  (unsigned long long)g_fifo_snapshot.load(), uc::mmio_bus().unmapped_count());
+    uc::fastmem_report();
     for (const auto& entry : uc::gx_audit_snapshot()) {
         std::fprintf(stderr, "gx audit: %08X calls %llu %s caller %08X  first r3..r10", entry.address, (unsigned long long)entry.calls, uc::symbol_name(entry.address).c_str(),entry.first_caller);
         for (auto arg : entry.first_gpr) std::fprintf(stderr, " %08X", arg);
@@ -463,8 +465,12 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             static uint64_t last_insns = 0; const uint64_t insns = ppc::g_guest_insns;   // nonzero only in a --count-insns generation
             std::fprintf(stderr, "[detbench] retrace %llu draws %llu guest_mcycles %.2f wall_ms %.2f", (unsigned long long)retraces, (unsigned long long)(draws - last_draws), (cycles - last_cycles) / 1e6, std::chrono::duration<double, std::milli>(now - last).count());
             if (insns) std::fprintf(stderr, " guest_insns %llu", (unsigned long long)(insns - last_insns));
+            // MMIO accesses this game second: reads, other writes, FIFO writes, and how many of them reached the fastmem fault handler
+            static uc::MmioCounts last_mmio{}; static uc::FastmemStats last_faults{}; const uc::MmioCounts mmio = uc::mmio_counts(); const uc::FastmemStats faults = uc::fastmem_stats();
+            std::fprintf(stderr, " mmio_reads %llu mmio_writes %llu fifo_writes %llu mmio_faults %llu", (unsigned long long)(mmio.reads - last_mmio.reads), (unsigned long long)(mmio.writes - last_mmio.writes),
+                         (unsigned long long)(mmio.fifo_writes - last_mmio.fifo_writes), (unsigned long long)(faults.reads + faults.writes - last_faults.reads - last_faults.writes));
             std::fprintf(stderr, "\n");
-            last = now; last_draws = draws; last_cycles = cycles; last_insns = insns;
+            last = now; last_draws = draws; last_cycles = cycles; last_insns = insns; last_mmio = mmio; last_faults = faults;
         }
         if (options.stop_retrace && retraces >= options.stop_retrace) det_stop = true;
         static const char* sample_flag = std::getenv("UC_CPU_SAMPLE_FLAG"); static const char* sample_from = std::getenv("UC_CPU_SAMPLE_RETRACE");

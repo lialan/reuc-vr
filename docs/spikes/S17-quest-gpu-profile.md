@@ -424,3 +424,60 @@ foveation, which this game's build never enabled, so the row did nothing). Here:
   renderer's set_render_scale remakes the EFB between two packets, no restart); vr.cfg `render_scale native|<720p multiplier>`.
   An explicit `render_scale` in config.json or `--render-scale` still decides at start (the harness uses it); otherwise vr.cfg does,
   at every renderer start.
+
+## CPU item 1: fastmem (2026-11-03, branch cpu-fastmem)
+
+Every guest load and store the translator could not prove to be RAM (base other than r1/r2/r13) tested `ea - 0xCC000000 < 0x02000000`
+and branched to `mmio_read`/`mmio_write` on a cold path; the call kept spill code and a compare+branch at every access.
+
+### Design
+
+- The hardware-register window was already part of the PROT_NONE 4 GiB reservation (`guest_mem_posix.cpp`), so on macOS and Android
+  arm64 (`UC_FASTMEM`, default ON; `-DUC_FASTMEM=OFF` restores the test; Windows and x64 keep the explicit test, same code as before)
+  an ordinary access carries no test. One that reaches the window faults; `runtime/fastmem.cpp` (SIGSEGV/SIGBUS, installed in front
+  of the crash handler by `install_crash_handlers`, SA_ONSTACK|SA_NODEFER) decodes the faulting arm64 instruction (LDR/STR of every
+  size and signedness in unsigned-offset, unscaled, pre/post-index and register-offset forms, LDP/STP/LDPSW/LDNP/STNP integer and
+  SIMD&FP, LD1/ST1 of one register; WZR/XZR and SP bases), performs it through `mmio_read`/`mmio_write` with the guest's byte order
+  (one 1/2/4-byte access, 8 and 16 bytes as 4-byte accesses in ascending order as `rdf64`/`wrf64` and the psq slow path did), writes
+  the result register(s) and the base writeback in the signal context and resumes at pc+4. Any other fault (outside the window, an
+  undecoded form, an access that starts outside the window) goes to the previous handler unchanged. A C++ exception from the device
+  code cannot unwind out of a signal handler: it ends the process through the terminate handler (as an uncaught one).
+- The hot MMIO traffic stays an explicit call: (a) where the compiler proves the address (`__builtin_constant_p` of the test after
+  inlining: `lis r3,0xCC01; stw r4,-0x8000(r3)` in the same block), and (b) where the translator's new "may hold a hardware address"
+  dataflow (`mark_mmio_bases` in emit.cpp: `lis rX,0xCC00..0xCE00` through addi/addis/ori/mr/update forms, ABI-volatile registers
+  dropped at calls) marks the base register: those sites are emitted as `ppc::op_*<true>` (2370 loads/stores in the game). (b) is
+  needed because a loop's interrupt poll reloads the register cache from the context, so the compiler loses the constant: without it
+  46 million FIFO stores of the replay faulted. The quantized psq slow path always tests (it carries the FIFO's quantized stores).
+- Untested accesses are `volatile` (`guest_load`/`guest_store`, may_alias): the compiler never merges, splits, drops or reorders them,
+  so a device sees exactly the guest's accesses; a store is a compiler barrier (the device code may write memory, as the call could).
+- Faults are handled on every host thread (guest threads, HLE code using the accessors); `UC_FASTMEM_LOG=1` lists the emulated sites
+  at exit (host pc, translated function, guest address). `[detbench]` lines now carry the game second's `mmio_reads`, `mmio_writes`,
+  `fifo_writes` and `mmio_faults`.
+
+### How often MMIO is hit
+
+fightmac replay (Mac), per game second of the fight window: ~4.2-4.3 million FIFO writes, ~10 thousand other register writes, 0 reads;
+faults: 0 in the fight window, 43 in the whole replay (one-off CP/PI/PE/SI register setup at boot, ~5 reads + 38 writes). Before (b)
+the fault path took 46 M writes (the GX vertex loops in body_80284D58, body_800BA398, body_8035748C ...) and the psq slow path 665 k.
+
+### Results
+
+Determinism: fightmac replayed with `--det-out`, guest memory hashed every 30 retraces (UC_DET_EVERY=30, 307 records to retrace 9226):
+identical to a129833. 201/201 tests (new test_fastmem: decode+emulate of every form against the assembler's encodings, writeback, edges
+of the window, rejected forms, the signal path through the accessors of ppc_rt.h on this and another thread, chaining to the previous
+handler; test_emit: the MMIO-base marking).
+
+Host instructions of hot functions (static, whole function; guest instructions in brackets):
+
+| function | Quest base | Quest fastmem | Mac base | Mac fastmem |
+|---|---|---|---|---|
+| body_800A4434 (308) | 7208 (23.4/guest) | 3057 (9.9) | 7412 | 3125 |
+| body_80376904 (171) | 2148 (12.6) | 1177 (6.9) | 2482 | 1261 |
+| body_80284D58 (GX FIFO) | 1356 | 1100 | 1624 | 1560 |
+| body_800BA398 | 9613 | 7878 | 9768 | 8417 |
+| fn_802647AC | 2568 | 1721 | 2709 | 1817 |
+
+Compares in body_800A4434 224 -> 99, calls 148 -> 32 (the cold MMIO calls were out-of-line but inside the function).
+
+Mac (`uctest bench dist/uc_base dist/uc_fm3 --demo fightmac --runs 3`): guest Mcycles 7444/7443/7663 -> 7020/7043/7087 (**-6.2%**),
+wall -2.8% (CI [-6.9%, +1.4%], inconclusive at 3 rounds; the Mac replay is partly GPU-bound).
