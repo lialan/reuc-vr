@@ -540,7 +540,8 @@ int main() {
         CHECK(packet->draws[8].uniforms->konst[1][3]==64/255.f);
         CHECK(packet->draws[9].uniforms->konst[1][0]==16/255.f); // playback commits; failure rolls back
         CHECK(packet->draws[0].uniforms->tex_rows[0][0]==2 && packet->draws[0].uniforms->tex_rows[0][3]==0.25f);
-        CHECK(packet->draws[0].uniforms->pixel[0]==0x3F0000 && packet->draws[0].uniforms->pixel[1]==0x17 && packet->draws[0].uniforms->pixel[2]==0x100);
+        // pixel[1]: the depth word in bits 0-4, BP 0x43 (GXData+0x22C) in bits 8-14 and bit 15 = known (renderer/depth_efb.h)
+        CHECK(packet->draws[0].uniforms->pixel[0]==0x3F0000 && (packet->draws[0].uniforms->pixel[1]&0xFF)==0x17 && (packet->draws[0].uniforms->pixel[1]>>15)==1 && packet->draws[0].uniforms->pixel[2]==0x100);
         CHECK(packet->draws[0].blend.mode==1 && packet->draws[0].blend.source==4 && packet->draws[0].blend.destination==5);
         CHECK(packet->draws[4].texture && packet->draws[4].texture->levels[0].rgba[0]==96);
         CHECK(packet->draws[5].texture && packet->draws[5].texture->levels[0].rgba[0]==128);

@@ -268,6 +268,15 @@ private:
     struct PipelineChoice { VkPipeline pipeline=VK_NULL_HANDLE; bool uber=false; };
     PipelineKey pipeline_key(const gx::DrawPacket& draw,bool alpha_pass=false) const;
     bool fused_destination_alpha(const gx::DrawPacket& draw) const;   // the headset: colour and destination alpha in one draw
+    void log_depth_stats(const gx::FramePacket& packet,size_t scene_draws,const std::function<uint32_t(size_t)>& index_count);   // UC_DEPTH_STATS (vulkan_depth_efb.cpp)
+    // UC_FOLD_CLEAR (depth_efb.h): an EFB copy's clear waits for the next pass on the EFB, which takes it as its load op (CLEAR, when the
+    // cleared rectangle holds the pass's render area) or clears it first thing; anything else that reads or writes the EFB before that pass
+    // records it as a pass of its own (record_efb_clear), as without the switch.
+    struct EfbClear { bool pending=false; VkRect2D rect{}; VkClearColorValue color{}; float depth=1; } efb_clear_;
+    void record_efb_clear(VkCommandBuffer command,const char* why);
+    uint64_t clear_passes_=0, clears_as_load_=0, clears_in_pass_=0;   // [depth-stats]: clears as passes of their own, as a pass's load op, inside a pass
+    // UC_DEPTH_FORMAT (depth_efb.h): the format of the EFB's depth and of every depth target its pipelines draw into (the headset and its preview).
+    VkFormat depth_format_=VK_FORMAT_D32_SFLOAT;
     PipelineChoice pipeline_for(const PipelineKey& key);
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early,bool table=false);   // tools/fold_tev_shaders.py's module for these constants, or null

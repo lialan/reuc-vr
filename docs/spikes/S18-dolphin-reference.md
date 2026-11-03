@@ -280,3 +280,72 @@ signal handler (`runtime/fastmem.cpp`) and the translator's MMIO-base dataflow k
    are small, up to a few ms if any is full screen; exact either way, and it removes the last two-draw path.
 
 CPU, when the GPU no longer dominates: single-precision dataflow for paired add/sub/mul/div (section 6, item 1).
+
+## Done: depth and EFB (2026-11-03, branch gpu-depth-efb; recommendations 2, 3 and 5)
+
+All switches are off by default until the headset A/B (`/tmp/qgs/plan_depth.sh`, not run yet); the logic is in `renderer/depth_efb.h`
+(tested by `test_depth_efb`), the counters in `renderer/vulkan_depth_efb.cpp`. Nothing is generated at run time: no switch adds a pipeline
+key in the fight, so the key files and folded modules stay as they are.
+
+| switch | what it does |
+|---|---|
+| `UC_FOLD_CLEAR=1` | An EFB copy's clear is not a pass of its own: it waits (`efb_clear_`) for the next EFB pass, which takes it as its colour and depth load op (CLEAR) when the cleared rectangle holds the pass's render area (the render area takes the rectangle in), or clears it first thing inside the pass otherwise. An empty packet passes it on; anything else that reads or writes the EFB first (bloom proxy, HUD/glow layers, upscale, HUD-less copy, a copy, the present, an EFB capture) records it as before (`record_efb_clear`). `UC_FOLD_CLEAR_LOG=1` names each fallback. |
+| `UC_DEPTH_FORMAT=d24` | The headset's (and preview's) EFB depth and every depth target its pipelines draw into: X8_D24_UNORM_PACK32, else D24_UNORM_S8_UINT (enables separateDepthStencilLayouts for the depth-only barriers and views), else D32 (`[vulkan] EFB depth format ...` says which). `x8d24`, `d24s8`, `d32` force one. The clear depth `d/0xFFFFFF` is exact in 24-bit unorm. |
+| `UC_ALPHA_PRECHECK=1` | Key word 0 bit 16 from the full pre-evaluation (`gx::alpha_test_result`: NEVER/ALWAYS plus GEQUAL 0, LEQUAL 255 pass, LESS 0, GREATER 255 fail, combined by AND/OR/XOR/XNOR), not only ALWAYS-and-ALWAYS. Exact: the shader compares the alpha rounded to 0..255. |
+| `UC_DEPTH_STATS=1` | Per 2 s, per presented frame: alpha-tested draws and what the pre-check decides, zcomploc (BP 0x43 bit 6), EFB pixel formats, destination-alpha draws (fused / second draw, by callsite and size), EFB clears (own pass / load op / in a pass), the depth format. |
+
+BP 0x43 (PE control, GXData+0x22C, `GXSetPixelFmt`/`GXSetZCompLoc` write it there: the translated GXSetZCompLoc stores bit 6 at r2-8968 -> +556)
+now travels with each draw in `DrawUniform pixel[1]` bits 8-14 (bit 15 = known); no shader reads that word.
+
+### Counted first (Mac VR preview, KosmicKrisp, fightvr replay, fight window, per presented frame)
+
+| | per frame |
+|---|---|
+| draws (issued + merged) | 1260-1320 |
+| alpha-tested (discard kept) | 317-355; the full pre-check decides **0** of them (all are real tests) |
+| zcomploc early (ztop) | 975-1032; alpha-tested among them 60-96, all undetermined, **none writes depth**: 803B7FE4 (42, depth test off), 800BADD8 and 800BAF88 (8 each, LEQUAL, no write, <0.001 screens), 8006CED4 / 8006D174 (1 each, no test) |
+| EFB pixel format | RGBA6_Z24 for **every** draw (no RGB8, no RGB565) |
+| destination alpha | 740-777: fused 638-657, second draws **5-7**, all callsite 80366E14, blend SRCALPHA/INVSRCALPHA, 0.010-0.015 scene screens each (bounding box) |
+| EFB clears | 1 (the present's clear after the XFB copy); the next packet is empty, the one after it is the next frame's scene pass |
+
+So in this fight:
+- **zcomploc (rec 3 / 1.1)**: the only case where honouring it changes anything is an alpha-tested early-Z draw that writes depth (depth then
+  written where the alpha test fails, as on the console). There is none, here or in the G21 train capture (TD-049). The alpha-tested ztop
+  draws without depth writes give the same picture with early or late depth tests, and the 16 a frame that test depth cover under 0.001
+  screens. Not implemented as a pipeline variant (it would need a third TEV module family, folded per key, and Apple GPUs are known to
+  break discard under forced early tests, S18 section 4); the counter stays for other scenes.
+- **EFB pixel format (1.3)**: RGBA6 everywhere, so there is no destination-alpha work to skip. Not implemented beyond the counter.
+  (RGBA6's 6-bit quantization and dither are a picture change, not a cost: separate question.)
+- **Dual-source destination alpha (rec 5 / 1.4)**: 5-7 small draws a frame from one callsite (~0.07 scene screens together): at S17's 20-40 us
+  per tiny draw at most ~0.2 ms on the headset. Doing it needs another module family (output 1 at location 0 index 1; the stereo modules
+  also write the transmit target at location 1, which dual-source blending forbids), so not worth it now.
+- **Alpha pre-check (1.2)**: implemented (exact, cheap); no draw of the fight changes, so no new key and no gain there.
+
+### Folded clear and depth format: Mac numbers (same replay)
+
+| | off | `UC_FOLD_CLEAR=1` |
+|---|---|---|
+| EFB clears a frame: own pass / load op / in a pass | 1 / 0 / 0 | **0 / 1 / 0** |
+| render passes a frame | 15 + 1 clear pass | 15 |
+| attachment pixels moved / whole targets, draw passes only (`[gpu-area]`; the clear pass's own stores are not in it) | 43% | 41-42% |
+| draws issued a frame | 443 | 443 |
+| GPU ms per present (Apple M4 Pro; run-to-run 5.6-6.9) | 5.6, 6.9 | 6.8, 5.9 (noise) |
+| "present draws 0" packet (held the clear pass) | 0.96-1.06 ms | 0.80-0.92 ms |
+
+The scene pass now starts with colour and depth CLEARed instead of LOADed: that is the state in which Adreno can keep LRZ valid for the
+pass (driver behaviour, to be read in the render-stage trace). `UC_DEPTH_FORMAT=d24` takes D32 on the Mac: KosmicKrisp lists no 24-bit
+depth format (Apple GPUs have none), so the D24 A/B is headset-only.
+
+Pictures (EFB captures at retraces 8700/9060/9300, 5120x1440): base vs two more base runs <= 1/255; base vs `UC_FOLD_CLEAR=1` in three runs:
+two <= 1/255, one 435 px over 1% at 9060 (peak 9/255); a run with every switch off showed the same kind of outlier at 9060 (382 px, peak
+6/255), so that is KosmicKrisp's run-to-run variation, not the switch. All three switches at once: <= 1/255. The validation layer reports
+nothing new with all three on (only the existing blend-attachment, DrawParameters and sampler-at-shutdown messages).
+
+### Left for the headset (`/tmp/qgs/plan_depth.sh`)
+
+- GPU ms of the main scene and the frame, off / fold / d24 / both, native, alternating twice; `[vulkan] EFB depth format` (which 24-bit
+  format the Adreno takes); `[depth-stats] EFB clears` (1 as load op).
+- EFB captures off vs fold and off vs d24.
+- Render-stage traces off vs fold: whether LRZ now rejects anything in the main scene (S17: no LRZ-killed pixels so far).
+- Then the defaults: fold and d24 on if they help; the pre-check can go on regardless (exact, no key changes in the fight; elsewhere it
+  can add keys, which `pipeline_keys.quest` would then need).

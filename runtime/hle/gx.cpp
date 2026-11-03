@@ -443,7 +443,7 @@ MaterialSnapshot material_snapshot(const SdkRef& sdk_block,uint32_t lr,bool use_
     auto& material=result.material; auto& uniforms=result.uniforms;
     auto word=[&](uint32_t offset) { return block.word(offset); };
     material.stages=((word(0x254)>>10)&15)+1;
-    uniforms.pixel[1]=word(0x228)&31;
+    uniforms.pixel[1]=(word(0x228)&31)|((word(0x22C)&0x7F)<<8)|(1u<<15);   // with BP 0x43 PE control (GXData+0x22C) in bits 8-14, bit 15 = known (renderer/depth_efb.h)
     uniforms.pixel[2]=word(0x224)&511;
     uniforms.pixel[3]=(word(0x254)>>4)&3;
     for(uint32_t i=0;i<2;++i) for(uint32_t lane=0;lane<4;++lane) {

@@ -26,6 +26,7 @@
 #include <atomic>
 #include <bit>
 #include "vr_cull.h"
+#include "depth_efb.h"
 #include "fovea_map.h"
 #include <chrono>
 #include <cstring>
@@ -353,6 +354,23 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     if (layers_ > 1) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
     xform_ = layers_ > 1 && supported12.bufferDeviceAddress && !std::getenv("UC_NO_XFORM");
+    // UC_DEPTH_FORMAT (depth_efb.h), the headset and its preview only: GX depth is 24-bit, so a 24-bit format holds it exactly. X8_D24 first
+    // (depth only); D24S8 needs separate depth/stencil layouts for the depth-only barriers and views used here. Unsupported: D32 as before.
+    if (const char* wanted=std::getenv("UC_DEPTH_FORMAT"); layers_>1 && wanted && *wanted && std::string(wanted)!="d32") {
+        const auto usable=[&](VkFormat format) {
+            VkFormatProperties properties{}; vkGetPhysicalDeviceFormatProperties(physical_,format,&properties);
+            const VkFormatFeatureFlags needed=VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            return (properties.optimalTilingFeatures&needed)==needed;
+        };
+        const std::string name(wanted);
+        if (name!="d24s8" && usable(VK_FORMAT_X8_D24_UNORM_PACK32)) depth_format_=VK_FORMAT_X8_D24_UNORM_PACK32;
+        else if (name!="x8d24" && supported12.separateDepthStencilLayouts && usable(VK_FORMAT_D24_UNORM_S8_UINT)) {
+            depth_format_=VK_FORMAT_D24_UNORM_S8_UINT; features12.separateDepthStencilLayouts=VK_TRUE;
+            if (!features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; features12_chained = true; }
+        }
+        std::fprintf(stderr,"[vulkan] EFB depth format %s (UC_DEPTH_FORMAT=%s)\n",depth_format_==VK_FORMAT_X8_D24_UNORM_PACK32 ? "X8_D24_UNORM_PACK32" :
+                     depth_format_==VK_FORMAT_D24_UNORM_S8_UINT ? "D24_UNORM_S8_UINT" : "D32_SFLOAT (no usable 24-bit depth format)",wanted);
+    }
     static_depth_ = layers_ > 1 && std::getenv("UC_STATIC_DEPTH");   // diagnostics: does dynamic depth state cost the tiler its LRZ?   // the headset's vertex pre-pass reads the vertices by address
     if (xform_) {
         features12.bufferDeviceAddress = VK_TRUE;
@@ -790,6 +808,25 @@ void VulkanRenderer::record_texture_copy(VkCommandBuffer command, VkImage source
     static const bool eager_mips=std::getenv("UC_EAGER_COPY_MIPS")!=nullptr;   // diagnostics: every copy's chain at once, as before
     if (eager_mips) record_copy_mips(command,target);
 }
+// UC_FOLD_CLEAR: the waiting EFB clear as a pass of its own over the cleared rectangle (what render's clear_region does for the EFB), for
+// whatever reads or writes the EFB before a pass of it could take the clear as its load op.
+void VulkanRenderer::record_efb_clear(VkCommandBuffer command,const char* why) {
+    if (!efb_clear_.pending) return;
+    static const bool log=gx::depth_switch("UC_FOLD_CLEAR_LOG");   // diagnostics: what took a waiting clear as a pass of its own
+    if (log) std::fprintf(stderr,"[fold-clear] frame %llu: a pass of its own (%s)\n",(unsigned long long)frame_index_,why);
+    efb_clear_.pending=false; ++clear_passes_;
+    const auto depth_stages=VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    barrier(command,depth_,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView=efb_view_; color.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; color.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; color.storeOp=VK_ATTACHMENT_STORE_OP_STORE; color.clearValue.color=efb_clear_.color;
+    depth.imageView=depth_view_; depth.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; depth.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; depth.storeOp=VK_ATTACHMENT_STORE_OP_STORE; depth.clearValue.depthStencil={efb_clear_.depth,0};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea=efb_clear_.rect; rendering.layerCount=1; rendering.viewMask=layers_>1 ? 0b11u : 0u;
+    rendering.colorAttachmentCount=1; rendering.pColorAttachments=&color; rendering.pDepthAttachment=&depth;
+    vkCmdBeginRendering(command,&rendering);   // the load ops clear the render area, which is the cleared rectangle
+    vkCmdEndRendering(command);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
+}
 void VulkanRenderer::record_copy_mips(VkCommandBuffer command, Texture& target) {
     if (!target.mips_pending) return;
     target.mips_pending=false;
@@ -878,7 +915,8 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     if(draw.state->cull>3) throw std::invalid_argument("invalid native cull mode");
     key[0]=blend.mode|(blend.source<<2)|(blend.destination<<5)|(blend.logic<<8)|(uint32_t(blend.color_write)<<12)|(uint32_t(blend.alpha_write)<<13);
     key[0]|=uint32_t(draw.state->cull)<<14;
-    key[0]|=uint32_t(gx::alpha_test_can_discard(draw.uniforms->pixel[0]))<<16;   // smoke.slang alphaTestActive (specialization constant 67)
+    static const bool alpha_precheck=gx::depth_switch("UC_ALPHA_PRECHECK");   // depth_efb.h: the alpha test evaluated from its compares and references
+    key[0]|=uint32_t(gx::alpha_test_needs_discard(draw.uniforms->pixel[0],alpha_precheck))<<16;   // smoke.slang alphaTestActive (specialization constant 67)
     key[0]|=uint32_t(gx::has_texture_matrix_index(*draw.state))<<17;   // as the bank binding (record), not draw.texture_bank (also set unused)   // per-vertex texture matrices: the headset's vertex stage with the bank code (else NO_BANK)
     const auto& material=draw.material;
     if (material.stages>16) throw std::invalid_argument("native TEV stage count exceeds16");
@@ -1205,7 +1243,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         const VkFormat formats[5] = {VK_FORMAT_R8G8B8A8_UNORM, kMotionFormat, kGBufferFormat, kMaterialFormat, kAlbedoFormat};
         const VkFormat hud_formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachmentFormats = formats; rendering.viewMask = layers_>1 ? 0b11u : 0u;
-        rendering.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
+        rendering.depthAttachmentFormat=depth_format_;
         if (hud_layer) { rendering.colorAttachmentCount=2; rendering.pColorAttachmentFormats=hud_formats; rendering.depthAttachmentFormat=VK_FORMAT_UNDEFINED; }
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depth.depthTestEnable=bool(key[68]&1) && !hud_layer; depth.depthWriteEnable=bool(key[68]&16) && !hud_layer;
@@ -1425,6 +1463,7 @@ RenderPixels VulkanRenderer::capture(uint64_t serial, bool efb) {
                 auto& copy=copies[eye]; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, eye, 1}; copy.imageExtent = {eye_size.width, eye_size.height, 1};
                 copy.bufferOffset=VkDeviceSize(eye_size.width)*eye*4; copy.bufferRowLength=size.width;
             }
+            if (efb) record_efb_clear(slot.command,"capture");   // UC_FOLD_CLEAR: the EFB as the packet left it, its clear included
             vkCmdCopyImageToBuffer(slot.command, efb ? efb_ : slot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.pixels.buffer, eyes, copies);
             VkBufferMemoryBarrier2 host_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2}; host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT; host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
             host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; host_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT; host_barrier.srcQueueFamilyIndex = host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1632,7 +1671,7 @@ void VulkanRenderer::record_upscale(VkCommandBuffer command, bool black_output) 
     const VkImageUsageFlags color_usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT;
     const VkImageUsageFlags depth_usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
     in.color={scene_color_,scene_color_view_,VK_FORMAT_R8G8B8A8_UNORM,scene_extent_,color_usage};
-    in.depth={scene_depth_,scene_depth_view_,VK_FORMAT_D32_SFLOAT,scene_extent_,depth_usage};
+    in.depth={scene_depth_,scene_depth_view_,depth_format_,scene_extent_,depth_usage};
     in.motion={scene_motion_,scene_motion_view_,kMotionFormat,scene_extent_,color_usage};
     in.output={efb_,efb_view_,VK_FORMAT_R8G8B8A8_UNORM,efb_extent_,color_usage};
     // The scene viewport (640x360 of the 640x480 logical EFB, top-left) in pixels of each target.
@@ -2045,7 +2084,7 @@ void VulkanRenderer::sync_rt_material_targets() {
     make_attachment(scene_albedo_,scene_albedo_memory_,scene_albedo_view_,scene_extent_,false,kAlbedoFormat);
 }
 void VulkanRenderer::make_attachment(VkImage& target,VkDeviceMemory& memory,VkImageView& target_view,VkExtent2D extent,bool depth,VkFormat format,uint32_t layers) {
-    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; image.imageType = VK_IMAGE_TYPE_2D; image.format = format!=VK_FORMAT_UNDEFINED ? format : depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; image.imageType = VK_IMAGE_TYPE_2D; image.format = format!=VK_FORMAT_UNDEFINED ? format : depth ? depth_format_ : VK_FORMAT_R8G8B8A8_UNORM;
     image.extent = {extent.width, extent.height, 1}; image.mipLevels = 1; image.arrayLayers = layers; image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.tiling = VK_IMAGE_TILING_OPTIMAL; image.usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;   // sampled: the HDR encode reads the EFB and the slot images
     if (motion_outputs_) image.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | (depth ? 0 : VK_IMAGE_USAGE_STORAGE_BIT);   // upscaler inputs and outputs
@@ -2297,7 +2336,7 @@ void VulkanRenderer::ensure_particle_layer() {
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         const VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount=2; dynamic.pDynamicStates=dynamic_states;
-        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask=0b11; rendering.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask=0b11; rendering.depthAttachmentFormat=depth_format_;
         VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext=&rendering; pipeline.stageCount=2; pipeline.pStages=stages;
         pipeline.pVertexInputState=&vertices; pipeline.pInputAssemblyState=&assembly; pipeline.pViewportState=&viewport; pipeline.pRasterizationState=&raster;
         pipeline.pMultisampleState=&multisample; pipeline.pDepthStencilState=&depth; pipeline.pColorBlendState=&blend; pipeline.pDynamicState=&dynamic; pipeline.layout=particle_.depth_layout;
@@ -2529,7 +2568,7 @@ void VulkanRenderer::rebuild() {
         if(efb_view_) vkDestroyImageView(device,efb_view_,nullptr);
         if(efb_) vkDestroyImage(device,efb_,nullptr);
         if(efb_memory_) vkFreeMemory(device,efb_memory_,nullptr);
-        efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; ++targets_generation_;
+        efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; ++targets_generation_; efb_clear_.pending=false;
         sweep_meshes(true);
         for(auto& texture:recycled_copies_) destroy_texture(texture);
         recycled_copies_.clear(); recycled_copy_bytes_=0;
@@ -2857,6 +2896,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         }
         gpu_draws.push_back(info);
     }
+    static const bool depth_stats=gx::depth_switch("UC_DEPTH_STATS");
+    if (depth_stats) log_depth_stats(packet,scene_draws,[&](size_t d) { return gpu_draws[d].index_count; });
     if (vertex_count && index_count) {
         if (slot.vertices.size < VkDeviceSize(vertex_count) * sizeof(gx::GpuMeshVertex)) {
             destroy_buffer(slot.vertices); slot.vertices = make_buffer(VkDeviceSize(vertex_count) * sizeof(gx::GpuMeshVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|vertex_usage());
@@ -3591,6 +3632,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     auto record_pass=[&](const PassTarget& target, size_t first, size_t last, bool scene) {
     const bool initialized=*target.initialized;
+    const bool efb_clear=efb_clear_.pending && target.color==efb_ && !overlay_frame;   // UC_FOLD_CLEAR: the copy's clear this pass applies first
     barrier(slot.command, target.color, initialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             initialized ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_NONE, initialized ? VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT : 0,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -3640,6 +3682,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (bx <= ax || by <= ay) return;
             x0 = std::min(x0, ax); y0 = std::min(y0, ay); x1 = std::max(x1, bx); y1 = std::max(y1, by);
         };
+        if (efb_clear) add(efb_clear_.rect.offset.x, efb_clear_.rect.offset.y, int64_t(efb_clear_.rect.offset.x) + efb_clear_.rect.extent.width, int64_t(efb_clear_.rect.offset.y) + efb_clear_.rect.extent.height);
         if (scene && scene_clear_.pending) {
             const auto& r = scene_clear_.region;
             add(int64_t(r[0]) * target.extent.width / 640, int64_t(r[1]) * target.extent.height / 480,
@@ -3692,7 +3735,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     depth.loadOp=initialized && !target.clear_depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR; depth.storeOp=VK_ATTACHMENT_STORE_OP_STORE; depth.clearValue.depthStencil={packet.clear_depth/float(0xFFFFFF),0};
     // A pass whose draws neither test nor write depth (the game's full-screen post quads, 2D) and that clears none keeps depth as it is
     // without moving it through the tile memory: not stored, and with LOAD_OP_NONE not loaded either.
-    if (initialized && !target.clear_depth && !full_render_area && !(scene && scene_clear_.pending) &&
+    if (initialized && !target.clear_depth && !full_render_area && !(scene && scene_clear_.pending) && !efb_clear &&
         std::none_of(gpu_draws.begin()+first,gpu_draws.begin()+last,[](const auto& info) { return info.index_count && ((info.key[68]&1) || ((info.key[68]>>4)&1)); })) {
         depth.storeOp=VK_ATTACHMENT_STORE_OP_NONE;
         if (load_op_none_) depth.loadOp=VK_ATTACHMENT_LOAD_OP_NONE_EXT;
@@ -3700,11 +3743,23 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     // A pass whose draws test depth but none writes it (the translucent effects and particles after the scene) loads depth and leaves it
     // as it was: STORE_OP_NONE (Vulkan 1.3) writes nothing back, 2 x 2064x2944 x 4 bytes saved a pass at native. UC_DEPTH_STORE_ALWAYS=1: stored.
     static const bool store_always=std::getenv("UC_DEPTH_STORE_ALWAYS")!=nullptr;
-    if (!store_always && depth.storeOp==VK_ATTACHMENT_STORE_OP_STORE && initialized && !target.clear_depth && !(scene && scene_clear_.pending) &&
+    if (!store_always && depth.storeOp==VK_ATTACHMENT_STORE_OP_STORE && initialized && !target.clear_depth && !(scene && scene_clear_.pending) && !efb_clear &&
         std::none_of(gpu_draws.begin()+first,gpu_draws.begin()+last,[](const auto& info) { return info.index_count && ((info.key[68]>>4)&1); }))
         depth.storeOp=VK_ATTACHMENT_STORE_OP_NONE;
     if (!store_always && target.clear_depth) depth.storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;   // a scratch depth buffer (the bloom proxy's, the held frame's): cleared by every pass, never read after it
     rendering.pDepthAttachment=&depth;
+    bool clear_inside=false;   // UC_FOLD_CLEAR: the rectangle does not hold the render area (or the target is new): cleared after the begin
+    if (efb_clear) {
+        const auto& r=efb_clear_.rect;
+        const bool holds=initialized && render_area.offset.x>=r.offset.x && render_area.offset.y>=r.offset.y &&
+            int64_t(render_area.offset.x)+render_area.extent.width<=int64_t(r.offset.x)+r.extent.width && int64_t(render_area.offset.y)+render_area.extent.height<=int64_t(r.offset.y)+r.extent.height;
+        if (holds) {
+            color.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; color.clearValue.color=efb_clear_.color; colors[0]=color;
+            depth.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; depth.clearValue.depthStencil={efb_clear_.depth,0};
+            ++clears_as_load_;
+        } else { clear_inside=true; ++clears_in_pass_; }
+        efb_clear_.pending=false;
+    }
     {   // UC_GPU_PACKETS: the attachment pixels moved through tile memory (loaded + stored, colour and depth, all eyes) against the whole target
         static const bool area_stats = std::getenv("UC_GPU_PACKETS") != nullptr;
         if (area_stats) {
@@ -3754,6 +3809,12 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         }
     }
     vkCmdBeginRendering(slot.command, &rendering);
+    if (clear_inside) {
+        VkClearAttachment clears[2]{}; clears[0].aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; clears[0].clearValue.color=efb_clear_.color;
+        clears[1].aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT; clears[1].clearValue.depthStencil={efb_clear_.depth,0};
+        const VkClearRect rectangle{efb_clear_.rect,0,1};
+        vkCmdClearAttachments(slot.command,2,clears,1,&rectangle);
+    }
     if (scene && scene_clear_.pending) {   // the last present's clear, which GX applied to the EFB this scene renders into
         const auto& r=scene_clear_.region;
         const uint32_t x=uint64_t(r[0])*target.extent.width/640, y=uint64_t(r[1])*target.extent.height/480;
@@ -4312,6 +4373,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
             }
         }
+        // UC_FOLD_CLEAR: a waiting clear goes first where something else than this packet's EFB passes reads or writes the EFB before them
+        if (efb_clear_.pending && (bloom_chain || bloom_proxy_.valid || hud_.used || glow_.used || upscale_here || writes_scene || dlss_generation_enabled() || fsr_generation_enabled() || overlay_frame))
+            record_efb_clear(slot.command,bloom_chain ? "bloom chain" : bloom_proxy_.valid ? "bloom proxy" : hud_.used || glow_.used ? "layers" : "scene/upscale/overlay");
         if (!bloom_chain && bloom_proxy_.valid && (!packet.draws.empty() || copy_target || packet.present)) put_back_bloom_proxy(slot.command);
         if (bloom_chain) {
             ensure_bloom_proxy();
@@ -4409,6 +4473,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     else if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
     if (hudless_wanted && !hudless_taken_ && packet.present) take_hudless();
+    // UC_FOLD_CLEAR: no EFB pass of this packet took a waiting clear. An empty packet (no draws, copy, present or clear: one follows every
+    // present in the fight) leaves the EFB alone, so the clear waits on; anything else may read or write the EFB from here on.
+    if (!packet.draws.empty() || copy_target || packet.present || packet.clear_only || packet.clear_after_copy || overlay_frame) record_efb_clear(slot.command,packet.draws.empty() ? "copy or present" : "draws, no EFB pass");
     const PassTarget& active=scene_only ? scene_target : efb_target;
     if(copy_target) {
         if (bloom_chain) record_texture_copy(slot.command,bloom_proxy_.color,bloom_proxy_.extent,packet.texture_copy->source,*copy_target,VK_IMAGE_LAYOUT_UNDEFINED);
@@ -4554,8 +4621,16 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdEndRendering(slot.command);
             barrier(slot.command,active.color,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
     };
+    static const bool fold_clear=gx::depth_switch("UC_FOLD_CLEAR");
     if (packet.clear_after_copy && (packet.present || copy_target || packet.clear_only)) {
-        clear_region(active,true);
+        if (fold_clear && !scene_only && &active==&efb_target && !full_render_area_clears && efb_initialized_) {   // the next EFB pass applies it (efb_clear_)
+            const auto& source=copy_target ? packet.texture_copy->source : packet.display_source;
+            const uint32_t x=uint64_t(source[0])*efb_extent_.width/640,y=uint64_t(source[1])*efb_extent_.height/480;
+            const uint32_t right=std::max(x+1,uint32_t(uint64_t(source[0]+source[2])*efb_extent_.width/640)),bottom=std::max(y+1,uint32_t(uint64_t(source[1]+source[3])*efb_extent_.height/480));
+            efb_clear_.pending=true; efb_clear_.rect={{int32_t(x),int32_t(y)},{right-x,bottom-y}};
+            for(size_t i=0;i<4;++i) efb_clear_.color.float32[i]=packet.clear_color[i]/255.f;
+            efb_clear_.depth=packet.clear_depth/float(0xFFFFFF);
+        } else { clear_region(active,true); ++clear_passes_; }
         // The scene targets keep this frame until it is presented (frame generation reads depth and vectors there); the next frame's first
         // scene pass applies this clear to them.
         if (packet.present && upscaler_ && !scene_only) scene_clear_={true,packet.display_source,packet.clear_color,packet.clear_depth};
@@ -4733,7 +4808,7 @@ void VulkanRenderer::shutdown() {
         if (efb_view_) vkDestroyImageView(device,efb_view_,nullptr);
         if (efb_) vkDestroyImage(device,efb_,nullptr);
         if (efb_memory_) vkFreeMemory(device,efb_memory_,nullptr);
-        efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; efb_extent_={};
+        efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; efb_extent_={}; efb_clear_.pending=false;
         destroy_fovea();
         destroy_hud_layer();
         destroy_bloom_proxy();
