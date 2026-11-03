@@ -514,3 +514,122 @@ Quest host instructions after both (base -> now): body_800A4434 7208 -> 2844 (9.
 - **5, registers as arguments**: NDK 27's clang 18 ignores `preserve_none` (Apple clang 21 accepts it), and the safe-point rule above
   means a pinned register would still be stored to the context before and reloaded after every non-closed call, which is where the
   hot functions' context traffic is (body_800A4434: 497 of its loads/stores address the context, 426 the stack); not done.
+
+## CPU: host side 2 (2026-11-03, branch cpu-host2)
+
+Question: the guest thread is ~25 ms of CPU a game frame on the headset and 60 fps needs ~16, while the other cores are half idle. Which of
+the guest thread's host work can run elsewhere without changing anything the guest sees (demo replays, netplay)?
+
+### 1. GX draws built on their own thread (3fba228)
+
+What the guest thread did for the renderer (S17 host section, 8dcb08f profile): `hle_ResMeshDraw` 12.5%, `GXCallDisplayList` 6%, the FIFO
+store path 5.5%, `GXBegin` 4.3%, texture/material/state snapshots 5.5%. None of it is visible to the guest except through a few values the
+HLE writes back. The split (Dolphin's dual-core idea, `runtime/hle/gx_queue.h`, `gx.cpp`):
+
+- **Front (guest thread)**: everything the guest can observe or that must happen at call time: SDK block writes, guest calls (dirty-state
+  flushes, palette lookups, GXFlush), the bytes of a display list being recorded (copied to guest memory at GXEndDisplayList), the draw-done
+  flag and callback, every check that throws (sequence, producer, layout, descriptor, bounds; the encoded size of a primitive from the SDK
+  block's vertex descriptors), the data an immediate load copies from a guest pointer (matrices, lights, colours, TEV/colour/pixel material
+  parsing, palettes), and the SDK block a draw sees (a 1376-byte copy, shared while the guest leaves the block alone). It appends one command
+  per call.
+- **Back (the builder thread)**: the renderer's GX state (transforms, uniforms, materials, bound textures and palettes, copied EFB textures,
+  the recorded lists' native items), vertex decoding (immediate primitives, display-list calls, mesh misses), the mesh and texture caches,
+  DrawPackets, the reticle/prompt handling of a packet and `Packets::seal_batch`.
+- Commands are lambdas in recycled 1 MiB chunks: one release store per command, a futex wake-up only when the builder sleeps (it polls
+  ~100 us first), the front waits only for the builder's backlog limit (48 MiB) or an explicit drain. A command that throws stops the builder;
+  the error comes back on the guest thread at its next GX call or from a scheduler event (a guest blocked on a draw-done that never comes).
+- **Guest memory the builder reads later** (vertex arrays, indexed matrices, textures, display-list payloads): the console's GPU reads them
+  from memory when it processes the FIFO, after the CPU moved on, and the game learns that the GPU passed them only through the draw-done.
+  Here the draw-done comes from the builder's own packets: live play when the render thread submits the packet the builder sealed, a replay
+  when the GPU completes it, network play (the draw-done is posted at once) after a drain of the builder. Rollback checkpoints drain too.
+- **What the guest reads back**, computed by the front: packet serials (the builder seals in command order, the front counts), the colour
+  channel words GXCallDisplayList writes back (each recording keeps a summary of its channel settings, texture copies and child calls), the
+  `known_sdk` the raw display-list path writes texgen words through.
+- **Write-watch**: the caches on the builder (textures, meshes, display-list decodes) record the stamp the guest thread took when it issued
+  the command (`gx_watch_stamp.h`); the builder never advances the epoch counter that every guest store reads. A store after the command has
+  a larger epoch, so nothing is missed; a store the comparison already saw costs one extra comparison.
+- **The FIFO port**: guest stores to 0xCC008000 go from `ppc::mmio_write` straight to `uc::gx_fifo_store` (`gx_fifo.h`, inline: a 4-byte
+  copy into the open recording or immediate primitive, the slow path when the store would close it) instead of the virtual MMIO device and
+  `gx_fifo_write`'s checks. A fastmem fault path can call the same inline function. The audits (`--gx-audit`, `--gx-gaps`) keep the device.
+- **Re-recorded display lists**: a new recording at the address of the previous one takes over the decoded vertices of each draw whose
+  payload bytes and vertex format are unchanged; a call reuses them while the vertex arrays its indices read are bound at the same addresses
+  and no guest store touched them since the decode (every 256th call decodes anyway). In the fight a quarter to a third of the display-list
+  draws reuse a decode (24% on the headset, 30% on the Mac; the rest index arrays the game rewrites each frame).
+- Determinism detail: the one deterministic-clock read the moved code made (the `--profile` mesh texture dump named its files after
+  `uc::now_ticks()`, which advances the virtual clock on a guest thread) is made by the front after the builder did the dump, so demos
+  recorded with `--profile` still replay.
+
+Checks: `fightmac` with `--det-out` (guest memory hashed every retrace): identical to the base over all 9226 retraces. `UC_GX_PACKET_HASH=1`
+(a hash of every sealed packet: geometry, state, transforms, uniforms, material, textures, packet fields): the 71265 packets of the replay
+are identical with the builder thread and without it (`UC_GX_SYNC=1`), i.e. the builder never read memory the guest had changed meanwhile.
+`UC_GX_CACHE_VERIFY=1`: no reused decode or snapshot differs from a fresh one. 202/202 tests after the merge (`test_gx_queue` new; the HLE unit
+tests run the builder inline).
+
+Commits: 3fba228 (builder), 22b4efc (lighter front), 173c09b (scheduler spin, off by default), and the FIFO outside-state inline path
+(below). Merged with quest3-vr (fastmem, one write per store) in 24021a3: `ppc::mmio_write` serves both the explicit store path and
+fastmem's fault handler, so both reach `uc::gx_fifo_store`.
+
+Guest-thread profile after (Mac `sample`, fightmac fight window, the GX share of the guest thread's samples):
+
+| | base | builder |
+|---|---|---|
+| `hle_ResMeshDraw` | 8.3% | 1.7% |
+| `hle_GXCallDisplayList` | 7.5% | <0.4% |
+| FIFO path (`gx_fifo_write`, `FifoSink`, decode per store) | 6.9% | 0.9% (+ `mmio_write` 1.9% with the inline append) |
+| `hle_GXBegin` | 5.0% | 1.4% |
+| per call (`[gxtime]`, Mac) | list 28 us, mesh 1.21 us | list 1.3 us, mesh 0.58 us |
+| per call (`[gxtime]`, headset) | list ~75 us, mesh ~5 us | list 6.3 us, mesh 0.68 us |
+
+The builder thread on the Mac is busy ~50% of a core in the fight; the guest thread now waits for it only at the draw-done (the replay's
+`builder backlog` is 0-200 KiB at the once-a-second print). Front details that mattered: the SDK block a draw sees travels inside the
+command (a compare and a shared block per draw cost 3.4% of the guest thread), and the front no longer derives the snapshot state (it checks
+the viewport/scissor and computes the encoded size from the one vertex format); outside a recording and a primitive the FIFO bytes (state
+commands of SDK code that is not replaced, ~250k stores a second) are counted inline unless a raw display-list call starts.
+
+### 2. Audio mixing off the guest thread: not done (nothing to gain)
+
+`uc::mix_ax_voice` writes back into every voice's parameter block what the guest reads (position, state, ADPCM predictor and history, the
+last sample, envelope and volumes); for ADPCM those values need every sample decoded in order, so the decode has to stay on the guest thread
+and only the volume/envelope multiply-add and the PCM output could move. Its cost: the Mac `sample` of the live fight (`uctest run fight`,
+8 s) finds the AX frame and mixer in ~7 of ~2570 guest-thread samples (0.3%), the replay 7 of 3103. The "~220 ms/s on guest thread #4"
+of the live `[sched]` line is not CPU: `[sched]` adds the time a thread holds the baton, which includes the scheduler's idle wait when that
+thread was the last to block (in the live sample every guest host thread but the main one is idle). Half of 0.3% does not pay for a second
+copy of the voice state.
+
+### 3. Guest threads on one host thread: evaluated, a spin tried, not enabled
+
+A baton handoff wakes a sleeping host thread: ~20-30 us from notify to running on the headset (`[sched] avg wake`), ~250-340 handoffs a
+second in the replay (~0.7% of its wall time), ~900 live (~2%). Fibres on one host thread would remove that, but every wait of the
+scheduler (handoff, start, rollback rewind and restore, cancel, shutdown) would have to become a stack switch, with per-platform switch code
+(bionic has no makecontext/swapcontext) — too much risk for ~1-2%. The cheaper half was tried (173c09b): a thread that hands the baton on
+spins up to `UC_SCHED_SPIN_US` for it before sleeping, and the hand-over skips the futex wake of a spinning target. In the headset replay
+the average wake stayed 22-30 us at 50 us of spin (the handoffs there go to threads that slept long before), on the Mac live fight 4.5 ->
+5.5 us (no gain). Kept as an option, default 0 (as before).
+
+### Measured on the headset (fightvr replay, render scale 1, UC_FINISH_AT_SUBMIT=1)
+
+Same window for every run (retraces 8520-8880, 7 game seconds; ms and Mcycles per game second):
+
+| build | wall ms | guest Mcycles |
+|---|---|---|
+| 110dac2 (base of this branch) | 2837, 2924 | 2557, 2603 |
+| builder (3fba228, first APK) | 2322, 2395 (**-18%**) | 1944, 1965 (**-24%**) |
+| quest3-vr feee800 (fastmem, one-write stores) | 2666 | 2355 |
+| feee800 + builder + lighter front (24021a3 + spin 50 us) | 2234 (**-16%**) | 1741 (**-26%**) |
+
+(The full 15-second windows: base 2769/2844 -> builder 2248/2297 ms, 2498/2536 -> 1901/1913 Mcycles; feee800 2601 ms / 2298 Mcycles.) The
+last row is one run cut at 8 of 15 game seconds (the headset was handed to the owner); the second pair, the run without the spin and the
+live fights (with and without UC_CPU_BOOST=1) are still to do.
+
+Mac (`uctest bench --demo fightmac --runs 3`, partly GPU-bound: its draw-done waits for GPU completion): 110dac2 -> builder -8.4% wall (CI
+[-15.7%, -1.1%]), guest Mcycles 7455 -> 6016 (-19%); feee800 -> merged -4.7% wall (inconclusive), peak FPS 102 -> 108.
+
+Determinism: `fightmac --det-out` identical to the base over all 9226 retraces for the builder (vs 110dac2) and for the merge with the
+spin (vs feee800). 202/202 tests.
+
+### What is left
+
+Guest CPU in the replay is now 1741 Mcycles (ns) per game second, 29 ms per retrace at its two game steps a retrace (43 ms at 110dac2).
+The translated code is most of it; the host share left on the guest thread is the SDK math HLE (PSVEC/PSMTX, collision, ~3%),
+`hle_ResMeshSetup`'s parse (~1%), the GX front (~4%) and the draw-done wait for the builder and the render thread. The builder has headroom
+(half a core); if it becomes the limit, its per-draw state blocks (the 2 KB `share()` compares, the shared_ptr counts) are next.

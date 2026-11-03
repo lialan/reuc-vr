@@ -8,13 +8,28 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include "host_thread.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(_M_ARM64)
+#include <intrin.h>
+#endif
 
 namespace uc {
 
 namespace {
+inline void cpu_relax() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#elif defined(_M_ARM64)
+    __yield();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
 struct Tramp { Sched* s; Thread* t; };
 void tramp(void* p) {
     std::unique_ptr<Tramp> tp(static_cast<Tramp*>(p));
@@ -24,7 +39,11 @@ void tramp(void* p) {
 }
 }  // namespace
 
-Sched::Sched(uint8_t* mem, size_t host_stack) : mem_(mem), host_stack_(host_stack) { irq_ctx_.mem = mem; }
+Sched::Sched(uint8_t* mem, size_t host_stack) : mem_(mem), host_stack_(host_stack) {
+    irq_ctx_.mem = mem;
+    const char* spin = std::getenv("UC_SCHED_SPIN_US");
+    spin_ns_ = uint64_t(spin ? std::strtoul(spin, nullptr, 10) : 0) * 1000;   // off by default: the headset replay showed no shorter wake-ups at 50 us
+}
 
 PendingHle::PendingHle(Sched& scheduler,ppc::Ctx& c,void (*retry)(ppc::Ctx&),uint32_t entry)
     : thread_(scheduler.current()) {
@@ -206,7 +225,7 @@ void Sched::join_hosts() {
         if (!host_thread_join(HostThread{handle}, 5000)) fatal("guest host thread failed to stop within 5 s");
     }
     for (auto& thread : threads_) if (thread->started) thread->state = Thread::State::Dead;
-    running_ = nullptr;
+    running_ = nullptr; baton_.store(nullptr);
 }
 
 Thread* Sched::create(uint32_t guest_addr, int priority, Body body, const ppc::Ctx* inherit) {
@@ -552,13 +571,28 @@ void Sched::handoff(Thread* self, Thread* next) {
     next->state = Thread::State::Running;
     ee_ = next->ee;
     if (switch_hook_) switch_hook_(next);
+    bool next_spins;
     {
         std::lock_guard<std::mutex> lk(baton_m_);
-        running_ = next;
+        running_ = next; baton_.store(next, std::memory_order_release);
         if (!next->started) start_host(next);
+        next_spins = next->spinning.load(std::memory_order_relaxed);   // under the lock: a spinner that stops later checks running_ under it too
     }
-    next->cv.notify_one();
+    if (!next_spins) next->cv.notify_one();   // a spinning thread sees the baton without a wake-up (a futex call on Android)
     if (self_finished) return;
+    // The baton often comes back within tens of microseconds (an interrupt woke a thread that runs briefly): waiting for it in a spin saves
+    // the wake-up latency of a sleeping host thread (~20 us on the headset) on the way back.
+    if (spin_ns_) {
+        self->spinning.store(true, std::memory_order_relaxed);
+        const uint64_t until = now + spin_ns_;
+        for (unsigned i = 1;; ++i) {
+            if (baton_.load(std::memory_order_acquire) == self || shutdown_.load(std::memory_order_relaxed)) break;
+            if (!(i & 63) && steady_ns() >= until) break;
+            cpu_relax();
+        }
+        std::lock_guard<std::mutex> lk(baton_m_);
+        self->spinning.store(false, std::memory_order_relaxed);
+    }
     std::unique_lock<std::mutex> lk(baton_m_);
     self->cv.wait(lk, [&] { return running_ == self || shutdown_ || self->cancelled || self->rewind_requested; });
     if(self->rewind_requested && !shutdown_) throw ThreadRewind{};
@@ -624,7 +658,7 @@ void Sched::run(Thread* m) {
         m->suspend_count = 0;
         if (switch_hook_) switch_hook_(m);
         m->state = Thread::State::Running;
-        running_ = m;
+        running_ = m; baton_.store(m, std::memory_order_release);
         start_host(m);
     }
     m->cv.notify_one();

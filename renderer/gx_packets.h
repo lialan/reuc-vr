@@ -59,6 +59,7 @@ public:
     bool wait_ready(std::chrono::nanoseconds timeout);
     bool complete(uint64_t serial);
     void cancel();
+    uint64_t next_serial() { std::lock_guard lock(mutex_); return next_serial_; }   // the serial the next seal_batch returns
     struct Depth { size_t queued, outstanding, frames_in_flight; };
     Depth depth() { std::lock_guard lock(mutex_); return {queued_.size()+size_t(bool(latest_scene_)), outstanding_.size(), frames_in_flight_.size()}; }
 private:
