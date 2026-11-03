@@ -33,7 +33,16 @@ static uint xformDraw = 0;
 #else
 [[vk::binding(2,0)]] ConstantBuffer<DrawState> drawState : register(b0);
 #endif
-#ifdef STEREO
+#ifdef TEX_TABLE
+// The headset's texture table (UC_TEX_MERGE, needs STEREO and XFORM_DRAW's vertex stage): the packet's textures and samplers as one array of
+// combined image samplers in set 1; a draw's maps 0..7 are the entries from textureBase on (a flat input: draws that differ only in their
+// textures are one run, so the index is not uniform across a wave). Set 0's maps are unused.
+[[vk::binding(0,1)]] Sampler2DArray<float4> tableImages[];
+static float stereoLayer = 0.0;
+static uint textureBase = 0;
+#define UC_SAMPLE(i, uv) tableImages[NonUniformResourceIndex(textureBase + (i))].Sample(float3(uv, stereoLayer))
+#define UC_DIMENSIONS(i) { uint layers; tableImages[NonUniformResourceIndex(textureBase + (i))].GetDimensions(w, h, layers); }
+#elif defined(STEREO)
 // The headset (STEREO): every image is an array; EFB copies hold one layer per eye, other textures one layer, which Vulkan's layer clamp
 // picks for either eye. stereoLayer is the fragment's view (set by fragmentMain).
 [[vk::binding(0,0)]] Texture2DArray<float4> images[8] : register(t0);
@@ -45,7 +54,9 @@ static float stereoLayer = 0.0;
 #define UC_SAMPLE(i, uv) images[i].Sample(imageSamplers[i], uv)
 #define UC_DIMENSIONS(i) images[i].GetDimensions(w, h)
 #endif
+#ifndef TEX_TABLE
 [[vk::binding(1,0)]] SamplerState imageSamplers[8] : register(s0);
+#endif
 TEV_CONST(0, stageCount);
 TEV_CONST(1, swapTables);
 TEV_CONST(2, colorEnv0);
@@ -129,6 +140,9 @@ void loadTevKey() {
 #endif
 
 float4 sampleImage(uint id, float2 uv) {
+#ifdef TEX_TABLE
+    return UC_SAMPLE(id, uv);   // an index, not eight samples: a stage's map is a constant in a folded module, an indirect map a uniform
+#else
     switch (id) {
     case 0: return UC_SAMPLE(0, uv);
     case 1: return UC_SAMPLE(1, uv);
@@ -140,6 +154,7 @@ float4 sampleImage(uint id, float2 uv) {
     case 7: return UC_SAMPLE(7, uv);
     }
     return float4(1.0);
+#endif
 }
 float4 swapColor(float4 value, uint table) {
     uint bits = (swapTables >> (table * 8)) & 255;
@@ -265,6 +280,9 @@ float combineAlpha(float a, float b, float c, float d, float3 colorA, float3 col
 }
 float2 imageSize(uint id) {
     uint w = 1, h = 1;
+#ifdef TEX_TABLE
+    UC_DIMENSIONS(id);
+#else
     switch (id) {
     case 0: UC_DIMENSIONS(0); break;
     case 1: UC_DIMENSIONS(1); break;
@@ -275,6 +293,7 @@ float2 imageSize(uint id) {
     case 6: UC_DIMENSIONS(6); break;
     case 7: UC_DIMENSIONS(7); break;
     }
+#endif
     return float2(w, h);
 }
 uint indirectWord(uint index) { return drawState.indirect[index / 4][index % 4]; }

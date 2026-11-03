@@ -359,6 +359,45 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         if (!features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; features12_chained = true; }
     }
     if (layers_ > 1) std::fprintf(stderr, "[vr] vertex pre-pass %s\n", xform_ ? "on" : supported12.bufferDeviceAddress ? "off (UC_NO_XFORM)" : "unavailable (no bufferDeviceAddress)");
+    if (layers_ > 1) {   // the texture table (UC_TEX_MERGE=1): descriptor indexing. Features and limits are logged on every headset start.
+        VkPhysicalDeviceVulkan12Properties properties12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; properties.pNext = &properties12;
+        vkGetPhysicalDeviceProperties2(physical_, &properties);
+        const auto& l = properties.properties.limits; const auto& p = properties12;
+        std::fprintf(stderr, "[vulkan] descriptor indexing: runtime arrays %d, partially bound %d, variable count %d, non-uniform sampled images %d (native %d), "
+                     "sampled images update after bind %d; per stage: samplers %u, sampled images %u, resources %u; per set: samplers %u, sampled images %u; "
+                     "update after bind: per stage samplers %u, sampled images %u, resources %u, per set samplers %u, sampled images %u, all pools %u\n",
+                     int(supported12.runtimeDescriptorArray), int(supported12.descriptorBindingPartiallyBound), int(supported12.descriptorBindingVariableDescriptorCount),
+                     int(supported12.shaderSampledImageArrayNonUniformIndexing), int(p.shaderSampledImageArrayNonUniformIndexingNative), int(supported12.descriptorBindingSampledImageUpdateAfterBind),
+                     l.maxPerStageDescriptorSamplers, l.maxPerStageDescriptorSampledImages, l.maxPerStageResources, l.maxDescriptorSetSamplers, l.maxDescriptorSetSampledImages,
+                     p.maxPerStageDescriptorUpdateAfterBindSamplers, p.maxPerStageDescriptorUpdateAfterBindSampledImages, p.maxPerStageUpdateAfterBindResources,
+                     p.maxDescriptorSetUpdateAfterBindSamplers, p.maxDescriptorSetUpdateAfterBindSampledImages, p.maxUpdateAfterBindDescriptorsInAllPools);
+        // A combined image sampler counts as a sampler and a sampled image; set 0 already holds eight of each, the fragment stage a few more
+        // resources (uniform block, attachments). At most 8192 entries (a packet of ~1000 draws with eight maps each).
+        static constexpr int64_t kTableMax = 8192;
+        const auto room = [](std::initializer_list<int64_t> limits) { return uint32_t(std::clamp<int64_t>(std::min(limits), 0, kTableMax)); };
+        const uint32_t plain = room({int64_t(l.maxPerStageDescriptorSamplers) - 8, int64_t(l.maxPerStageDescriptorSampledImages) - 8, int64_t(l.maxDescriptorSetSamplers) - 8,
+                                     int64_t(l.maxDescriptorSetSampledImages) - 8, int64_t(l.maxPerStageResources) - 32});
+        const uint32_t after_bind = supported12.descriptorBindingSampledImageUpdateAfterBind ?
+            room({int64_t(p.maxPerStageDescriptorUpdateAfterBindSamplers) - 8, int64_t(p.maxPerStageDescriptorUpdateAfterBindSampledImages) - 8, int64_t(p.maxDescriptorSetUpdateAfterBindSamplers) - 8,
+                  int64_t(p.maxDescriptorSetUpdateAfterBindSampledImages) - 8, int64_t(p.maxPerStageUpdateAfterBindResources) - 32, int64_t(p.maxUpdateAfterBindDescriptorsInAllPools) / int64_t(kFrameSlots) - 8}) : 0;
+        // The update-after-bind limits only when the plain ones are small (or UC_TEX_MERGE_UAB=1): the table is written before the packet is
+        // recorded, so the flag buys nothing else.
+        table_update_after_bind_ = after_bind > plain && (plain < 4096 || std::getenv("UC_TEX_MERGE_UAB"));
+        table_limit_ = table_update_after_bind_ ? after_bind : plain;
+        const bool indexing = supported12.runtimeDescriptorArray && supported12.descriptorBindingPartiallyBound && supported12.descriptorBindingVariableDescriptorCount &&
+                              supported12.shaderSampledImageArrayNonUniformIndexing;
+        const bool wanted = std::getenv("UC_TEX_MERGE") && std::strcmp(std::getenv("UC_TEX_MERGE"), "0") != 0;
+        tex_merge_ = wanted && xform_ && indexing && table_limit_ >= 256;
+        std::fprintf(stderr, "[vr] texture table %s (%u entries a packet%s)\n", tex_merge_ ? "on" : !wanted ? "off (UC_TEX_MERGE=1 turns it on)" : !xform_ ? "unavailable (no vertex pre-pass)" :
+                     !indexing ? "unavailable (descriptor indexing features missing)" : "unavailable (descriptor limits too small)", table_limit_, table_update_after_bind_ ? ", update after bind" : "");
+        if (tex_merge_) {
+            features12.runtimeDescriptorArray = features12.descriptorBindingPartiallyBound = features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+            features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+            features12.descriptorBindingSampledImageUpdateAfterBind = table_update_after_bind_;
+            if (!features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; features12_chained = true; }
+        }
+    }
     if(chosen_maintenance)device_extensions.push_back(chosen_maintenance);
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR shading_rate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR}; bool shading_rate_wanted = false;
     {   // FidelityFX resolves these entry points by their extension names, including after a live switch.
@@ -548,6 +587,13 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         create.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,xform_compute_module_,"xformMain",nullptr};
         create.layout=xform_layout_;
         vk_check(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&create,nullptr,&xform_pipeline_),"pre-pass pipeline");
+    }
+    if (tex_merge_ && probe_fragment_) { tex_merge_=false; std::fprintf(stderr,"[vr] texture table off: UC_PROBE_FS\n"); }
+    if (tex_merge_) {   // the texture table's modules (TEX_TABLE): the pre-pass's draw vertex stage with the table entry, the fragment stage reading the table
+        try {
+            table_vertex_module_=shader(device, shaders_ / "smoke.stereo.xform.tex.vert.spv");
+            table_fragment_module_=shader(device, shaders_ / "smoke.stereo.tex.frag.spv"); table_early_module_=shader(device, shaders_ / "smoke.stereo.tex.early.frag.spv");
+        } catch (const std::exception& error) { tex_merge_=false; std::fprintf(stderr,"[vr] texture table off: %s\n",error.what()); }
     }
     load_pipeline_cache();
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
@@ -780,6 +826,8 @@ void VulkanRenderer::destroy_texture(Texture& texture) {
 void VulkanRenderer::retire_textures(Slot& slot) {
     if (slot.texture_pool) vkDestroyDescriptorPool(device,slot.texture_pool,nullptr);
     slot.texture_pool=VK_NULL_HANDLE; slot.descriptor_capacity=0; slot.texture_sets.clear();
+    if (slot.table_pool) vkDestroyDescriptorPool(device,slot.table_pool,nullptr);
+    slot.table_pool=VK_NULL_HANDLE; slot.table_set=VK_NULL_HANDLE; slot.table_capacity=0;
     if (slot.xform_pool) vkDestroyDescriptorPool(device,slot.xform_pool,nullptr);
     slot.xform_pool=VK_NULL_HANDLE; slot.xform_set=VK_NULL_HANDLE;
     slot.textures.clear();   // the last slot to drop a texture destroys it
@@ -884,6 +932,17 @@ VulkanRenderer::PipelineChoice VulkanRenderer::pipeline_for(const PipelineKey& r
     if (!uber) queue_pipeline(fixed,true);
     if (fresh || ms>=2) std::fprintf(stderr,"[pipeline] %s %s compiled on the render thread: %.1f ms\n",fresh ? "new" : "not yet ready",uber ? "ubershader" : "key",ms);
     return {pipeline,uber};
+}
+// The texture-table variant of a draw's pipeline (key bit kTexTableKeyBit) when it is compiled; otherwise it is queued for the compile threads
+// and the draw keeps its own pipeline and set meanwhile (no ubershader for the table: the draw is just not merged across textures).
+VkPipeline VulkanRenderer::table_pipeline(const PipelineKey& requested) {
+    if (last_table_pipeline_ && requested==last_table_key_) return last_table_pipeline_;
+    auto key=static_depth_ ? requested : static_key(requested);
+    key[0]|=kTexTableKeyBit;
+    std::lock_guard lock(pipelines_mutex_);
+    if (const auto found=pipelines_.find(key); found!=pipelines_.end()) { last_table_key_=requested; last_table_pipeline_=found->second; return found->second; }
+    queue_pipeline(key,false);
+    return VK_NULL_HANDLE;
 }
 uint32_t VulkanRenderer::effective_anisotropy() const { return clamp_anisotropy(effects_.anisotropy,anisotropy_supported_,anisotropy_limit_); }
 // One sampler per GX sampler mode (wrap s/t, mipmap mode, mag/min filter); anisotropic filtering applies to the ones that filter linearly across mips.
@@ -1013,15 +1072,16 @@ VkPipeline VulkanRenderer::make_shadow_pipeline() {
     vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&create,nullptr,&pipeline),"shadow pipeline");
     return pipeline;
 }
-// The build-time specialized TEV fragment module for these constants and variant (1: early-Z), or null; loaded once, kept until shutdown.
+// The build-time specialized TEV fragment module for these constants and variant (1: early-Z; 2, 3: the same with the texture table), or null;
+// loaded once, kept until shutdown.
 // Names: FNV-1a 64 of the 68 constants (little-endian words) and the variant byte, as tools/fold_tev_shaders.py writes them.
-VkShaderModule VulkanRenderer::folded_module(const std::array<uint32_t,68>& values,bool early) {
+VkShaderModule VulkanRenderer::folded_module(const std::array<uint32_t,68>& values,bool early,bool table) {
     static const bool off=std::getenv("UC_NO_FOLDED_SHADERS")!=nullptr;   // diagnostics: the driver specializes every pipeline
     if (off) return VK_NULL_HANDLE;
     uint64_t hash=0xCBF29CE484222325ull;
     const auto mix=[&](uint8_t byte) { hash^=byte; hash*=0x100000001B3ull; };
     for (const uint32_t value:values) for (int shift=0;shift<32;shift+=8) mix(uint8_t(value>>shift));
-    mix(early ? 1 : 0);
+    mix(uint8_t((early ? 1 : 0)|(table ? 2 : 0)));   // 2, 3: the texture-table modules (TEX_TABLE)
     std::lock_guard guard(folded_mutex_);
     if (const auto found=folded_modules_.find(hash); found!=folded_modules_.end()) return found->second;
     char file[32]; std::snprintf(file,sizeof file,"%016llx.spv",(unsigned long long)hash);
@@ -1058,11 +1118,25 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout_info.pushConstantRangeCount=1; layout_info.pPushConstantRanges=&projection;
         layout_info.setLayoutCount=1; layout_info.pSetLayouts=&texture_layout_;
         vk_check(vkCreatePipelineLayout(device, &layout_info, nullptr, &layout_), "pipeline layout");
+        if (tex_merge_) {   // the texture table: set 0 as above (its maps unused), set 1 one array of combined image samplers, as many as the packet has
+            const VkDescriptorSetLayoutBinding table{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,table_limit_,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+            const VkDescriptorBindingFlags flags=VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT|VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT|(table_update_after_bind_ ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0u);
+            VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO}; binding_flags.bindingCount=1; binding_flags.pBindingFlags=&flags;
+            VkDescriptorSetLayoutCreateInfo table_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; table_info.pNext=&binding_flags; table_info.bindingCount=1; table_info.pBindings=&table;
+            if (table_update_after_bind_) table_info.flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+            vk_check(vkCreateDescriptorSetLayout(device,&table_info,nullptr,&table_set_layout_),"texture table layout");
+            const VkDescriptorSetLayout sets[2]={texture_layout_,table_set_layout_};
+            layout_info.setLayoutCount=2; layout_info.pSetLayouts=sets;
+            vk_check(vkCreatePipelineLayout(device,&layout_info,nullptr,&table_layout_),"texture table pipeline layout");
         }
+        }
+        const bool table=(key[0]&kTexTableKeyBit)!=0;   // the texture-table variant (tex_merge_): its own modules and layout
+        if (table && (uber || !tex_merge_)) throw std::invalid_argument("texture-table pipeline without the table");
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex; stages[0].pName = "vertexMain";
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fragment; stages[1].pName = "fragmentMain";
+        const bool early_variant=!uber && fragment==early_module_;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = table ? (early_variant ? table_early_module_ : table_fragment_module_) : fragment; stages[1].pName = "fragmentMain";
         // Constants 0..66: the TEV words (key words 1..67); 67: whether the draws can fail the alpha test (key word 0 bit 16). The ubershader
         // reads the TEV words from the draw, so it gets only constant 67.
         std::array<uint32_t,68> spec_values{};
@@ -1077,11 +1151,11 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         // The headset: a module specialized at build time for exactly these constants (tools/fold_tev_shaders.py), when there is one. The
         // driver's own specialization left most of the 600 KB module in (a one-stage quad ran 160-200 instructions a fragment).
         if (!uber && layers_>1 && !probe_fragment_) {
-            VkShaderModule folded=folded_module(spec_values,fragment==early_module_);
+            VkShaderModule folded=folded_module(spec_values,early_variant,table);
             if (!folded) {   // a key not listed for the build (pipeline_keys.quest): the module of the same key with every stage's indirect path in
                 auto all_indirect=spec_values;
                 for (uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) all_indirect[4+4*stage]&=~kTevDirectStage;
-                if (all_indirect!=spec_values) folded=folded_module(all_indirect,fragment==early_module_);
+                if (all_indirect!=spec_values) folded=folded_module(all_indirect,early_variant,table);
             }
             if (folded) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
         }
@@ -1089,7 +1163,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkVertexInputBindingDescription binding; std::array<VkVertexInputAttributeDescription,14> attributes;
         mesh_vertex_input(binding,attributes);
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; input.vertexBindingDescriptionCount = 1; input.pVertexBindingDescriptions = &binding; input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
-        if (xform_) { input.vertexBindingDescriptionCount = 0; input.vertexAttributeDescriptionCount = 0; stages[0].module = xform_vertex_module_; }   // the pre-pass's draws read their vertices from its outputs
+        if (xform_) { input.vertexBindingDescriptionCount = 0; input.vertexAttributeDescriptionCount = 0; stages[0].module = table ? table_vertex_module_ : xform_vertex_module_; }   // the pre-pass's draws read their vertices from its outputs
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VkPrimitiveTopology(key[69]);
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = cull_mode(key); raster.frontFace = VK_FRONT_FACE_CLOCKWISE; raster.lineWidth = 1; raster.depthClampEnable = depth_clamp_;
@@ -1138,7 +1212,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         depth.depthCompareOp=VkCompareOp((key[68]>>1)&7);
         VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; create.pNext = &rendering; create.stageCount = 2; create.pStages = stages; create.pVertexInputState = &input;
         create.pInputAssemblyState = &assembly; create.pViewportState = &viewport; create.pRasterizationState = &raster; create.pMultisampleState = &samples;
-        create.pColorBlendState = &blending; create.pDynamicState = &dynamic; create.layout = layout_;
+        create.pColorBlendState = &blending; create.pDynamicState = &dynamic; create.layout = table ? table_layout_ : layout_;
         create.pDepthStencilState=&depth;
         if (fovea_supported_) create.flags|=VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;   // EFB passes may bind the foveation map
         vk_check(vkCreateGraphicsPipelines(device, pipeline_cache_, 1, &create, nullptr, &pipeline), "graphics pipeline");
@@ -2855,6 +2929,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     // The headset: one descriptor set per distinct texture/sampler combination (the uniform block and the eye block are dynamic offsets)
     std::map<std::array<uint64_t,16>,uint32_t> set_of;
     std::vector<uint32_t> draw_set(layers_>1 ? packet.draws.size() : 0,0), draw_uniform_offset(layers_>1 ? packet.draws.size() : 0,0);
+    // The texture table (tex_merge_): each distinct set's maps 0..highest used, in set order, as combined image samplers; set_base: a set's first
+    // entry. table_ok: the packet's table fits (else every draw keeps its own set, as without the table).
+    std::vector<VkDescriptorImageInfo> table_entries; std::vector<uint32_t> set_base; bool table_ok=false;
     if (xform_ && !packet.draws.empty()) {
         xform_draws.resize(packet.draws.size());
         uint32_t positions=0, attributes=0, indices=0;
@@ -2862,7 +2939,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (!gpu_draws[i].index_count) continue;
             const auto& draw=packet.draws[i];
             const uint32_t n=uint32_t(draw.vertex_view().size());
-            const uint32_t mask=coord_mask(i), stride=2+3*uint32_t(std::popcount(mask));
+            const uint32_t mask=coord_mask(i), stride=2+3*uint32_t(std::popcount(mask))+(tex_merge_ ? 1u : 0u);   // the texture table: one more word, the draw's first entry
             xform_draws[i]={positions,attributes,stride|(mask<<8),n,indices};
             positions+=n; attributes+=n*stride; indices+=gpu_draws[i].index_count;
         }
@@ -2992,6 +3069,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 const auto [found,added]=set_of.try_emplace(textures,uint32_t(set_of.size()));
                 draw_set[i]=found->second;
                 if (!added) continue;   // that set is written
+                if (tex_merge_) {   // the new set's maps in the table: 0 .. the highest one its draws read (the shaders read no other)
+                    set_base.push_back(uint32_t(table_entries.size()));
+                    for (uint32_t map=0;map<uint32_t(std::bit_width(maps));++map) table_entries.push_back({samplers[map].sampler,image[map].imageView,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+                }
                 uniform={slot.uniforms.buffer,0,kDrawUniformBytes};
                 motion={slot.motions.buffer,0,kStereoBlockBytes};
             }
@@ -3008,6 +3089,29 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             writes[5].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
             writes[6].descriptorType=writes[7].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[6].pBufferInfo=&xform_positions; writes[7].pBufferInfo=&xform_attributes;
             vkUpdateDescriptorSets(device,binding_count,writes,0,nullptr);
+        }
+        if (tex_merge_ && !table_entries.empty()) {   // the packet's table: one set per slot, its pool grown to the largest packet so far
+            table_ok=table_entries.size()<=table_limit_;
+            if (!table_ok) ++table_overflows_;
+            if (table_ok && table_entries.size()>slot.table_capacity) {
+                if (slot.table_pool) vkDestroyDescriptorPool(device,slot.table_pool,nullptr);
+                slot.table_pool=VK_NULL_HANDLE; slot.table_set=VK_NULL_HANDLE; slot.table_capacity=0;
+                const uint32_t capacity=std::min<uint32_t>(table_limit_,std::max<uint32_t>(256,uint32_t(table_entries.size()+table_entries.size()/2)));
+                const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,capacity};
+                VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&size;
+                if (table_update_after_bind_) pool.flags=VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+                vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.table_pool),"texture table pool");
+                VkDescriptorSetVariableDescriptorCountAllocateInfo variable{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO}; variable.descriptorSetCount=1; variable.pDescriptorCounts=&capacity;
+                VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.pNext=&variable; allocate.descriptorPool=slot.table_pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&table_set_layout_;
+                vk_check(vkAllocateDescriptorSets(device,&allocate,&slot.table_set),"texture table set");
+                slot.table_capacity=capacity;
+            }
+            if (table_ok) {
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; write.dstSet=slot.table_set; write.dstBinding=0; write.descriptorCount=uint32_t(table_entries.size());
+                write.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; write.pImageInfo=table_entries.data();
+                vkUpdateDescriptorSets(device,1,&write,0,nullptr);
+                ++table_packets_; table_entries_+=table_entries.size();
+            }
         }
     }
     uint32_t image_index = 0;
@@ -3245,8 +3349,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     // A render target of the frame: efb_ (output resolution) or the internal scene targets. Between passes color is TRANSFER_SRC, depth
     // DEPTH_ATTACHMENT and motion COLOR_ATTACHMENT; *initialized false means never written (cleared on first use).
     if (!xform_draws.empty()) {   // the vertex pre-pass: every vertex of the packet's draws shaded once, before the passes that draw them
-        struct XformJob { uint64_t vertices; uint32_t count, draw; gx::Projection rows; uint32_t palette, current, indexed, bank, positions, attributes, mask, stride; };   // smoke.slang XformJob
-        static_assert(sizeof(XformJob)==112 && offsetof(XformJob,rows)==16 && offsetof(XformJob,palette)==80);
+        // table: the draw's first texture-table entry, written as the last attribute word of every vertex (~0u: none)
+        struct XformJob { uint64_t vertices; uint32_t count, draw; gx::Projection rows; uint32_t palette, current, indexed, bank, positions, attributes, mask, stride, table, pad[3]; };   // smoke.slang XformJob
+        static_assert(sizeof(XformJob)==128 && offsetof(XformJob,rows)==16 && offsetof(XformJob,palette)==80 && offsetof(XformJob,table)==112);
         std::vector<XformJob> jobs; std::vector<std::array<uint32_t,2>> chunks;
         const auto address=[&](const Buffer& buffer) { VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; info.buffer=buffer.buffer; return uint64_t(vkGetBufferDeviceAddress(device,&info)); };
         uint64_t inline_base=0;
@@ -3257,7 +3362,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (info.vertices) vertices=address(*info.vertices)+info.vertex_offset;
             else { if (!inline_base) inline_base=address(slot.vertices); vertices=inline_base+uint64_t(info.first_vertex)*sizeof(gx::GpuMeshVertex); }
             for (uint32_t first=0;first<x.count;first+=64) chunks.push_back({uint32_t(jobs.size()),first});
-            jobs.push_back({vertices,x.count,draw_uniform[d],packet.draws[d].transforms->projection,info.palette,info.current,info.indexed,info.bank,x.positions,x.attributes,x.word>>8,x.word&255});
+            jobs.push_back({vertices,x.count,draw_uniform[d],packet.draws[d].transforms->projection,info.palette,info.current,info.indexed,info.bank,x.positions,x.attributes,x.word>>8,x.word&255,
+                            tex_merge_ ? (table_ok ? set_base[draw_set[d]] : 0u) : ~0u,{}});
         }
         if (!jobs.empty()) {
             const auto fill=[&](Buffer& buffer,const void* data,VkDeviceSize bytes) {
@@ -3685,21 +3791,24 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         bool probe_bound=false;
         // The headset's descriptor binding: the draw's shared set with its uniform block and eye block as dynamic offsets; nothing is
         // recorded when the set and both offsets are the ones bound. An eye block equal to the bound one keeps the bound offset.
-        VkDescriptorSet bound_set=VK_NULL_HANDLE; uint32_t bound_offsets[2]{~0u,~0u};
-        const auto bind_draw_set=[&](size_t d,bool compare_eye) {
+        // A texture-table run (table) binds set 0 of the packet's first texture combination (its maps are not read, its other bindings are the
+        // same in every set) and the table as set 1, through the table's layout (compatible with layout_ for set 0).
+        VkDescriptorSet bound_set=VK_NULL_HANDLE; uint32_t bound_offsets[2]{~0u,~0u}; bool bound_table=false;
+        const auto bind_draw_set=[&](size_t d,bool compare_eye,bool table=false) {
             uint32_t offsets[2]={draw_uniform_offset[d],uint32_t(d*stereo_stride_)};
             if (compare_eye && bound_offsets[1]!=~0u && std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+offsets[1],static_cast<std::byte*>(slot.motions.mapped)+bound_offsets[1],kStereoBlockBytes)==0)
                 offsets[1]=bound_offsets[1];
-            const VkDescriptorSet set=slot.texture_sets[draw_set[d]];
-            if (set==bound_set && offsets[0]==bound_offsets[0] && offsets[1]==bound_offsets[1] && !no_dedup) return;
-            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&set,2,offsets);
+            const VkDescriptorSet set=slot.texture_sets[table ? 0 : draw_set[d]];
+            if (set==bound_set && offsets[0]==bound_offsets[0] && offsets[1]==bound_offsets[1] && (!table || bound_table) && !no_dedup) return;
+            if (table) { const VkDescriptorSet sets[2]={set,slot.table_set}; vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,table_layout_,0,2,sets,2,offsets); }
+            else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&set,2,offsets);
             ++set_binds_;
-            bound_set=set; bound_offsets[0]=offsets[0]; bound_offsets[1]=offsets[1];
+            bound_set=set; bound_offsets[0]=offsets[0]; bound_offsets[1]=offsets[1]; bound_table=table;
         };
         // The pre-pass (xform_): consecutive draws that differ only in their vertices (same pipeline, textures, samplers, uniform block, eye
         // block, push constants, viewport, scissor; consecutive in the rebased index buffer) are one draw. UC_NO_MERGE=1: a draw each.
         static const bool no_merge=std::getenv("UC_NO_MERGE")!=nullptr;
-        struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; bool fovea; };   // rate: the fragment shading rate, fovea: whether the foveation map applies (a run joins only draws of one rate and kind)
+        struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; bool fovea; bool table=false; };   // rate: the fragment shading rate, fovea: whether the foveation map applies (a run joins only draws of one rate and kind); table: textures from the packet's texture table
         bool bound_fovea=false;
         // The rate of a draw: its own (pipeline rate), and with the foveation map the coarser of both (MAX), or the map's where the draw's own
         // is 1x1 (REPLACE) on a device without the non-trivial combiners.
@@ -3717,8 +3826,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (bound_indices!=&slot.xform_indices) { vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32); bound_indices=&slot.xform_indices; bound_index_offset=0; }
             bind_pipeline(run.pipeline);
             set_draw_state(info.key);
-            if (layers_>1) bind_draw_set(run.set,true);
+            if (layers_>1) bind_draw_set(run.set,true,run.table);
             else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
+            table_runs_+=run.table;
             DrawPush push=run.push;
             apply_rate(run.rate,run.fovea);
             {   // UC_GPU_PACKETS: how many issued runs shade coarsely, flat (bloom chain, glows) and world (sprites), and how many take the foveation map
@@ -3913,6 +4023,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 if (cull_stats && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
                     std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds, %llu pipeline binds, %llu second destination-alpha draws\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_,(unsigned long long)pipeline_binds_,(unsigned long long)alpha_passes_);
+                    if (tex_merge_)   // the texture table over the same 2 s: packets with a table (and too large for it), its entries, the runs drawn from it, the draws it joined, draws whose table pipeline was still compiling
+                        std::fprintf(stderr,"[tex-merge] packets %llu, overflows %llu, entries %llu, runs %llu, joins %llu, waiting %llu\n",(unsigned long long)table_packets_,(unsigned long long)table_overflows_,
+                                     (unsigned long long)table_entries_,(unsigned long long)table_runs_,(unsigned long long)table_joins_,(unsigned long long)table_pending_);
+                    table_packets_=table_overflows_=table_entries_=table_runs_=table_joins_=table_pending_=0;
                     cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=alpha_passes_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
             }
@@ -3926,8 +4040,17 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 const auto& x=xform_draws[d];
                 Run run{d,particle_pass ? particle_pipeline(info.key) : info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
                         set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
+                // The texture table: the draw's pipeline variant that reads its textures from the packet's table, once compiled (meanwhile the
+                // draw keeps its own). Not for the particle layer's pipelines, nor a draw whose second destination-alpha draw reads its own set.
+                if (table_ok && !particle_pass) {
+                    const auto depth=draw.uniforms->pixel[1]&31;
+                    const bool second_alpha=(draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0) && (fuse_off() || !fused_destination_alpha(draw));
+                    if (!second_alpha) { if (const VkPipeline table=table_pipeline(info.key)) { run.pipeline=table; run.table=true; } else ++table_pending_; }
+                }
                 const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
-                const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && set_keys[pending->set]==set_keys[run.set] &&
+                // the sets: equal (textures, samplers, uniform block), or for two table runs the uniform block alone (the textures are in the table)
+                const bool same_set=pending && (run.table ? pending->table && set_keys[pending->set][16]==set_keys[run.set][16] : !pending->table && set_keys[pending->set]==set_keys[run.set]);
+                const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && same_set &&
                     std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0 &&
                     same_push(pending->push,run.push) && std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)==0 &&
                     pending->first+pending->count==run.first && pending->rate.width==run.rate.width && pending->rate.height==run.rate.height && pending->fovea==run.fovea && pending->positions_end==x.positions && pending->attributes_end==x.attributes;
@@ -3951,7 +4074,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                         std::memset(reasons,0,sizeof reasons); since=std::chrono::steady_clock::now();
                     }
                 }
-                if (joins) { pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_; }
+                if (joins) {
+                    pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_;
+                    if (run.table && !std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin())) ++table_joins_;   // joined only through the table
+                }
                 else { if (pending) issue_run(*pending); pending=run; }
                 continue;
             }
@@ -4609,12 +4735,17 @@ void VulkanRenderer::shutdown() {
         stop_workers();
         for (auto [key,pipeline]:pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
         for (auto [key,pipeline]:uber_pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
-        pipelines_.clear(); uber_pipelines_.clear(); last_pipeline_=VK_NULL_HANDLE;
+        pipelines_.clear(); uber_pipelines_.clear(); last_pipeline_=VK_NULL_HANDLE; last_table_pipeline_=VK_NULL_HANDLE;
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
         for (auto module:{vertex_module_,nobank_vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_,xform_vertex_module_,xform_compute_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
         xform_vertex_module_=xform_compute_module_=VK_NULL_HANDLE;
+        for (auto module:{table_vertex_module_,table_fragment_module_,table_early_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        table_vertex_module_=table_fragment_module_=table_early_module_=VK_NULL_HANDLE;
+        if (table_layout_) vkDestroyPipelineLayout(device,table_layout_,nullptr);
+        if (table_set_layout_) vkDestroyDescriptorSetLayout(device,table_set_layout_,nullptr);
+        table_layout_=VK_NULL_HANDLE; table_set_layout_=VK_NULL_HANDLE;
         if (xform_pipeline_) vkDestroyPipeline(device,xform_pipeline_,nullptr);
         if (xform_layout_) vkDestroyPipelineLayout(device,xform_layout_,nullptr);
         if (xform_set_layout_) vkDestroyDescriptorSetLayout(device,xform_set_layout_,nullptr);

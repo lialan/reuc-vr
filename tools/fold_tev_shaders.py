@@ -8,7 +8,9 @@ files); the renderer uses a folded module when one matches a pipeline's constant
   python -I tools/fold_tev_shaders.py --spirv-opt PATH --shaders DIR --out DIR KEYFILE...
 
 Writes OUT/<fnv1a64 of the 68 constants and the variant>.spv; the variant is the module: smoke.stereo.early.frag.spv for keys whose alpha
-test cannot fail (key word 0 bit 16 clear), smoke.stereo.frag.spv otherwise (renderer/vulkan_renderer.cpp make_pipeline, folded_module).
+test cannot fail (key word 0 bit 16 clear), smoke.stereo.frag.spv otherwise (renderer/vulkan_renderer.cpp make_pipeline, folded_module);
+variants 2 and 3 are the same two with the texture table (smoke.stereo.tex.frag.spv, smoke.stereo.tex.early.frag.spv, UC_TEX_MERGE), folded
+for every key when those modules are in --shaders.
 """
 import argparse
 import concurrent.futures
@@ -92,7 +94,9 @@ def main():
     parser.add_argument("keys", nargs="+")
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    modules = {0: os.path.join(args.shaders, "smoke.stereo.frag.spv"), 1: os.path.join(args.shaders, "smoke.stereo.early.frag.spv")}
+    modules = {0: os.path.join(args.shaders, "smoke.stereo.frag.spv"), 1: os.path.join(args.shaders, "smoke.stereo.early.frag.spv"),
+               2: os.path.join(args.shaders, "smoke.stereo.tex.frag.spv"), 3: os.path.join(args.shaders, "smoke.stereo.tex.early.frag.spv")}
+    table = os.path.exists(modules[2]) and os.path.exists(modules[3])   # the texture-table modules (variant + 2)
     wanted = {}
     for path in args.keys:
         if os.path.exists(path):
@@ -102,7 +106,8 @@ def main():
                 # read one, in a scene no recording covered): never slower than before the marks
                 for form in (headset_key(key), stripped_key(key)):
                     values, var = constants(form), variant(form)
-                    wanted[name(values, var)] = (values, var)
+                    for v in (var, var + 2) if table else (var,):
+                        wanted[name(values, v)] = (values, v)
     jobs = []
     for file, (values, var) in sorted(wanted.items()):
         target = os.path.join(args.out, file)

@@ -66,6 +66,9 @@ struct Output {
     [[vk::location(0)]] float4 color : COLOR0;
     [[vk::location(1)]] float3 texcoords[8] : TEXCOORD0;
     [[vk::location(9)]] float4 color1 : COLOR1;
+#ifdef TEX_TABLE
+    [[vk::location(10)]] nointerpolation uint textureBase : TEXCOORD14;   // the draw's first entry in the packet's texture table (tev.slang)
+#endif
 #ifdef MOTION
     [[vk::location(10)]] float4 currentClip : TEXCOORD8;    // unjittered
     [[vk::location(11)]] float4 previousClip : TEXCOORD9;
@@ -151,7 +154,8 @@ float3 generateTexcoord(uint id, Input input) {
 // them back and applies the eye transform: every pipeline reads the same bits, so layered surfaces keep identical depths.
 // The vertices are read word by word through a uint pointer (gx::GpuMeshVertex, 27 words): the Quest's compiler crashed on a struct
 // load through a physical-storage pointer.
-struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; };
+// table: the draw's first texture-table entry (UC_TEX_MERGE), written as each vertex's last attribute word; 0xFFFFFFFF: none (no such word).
+struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint pad0; uint pad1; uint pad2; };
 float4 unpackColor(uint c) { return float4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24) / 255.0; }
 uint packColor(float4 c) { const uint4 b = uint4(round(saturate(c) * 255.0)); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
 #ifdef XFORM
@@ -195,6 +199,7 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         const float3 t = generateTexcoord(id, input);
         xformAttributes[at] = asuint(t.x); xformAttributes[at + 1] = asuint(t.y); xformAttributes[at + 2] = asuint(t.z); at += 3;
     }
+    if (job.table != 0xFFFFFFFFu) xformAttributes[at] = job.table;
 }
 #endif
 #ifdef XFORM_DRAW
@@ -216,6 +221,9 @@ Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   //
         output.texcoords[id] = float3(0.0, 0.0, 1.0);
         if ((mask & (1u << id)) != 0) { output.texcoords[id] = asfloat(uint3(xformAttributes[at], xformAttributes[at + 1], xformAttributes[at + 2])); at += 3; }
     }
+#ifdef TEX_TABLE
+    output.textureBase = xformAttributes[at];   // the draw's first texture-table entry (the pre-pass's last word)
+#endif
     return output;
 }
 #else
@@ -366,6 +374,9 @@ float2 pixelOf(float4 clip) { return projection.viewport.xy + (clip.xy / clip.w 
 #ifdef STEREO
 Targets fragmentMain(Output input, uint view : SV_ViewID) {
     stereoLayer = float(view);
+#ifdef TEX_TABLE
+    textureBase = input.textureBase;
+#endif
 #else
 Targets fragmentMain(Output input) {
 #endif

@@ -40,6 +40,9 @@ inline PipelineKey headset_direct_key(PipelineKey key) {
 constexpr uint32_t kHudLayerKeyBit=1u<<18;
 // key[0] bit 19: the headset's particle layer variant (VulkanRenderer, UC_PARTICLE_LAYER): the EFB's formats, alpha written as T (ZERO, D).
 constexpr uint32_t kParticleLayerKeyBit=1u<<19;
+// key[0] bit 20: the headset's texture-table variant (VulkanRenderer, UC_TEX_MERGE): the draw's textures from the packet's table (TEX_TABLE
+// modules, set 1). Never recorded in a key file (valid_pipeline_key rejects it): it is derived from the recorded key at draw time.
+constexpr uint32_t kTexTableKeyBit=1u<<20;
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
     return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>20)==0 && ((key[0]&3)!=2 || logic_ops);

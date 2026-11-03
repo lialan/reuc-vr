@@ -228,6 +228,7 @@ private:
         std::vector<VkDescriptorSet> texture_sets;
         VkDescriptorPool texture_pool=VK_NULL_HANDLE;
         uint32_t descriptor_capacity=0;
+        VkDescriptorPool table_pool=VK_NULL_HANDLE; VkDescriptorSet table_set=VK_NULL_HANDLE; uint32_t table_capacity=0;   // the texture table (tex_merge_): set 1, one per packet
         uint64_t serial = 0;
         bool submitted = false, reported = false, initialized = false, copied = false, timed = false;
         std::string timing_kind;   // UC_GPU_PACKETS: what this packet was (copy size, present, draws), for the per-kind GPU time
@@ -269,7 +270,8 @@ private:
     bool fused_destination_alpha(const gx::DrawPacket& draw) const;   // the headset: colour and destination alpha in one draw
     PipelineChoice pipeline_for(const PipelineKey& key);
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
-    VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early);   // tools/fold_tev_shaders.py's module for these constants, or null
+    VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early,bool table=false);   // tools/fold_tev_shaders.py's module for these constants, or null
+    VkPipeline table_pipeline(const PipelineKey& key);   // the texture-table variant of a draw's pipeline when compiled (else queued, null)
     std::mutex folded_mutex_; std::unordered_map<uint64_t,VkShaderModule> folded_modules_;
     void queue_pipeline(const PipelineKey& key,bool uber);   // pipelines_mutex_ held
     void load_pipeline_cache();
@@ -544,6 +546,16 @@ private:
     VkDescriptorSetLayout xform_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout xform_layout_ = VK_NULL_HANDLE;
     VkPipeline xform_pipeline_ = VK_NULL_HANDLE;
+    // The headset's texture table (UC_TEX_MERGE=1, needs xform_ and descriptor indexing): every packet's distinct texture/sampler sets as one
+    // array of combined image samplers (set 1); a draw's first entry travels with its vertices (the pre-pass writes it), so draws that differ
+    // only in their textures merge into one run. Pipelines with key bit kTexTableKeyBit use the TEX_TABLE modules and table_layout_.
+    bool tex_merge_ = false, table_update_after_bind_ = false;
+    uint32_t table_limit_ = 0;   // entries a packet's table may hold (the device's per-stage limits less set 0's eight)
+    VkDescriptorSetLayout table_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout table_layout_ = VK_NULL_HANDLE;
+    VkShaderModule table_vertex_module_ = VK_NULL_HANDLE, table_fragment_module_ = VK_NULL_HANDLE, table_early_module_ = VK_NULL_HANDLE;
+    PipelineKey last_table_key_{}; VkPipeline last_table_pipeline_ = VK_NULL_HANDLE;   // table_pipeline's memo (render thread only)
+    uint64_t table_runs_ = 0, table_joins_ = 0, table_packets_ = 0, table_overflows_ = 0, table_pending_ = 0, table_entries_ = 0;   // [tex-merge] (UC_GPU_PACKETS)
     VkBufferUsageFlags vertex_usage() const { return rt_input_usage() | (xform_ ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0); }   // buffers the pre-pass reads by address
     VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE, nobank_vertex_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
     std::filesystem::path cache_dir_;
