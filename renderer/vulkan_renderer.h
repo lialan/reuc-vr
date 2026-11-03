@@ -190,6 +190,7 @@ private:
     std::function<std::array<float,2>(double)> aim_history_;
     std::atomic<double> wake_seconds_{0};
     std::atomic<uint64_t> late_aim_draws_{0};
+    uint64_t merged_draws_=0, issued_draws_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
     struct Buffer { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; VkDeviceSize size = 0; };
     struct Texture {
         VkImage image=VK_NULL_HANDLE;
@@ -215,7 +216,7 @@ private:
         VkImageView view = VK_NULL_HANDLE;
         VkImage ui_image = VK_NULL_HANDLE; VkDeviceMemory ui_memory = VK_NULL_HANDLE; VkImageView ui_view = VK_NULL_HANDLE;   // HDR: the menu and prompts, composited at UI brightness
         Buffer vertices, indices, pixels, uniforms, palettes, banks, motions;   // vertices/indices: this frame's non-mesh draws; motions: MotionBlock per scene draw
-        Buffer xform_jobs, xform_chunks, xform_positions, xform_attributes;   // the vertex pre-pass (xform_): its input table and outputs
+        Buffer xform_jobs, xform_chunks, xform_positions, xform_attributes, xform_indices;   // the vertex pre-pass (xform_): its input table, outputs and the rebased indices
         VkDescriptorPool xform_pool = VK_NULL_HANDLE; VkDescriptorSet xform_set = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<const gx::MeshBuffers>> mesh_refs;   // keeps the meshes this submission draws alive until its fence completed
         std::vector<std::shared_ptr<Texture>> textures;   // shared through texture_pool_: one GPU image per texture, not one per slot

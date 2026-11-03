@@ -145,6 +145,7 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   if(UC_FOLD_TEV)   # the headset's build-time specialized TEV modules (renderer/CMakeLists.txt)
     add_dependencies(uc uc_folded_tev)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_directory ${UC_FOLDED_DIR} $<TARGET_FILE_DIR:uc>/data/shaders/folded)
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_directory ${UC_FOLDED_DIR}_rp $<TARGET_FILE_DIR:uc>/data/shaders/folded_rp)   # UC_RELAXED_TEV
   endif()
   if(UC_DIRECTX_SHADER_FILES)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_DIRECTX_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)

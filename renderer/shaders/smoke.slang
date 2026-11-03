@@ -199,16 +199,17 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
 #ifdef XFORM_DRAW
 // The draws' vertex stage with the pre-pass: projection.palette = the draw's first attribute word, currentRow = stride | mask << 8,
-// indexed = the draw's first position; the draw has vertexOffset 0, so the vertex index is the draw-local one.
+// indexed = the draw's first position. The renderer rebases the draws' indices onto the positions (one index buffer for the packet), so
+// the vertex index is the position's, and consecutive draws that share everything else can be one draw.
 [[vk::binding(6, 0)]] StructuredBuffer<float4> xformPositions;
 [[vk::binding(7, 0)]] StructuredBuffer<uint> xformAttributes;
-Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   // gl_VertexIndex: the draw-local index (vertexOffset 0)
+Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   // gl_VertexIndex: the rebased index (vertexOffset 0)
     Output output;
-    float4 clip = xformPositions[projection.indexed + vertex];
+    float4 clip = xformPositions[vertex];
     clip.xy += projection.shift * clip.w;
     output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
     const uint stride = projection.currentRow & 255u, mask = projection.currentRow >> 8;
-    uint at = projection.palette + vertex * stride;
+    uint at = projection.palette + (vertex - projection.indexed) * stride;
     output.color = unpackColor(xformAttributes[at]); output.color1 = unpackColor(xformAttributes[at + 1]);
     at += 2;
     [unroll] for (uint id = 0; id < 8; ++id) {

@@ -907,7 +907,9 @@ VkShaderModule VulkanRenderer::folded_module(const std::array<uint32_t,68>& valu
     if (const auto found=folded_modules_.find(hash); found!=folded_modules_.end()) return found->second;
     char file[32]; std::snprintf(file,sizeof file,"%016llx.spv",(unsigned long long)hash);
     VkShaderModule module=VK_NULL_HANDLE;
-    std::ifstream in(shaders_/"folded"/file,std::ios::binary);
+    // UC_RELAXED_TEV=1: the modules with their colour arithmetic RelaxedPrecision (tools/spirv_relaxed_precision.py, folded_rp)
+    static const char* const folded_dir=std::getenv("UC_RELAXED_TEV") ? "folded_rp" : "folded";
+    std::ifstream in(shaders_/folded_dir/file,std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(in)),{});
     if (!code.empty() && code.size()%4==0) {
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; info.codeSize=code.size(); info.pCode=reinterpret_cast<const uint32_t*>(code.data());
@@ -1382,7 +1384,7 @@ void VulkanRenderer::retire_images(bool keep_buffers) {
         if (!keep_buffers) {
             retire_textures(slot);
             destroy_buffer(slot.vertices); destroy_buffer(slot.indices); destroy_buffer(slot.pixels); destroy_buffer(slot.uniforms); destroy_buffer(slot.palettes); destroy_buffer(slot.banks); destroy_buffer(slot.motions); slot.mesh_refs.clear();
-            for (Buffer* buffer:{&slot.xform_jobs,&slot.xform_chunks,&slot.xform_positions,&slot.xform_attributes}) destroy_buffer(*buffer);
+            for (Buffer* buffer:{&slot.xform_jobs,&slot.xform_chunks,&slot.xform_positions,&slot.xform_attributes,&slot.xform_indices}) destroy_buffer(*buffer);
         }
         destroy_slot_images(slot);
         slot.submitted = slot.reported = slot.initialized = slot.copied = false; slot.serial = 0;
@@ -2275,19 +2277,22 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     };
     // The vertex pre-pass (xform_): where each draw's shaded vertices go. Positions: one float4 a vertex; attributes: 2 + 3 per used
     // coordinate words a vertex. A draw that draws nothing gets no job.
-    struct XformDraw { uint32_t positions=0, attributes=0, word=0, count=0; };   // word: stride | mask << 8 (the draws' currentRow)
+    // The draws' indices are rebased onto the positions, in draw order, into one index buffer (first: the draw's first index there): a
+    // run of draws that share their state is then one draw.
+    struct XformDraw { uint32_t positions=0, attributes=0, word=0, count=0, first=0; };   // word: stride | mask << 8 (the draws' currentRow)
     std::vector<XformDraw> xform_draws;
     std::vector<uint32_t> draw_uniform(packet.draws.size(),0);   // each draw's uniform block index (offset / uniform_stride_)
+    std::vector<std::array<uint64_t,17>> set_keys(xform_ ? packet.draws.size() : 0);   // per draw: image views, samplers, uniform offset
     if (xform_ && !packet.draws.empty()) {
         xform_draws.resize(packet.draws.size());
-        uint32_t positions=0, attributes=0;
+        uint32_t positions=0, attributes=0, indices=0;
         for (size_t i=0;i<packet.draws.size();++i) {
             if (!gpu_draws[i].index_count) continue;
             const auto& draw=packet.draws[i];
-            const uint32_t n=uint32_t(draw.mesh ? draw.mesh->vertices.size() : draw.vertex_view().size());
+            const uint32_t n=uint32_t(draw.vertex_view().size());
             const uint32_t mask=coord_mask(i), stride=2+3*uint32_t(std::popcount(mask));
-            xform_draws[i]={positions,attributes,stride|(mask<<8),n};
-            positions+=n; attributes+=n*stride;
+            xform_draws[i]={positions,attributes,stride|(mask<<8),n,indices};
+            positions+=n; attributes+=n*stride; indices+=gpu_draws[i].index_count;
         }
         const auto grow=[&](Buffer& buffer,VkDeviceSize bytes) {
             bytes=std::max<VkDeviceSize>(bytes,16);
@@ -2295,6 +2300,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             destroy_buffer(buffer); buffer=make_buffer(bytes+bytes/2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,true);
         };
         grow(slot.xform_positions,VkDeviceSize(positions)*16); grow(slot.xform_attributes,VkDeviceSize(attributes)*4);
+        if (slot.xform_indices.size<VkDeviceSize(indices)*4) { destroy_buffer(slot.xform_indices); slot.xform_indices=make_buffer(std::max<VkDeviceSize>(indices,16)*6,VK_BUFFER_USAGE_INDEX_BUFFER_BIT,true); }
+        auto* out=static_cast<uint32_t*>(slot.xform_indices.mapped);
+        for (size_t i=0;i<packet.draws.size();++i) {
+            if (!gpu_draws[i].index_count) continue;
+            const uint32_t base=xform_draws[i].positions; uint32_t* at=out+xform_draws[i].first;
+            for (const uint32_t index:packet.draws[i].index_view()) *at++=base+index;
+        }
     }
     if (!packet.draws.empty()) {
         if (packet.draws.size()>UINT32_MAX) throw std::invalid_argument("too many native texture descriptors");
@@ -2388,6 +2400,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             VkDescriptorBufferInfo motion{slot.motions.buffer,0,VK_WHOLE_SIZE};
             if (layers_>1) motion={slot.motions.buffer,VkDeviceSize(i)*stereo_stride_,kStereoBlockBytes};   // this draw's eye block
             draw_uniform[i]=uint32_t(uniform_offset/uniform_stride_);
+            if (xform_) {   // what the draw's set holds besides its eye block: draws with the same can share one set (and one draw)
+                auto& key=set_keys[i];
+                for (size_t map=0;map<8;++map) { key[map]=uint64_t(image[map].imageView); key[8+map]=uint64_t(samplers[map].sampler); }
+                key[16]=uniform_offset;
+            }
             const VkDescriptorBufferInfo xform_positions{slot.xform_positions.buffer,0,VK_WHOLE_SIZE}, xform_attributes{slot.xform_attributes.buffer,0,VK_WHOLE_SIZE};
             VkWriteDescriptorSet writes[8]{};
             const uint32_t binding_count=xform_ ? 8 : 6;
@@ -2475,9 +2492,32 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     if (by_kind) {
         const size_t n = packet.draws.size();
         const char* bucket = n == 0 ? "0" : n < 10 ? "1-9" : n < 50 ? "10-49" : n < 200 ? "50-199" : "200+";
-        if (n >= 200) {   // the vertex load of the big (scene) packets: indices drawn, per second
+        if (n >= 200 && !(packet.texture_copy && packet.texture_copy->source[2] == 640)) {   // the other big packets: what they draw
+            static uint64_t packets = 0, drawn = 0, indices = 0, perspective = 0; static double area = 0; static auto since = std::chrono::steady_clock::now();
+            for (size_t d = 0; d < gpu_draws.size(); ++d) {
+                if (!gpu_draws[d].index_count) continue;
+                ++drawn; indices += gpu_draws[d].index_count;
+                if (packet.draws[d].transforms->projection[3][3] == 0) ++perspective;
+                else if (const auto b = gx::draw_bounds_ndc(packet.draws[d])) area += std::max(0.f, std::clamp((*b)[2], -1.f, 1.f) - std::clamp((*b)[0], -1.f, 1.f)) * std::max(0.f, std::clamp((*b)[3], -1.f, 1.f) - std::clamp((*b)[1], -1.f, 1.f)) / 4;
+            }
+            ++packets;
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
+                const double p = double(packets);
+                std::fprintf(stderr, "[gpu-packets] other big packets (%s): %.0f draws, %.0f perspective, %.0f indices, ortho draws cover %.1f viewports (%llu packets)\n",
+                             packet.texture_copy ? "copy" : "no copy", drawn / p, perspective / p, indices / p, area / p, (unsigned long long)packets);
+                for (size_t d = 0; d < packet.draws.size() && d < 400; d += 97) {   // a few of its draws: GX viewport, scissor, lens, NDC box
+                    const auto& draw = packet.draws[d]; const auto v = draw.state->viewport.value_or(std::array<float,6>{});
+                    const auto sc = draw.state->scissor.value_or(std::array<int32_t,4>{}); const auto b = gx::draw_bounds_ndc(draw).value_or(std::array<float,4>{});
+                    std::fprintf(stderr, "[gpu-packets]   draw %zu callsite %08X viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %dx%d p00 %.3f p11 %.3f box %.2f,%.2f..%.2f,%.2f blend %u copy %u,%u %ux%u\n", d, draw.callsite, v[0], v[1], v[2], v[3],
+                                 int(sc[0]), int(sc[1]), int(sc[2]), int(sc[3]), draw.transforms->projection[0][0], draw.transforms->projection[1][1], b[0], b[1], b[2], b[3], unsigned(draw.blend.mode),
+                                 packet.texture_copy ? packet.texture_copy->source[0] : 0, packet.texture_copy ? packet.texture_copy->source[1] : 0, packet.texture_copy ? packet.texture_copy->source[2] : 0, packet.texture_copy ? packet.texture_copy->source[3] : 0);
+                }
+                packets = drawn = indices = perspective = 0; area = 0; since = std::chrono::steady_clock::now();
+            }
+        }
+        if (n >= 200 && packet.texture_copy && packet.texture_copy->source[2] == 640) {   // the main scene packets: their vertex load and state changes, per second
             static uint64_t indices = 0, packets = 0, drawn = 0, vertices = 0, switches = 0, distinct = 0, meshes = 0; static auto since = std::chrono::steady_clock::now();
-            static uint64_t uniform_changes = 0, texture_changes = 0, projection_changes = 0;
+            static uint64_t uniform_changes = 0, texture_changes = 0, projection_changes = 0, runs = 0;
             std::set<VkPipeline> pipelines; VkPipeline last = VK_NULL_HANDLE; size_t last_drawn = SIZE_MAX;
             for (size_t d = 0; d < gpu_draws.size(); ++d) {
                 const auto& info = gpu_draws[d];
@@ -2493,6 +2533,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     for (size_t map = 0; map < 8 && same; ++map) same = draw_texture(a, map) == draw_texture(b, map);
                     texture_changes += !same;
                     projection_changes += a.transforms->projection != b.transforms->projection;
+                    // could the two draws be one (the pre-pass's outputs are consecutive): same pipeline, uniform block, textures, viewport and scissor
+                    const bool viewports = a.state->viewport == b.state->viewport && a.state->scissor == b.state->scissor;
+                    runs += !(same && info.choice.pipeline == gpu_draws[last_drawn].choice.pipeline && a.uniforms.block() == b.uniforms.block() && viewports && a.transforms->projection == b.transforms->projection && !a.reticle && !a.late_aim && !a.layer);
                 }
                 last_drawn = d;
             }
@@ -2500,9 +2543,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             ++packets;
             if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
                 const double p = double(packets);
-                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets), %.0f draws (%.0f meshes), %.0f vertices, %.0f pipelines, %.0f pipeline changes, %.0f uniform changes, %.0f texture changes, %.0f projection changes\n", double(indices) / p, (unsigned long long)packets,
-                             drawn / p, meshes / p, vertices / p, distinct / p, switches / p, uniform_changes / p, texture_changes / p, projection_changes / p);
-                indices = packets = drawn = vertices = switches = distinct = meshes = uniform_changes = texture_changes = projection_changes = 0; since = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets), %.0f draws (%.0f meshes), %.0f vertices, %.0f pipelines, %.0f pipeline changes, %.0f uniform changes, %.0f texture changes, %.0f projection changes, %.0f runs of mergeable draws\n", double(indices) / p, (unsigned long long)packets,
+                             drawn / p, meshes / p, vertices / p, distinct / p, switches / p, uniform_changes / p, texture_changes / p, projection_changes / p, (runs + packets) / p);
+                indices = packets = drawn = vertices = switches = distinct = meshes = uniform_changes = texture_changes = projection_changes = runs = 0; since = std::chrono::steady_clock::now();
             }
         }
         char kind[128];
@@ -2716,6 +2759,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         }
         if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = y1 = 1; }   // nothing drawn: one pixel
         render_area = {{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+        static const bool area_log = std::getenv("UC_GPU_PACKETS") != nullptr;   // the render area of the big passes, once per 2 s per kind
+        if (area_log && last - first >= 200) {
+            static std::map<std::string, std::chrono::steady_clock::time_point> logged;
+            auto& at = logged[slot.timing_kind];
+            if (std::chrono::steady_clock::now() - at > std::chrono::seconds(2)) {
+                at = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpu-area] %s: render area %d,%d %ux%u of %ux%u\n", slot.timing_kind.c_str(), render_area.offset.x, render_area.offset.y, render_area.extent.width, render_area.extent.height, target.extent.width, target.extent.height);
+            }
+        }
     }
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea = render_area; rendering.layerCount = 1; rendering.viewMask = layers_>1 ? 0b11u : 0u; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachments = colors;
     const VkImageLayout depth_before=!initialized ? VK_IMAGE_LAYOUT_UNDEFINED : scene ? scene_depth_layout_ : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
@@ -2782,6 +2834,36 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdSetDepthCompareOp(slot.command,VkCompareOp((key[68]>>1)&7));
         };
         bool probe_bound=false;
+        // The pre-pass (xform_): consecutive draws that differ only in their vertices (same pipeline, textures, samplers, uniform block, eye
+        // block, push constants, viewport, scissor; consecutive in the rebased index buffer) are one draw. UC_NO_MERGE=1: a draw each.
+        static const bool no_merge=std::getenv("UC_NO_MERGE")!=nullptr;
+        struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; };
+        std::optional<Run> pending;
+        const auto issue_run=[&](const Run& run) {
+            const auto& draw=packet.draws[run.d]; const auto& info=gpu_draws[run.d];
+            if (no_dedup || std::memcmp(&run.viewport,&bound_viewport,sizeof run.viewport)) { vkCmdSetViewport(slot.command,0,1,&run.viewport); bound_viewport=run.viewport; }
+            if (no_dedup || std::memcmp(&run.scissor,&bound_scissor,sizeof run.scissor)) { vkCmdSetScissor(slot.command,0,1,&run.scissor); bound_scissor=run.scissor; }
+            if (bound_indices!=&slot.xform_indices) { vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32); bound_indices=&slot.xform_indices; bound_index_offset=0; }
+            bind_pipeline(run.pipeline);
+            set_draw_state(info.key);
+            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
+            DrawPush push=run.push;
+            vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
+            const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
+            if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
+            vkCmdDrawIndexed(slot.command,run.count,1,run.first,0,0);
+            ++issued_draws_;
+            const auto depth=draw.uniforms->pixel[1]&31;
+            if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0)) {   // as below: destination alpha after RGB blending
+                const auto alpha_key=pipeline_key(draw,true);
+                const auto alpha=pipeline_for(alpha_key);
+                bind_pipeline(alpha.pipeline);
+                set_draw_state(alpha_key);
+                if (alpha.uber) { push.alpha_pass=1; vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push); }
+                vkCmdDrawIndexed(slot.command,run.count,1,run.first,0,0);
+            }
+            if (counted) { vkCmdEndQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_)); frag_queries_.push_back(uint32_t(run.d)); }
+        };
         for (size_t d=first; d<last; ++d) {
             const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
             const size_t set_index=d;
@@ -2820,6 +2902,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (log_aim) std::fprintf(stderr,"[aim] t=%.4f consumed %.4f %.4f latest %.4f %.4f callsite %08X\n",std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),from[0],from[1],latest[0],latest[1],draw.callsite);
                 if (dx!=0 || dy!=0) { late_shift[0]=dx*2/draw_viewport.width; late_shift[1]=dy*2/draw_viewport.height; draw_scissor=scissor; ++late_aim_draws_; }
             }
+            if (!xform_) {   // the pre-pass: the state goes with the run's draw (issue_run below)
             if (no_dedup || std::memcmp(&draw_viewport,&bound_viewport,sizeof draw_viewport)) { vkCmdSetViewport(slot.command,0,1,&draw_viewport); bound_viewport=draw_viewport; }
             if (no_dedup || std::memcmp(&draw_scissor,&bound_scissor,sizeof draw_scissor)) { vkCmdSetScissor(slot.command,0,1,&draw_scissor); bound_scissor=draw_scissor; }
             const Buffer& vertex_buffer=info.vertices ? *info.vertices : slot.vertices;
@@ -2832,6 +2915,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (!probe_sets || !probe_bound)
             vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[set_index],0,nullptr);
             probe_bound=true;
+            }
             DrawPush push{draw.transforms->projection,info.palette,info.current,info.indexed,0,info.bank};
             if (xform_) { const auto& x=xform_draws[d]; push.palette=x.attributes; push.current_row=x.word; push.indexed=x.positions; }   // XFORM_DRAW: where the pre-pass put this draw's vertices
             push.viewport[0]=draw_viewport.x; push.viewport[1]=draw_viewport.y; push.viewport[2]=draw_viewport.width; push.viewport[3]=draw_viewport.height;
@@ -2957,11 +3041,24 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     }
                 }
                 if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
-                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx)\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load());
-                    cull_tested=cull_draws=cull_indices=all_indices=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
+                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_);
+                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
             }
             if (culled) continue;
+            if (xform_) {   // join the pending run when nothing but the vertex range differs, else draw the pending run and start a new one
+                push.motion=0;   // the stereo shaders read the eye block from the set, not this index
+                const auto& x=xform_draws[d];
+                Run run{d,info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255)};
+                const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
+                const bool joins=pending && !no_merge && !frag_dump_ && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key && set_keys[pending->set]==set_keys[run.set] &&
+                    std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0 &&
+                    same_push(pending->push,run.push) && std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)==0 &&
+                    pending->first+pending->count==run.first && pending->positions_end==x.positions && pending->attributes_end==x.attributes;
+                if (joins) { pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_; }
+                else { if (pending) issue_run(*pending); pending=run; }
+                continue;
+            }
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
             const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
             if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
@@ -2978,6 +3075,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             }
             if (counted) { vkCmdEndQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_)); frag_queries_.push_back(uint32_t(d)); }
         }
+        if (pending) issue_run(*pending);
     }
     vkCmdEndRendering(slot.command);
     barrier(slot.command, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
