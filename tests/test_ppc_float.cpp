@@ -152,7 +152,8 @@ int main() {
             CHECK(c.f[5] == l0);
         }
     }
-    // r1 (stack) accesses skip the MMIO test and the write barrier, r2/r13 skip only the MMIO test, other bases keep both; values agree on every path
+    // r1, r2, r13 skip the MMIO test, other bases keep it; every store marks its page's write epoch (the one barrier, which rollback reads too);
+    // values agree on every path
     for (int base : {1, 2, 13, 3}) {
         const uint32_t page = 0x80010000u + uint32_t(base) * 0x1000u;
         gx::page_epoch[(page & 0x3FFFFFFFu) >> 12] = 0; gx::write_epoch = 9;
@@ -167,22 +168,22 @@ int main() {
         op_lbz(c, 6, base, 9);   CHECK(c.r[6] == 0x44u);
         c.f[21] = 0; op_lfd(c, 21, base, 16); CHECK(c.f[21] == 6.25);
         c.f[21] = 0; op_lfs(c, 21, base, 24); CHECK(c.f[21] == 6.25 && c.ps1[21] == 6.25);
-        CHECK(gx::page_epoch[(page & 0x3FFFFFFFu) >> 12] == (base == 1 ? 0u : 9u));
+        CHECK(gx::page_epoch[(page & 0x3FFFFFFFu) >> 12] == 9u);
     }
-    // Paired float stack traffic uses the same unwatched RAM path as scalar stack stores.
+    // Paired float stack traffic marks its pages as scalar stack stores do.
     for(int base : {1,2,13,3}) {
         const uint32_t address=0x80015FFCu;
         c.r[base]=address; c.gqr[0]=0; c.f[20]=1.5; c.ps1[20]=-0.1;
         gx::page_epoch[0x15000>>12]=gx::page_epoch[0x16000>>12]=0;
         op_psq_st(c,20,base,0,0,0);
         CHECK(rd32(c,address)==0x3FC00000u && rd32(c,address+4)==0xBDCCCCCDu);
-        CHECK(gx::page_epoch[0x15000>>12]==(base==1 ? 0u : 9u));
-        CHECK(gx::page_epoch[0x16000>>12]==(base==1 ? 0u : 9u));
+        CHECK(gx::page_epoch[0x15000>>12]==9u);
+        CHECK(gx::page_epoch[0x16000>>12]==9u);
         op_psq_l(c,21,base,0,0,0);
         CHECK(c.f[21]==1.5 && c.ps1[21]==double(-0.1f));
         gx::page_epoch[0x15000>>12]=0;
         op_psq_st(c,20,base,-4,1,0);
-        CHECK(gx::page_epoch[0x15000>>12]==(base==1 ? 0u : 9u));
+        CHECK(gx::page_epoch[0x15000>>12]==9u);
         op_psq_l(c,21,base,-4,1,0);
         CHECK(c.f[21]==1.5 && c.ps1[21]==1.0);
     }

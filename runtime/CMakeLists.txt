@@ -24,7 +24,7 @@ target_sources(uc_runtime PRIVATE native_input.cpp)
 target_sources(uc_runtime PRIVATE ax_audio.cpp audio_gap_audit.cpp)
 target_sources(uc_runtime PRIVATE locked_copy.cpp)
 target_sources(uc_runtime PRIVATE rollback_memory.cpp)
-target_sources(uc_runtime PRIVATE crash_report.cpp gx_gap_audit.cpp)
+target_sources(uc_runtime PRIVATE crash_report.cpp gx_gap_audit.cpp fastmem.cpp)
 target_link_libraries(uc_runtime PUBLIC uc_gx uc_input uc_gamepad_config uc_wiimote_config PRIVATE uc_public_release)
 # Real hook implementations for uc.exe (ppc::trap, mmio_*, timebase); tests use tests/mmio_stub.cpp instead.
 add_library(uc_platform STATIC platform.cpp)

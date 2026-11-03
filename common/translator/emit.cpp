@@ -262,7 +262,7 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
-    return "ppc::op_" + name + "(c" + (a.empty() ? "" : ", " + a) + ");";
+    return "ppc::op_" + name + (hints && hints->io ? "<true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
 }
 
 static bool is_terminator_word(uint32_t w) { return w == 0x4E800020u || w == 0x4E800420u || ((w >> 26) == 18 && !(w & 1)); }
@@ -491,6 +491,8 @@ std::string copy_text(const RegSet& set, bool to_ctx) {
     return s;
 }
 
+struct FnPlanView { const std::vector<uint32_t>* words; const std::vector<std::string>* comment; };
+
 // Control flow of one instruction as emit_insn writes it.
 RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment,
                  const std::unordered_map<uint32_t, LeafRegs>* leaves) {
@@ -580,6 +582,78 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
     nd.eff = reg_effect(*op, w, op->rc && ppc::rc(w) && !h.drop_rc, ok);
     if (!ok) { nd.eff.use = cached_mask(); }   // not expected: read everything, write nothing
     return nd;
+}
+
+// The guest loads and stores whose base register may hold an address in the hardware-register window (0xCC000000..0xCDFFFFFF): a
+// forward "may" dataflow over the function from `lis rX,0xCC00..0xCE00` through addi/addis/ori/mr and update-form writebacks; a call keeps
+// only the registers the ABI preserves (r1, r2, r13..r31); any other write ends it. A load or store from such a base is emitted with
+// the explicit MMIO test (ppc::op_*<true>): with fastmem the others carry no test, and an MMIO access among them costs a fault. Only a
+// heuristic for speed: either form is correct for any address.
+const std::set<std::string>& guest_memory_ops() {
+    static const std::set<std::string> ops = {
+        "lbz", "lbzu", "lbzx", "lbzux", "lhz", "lhzu", "lhzx", "lhzux", "lha", "lhau", "lhax", "lhaux", "lwz", "lwzu", "lwzx", "lwzux",
+        "stb", "stbu", "stbx", "stbux", "sth", "sthu", "sthx", "sthux", "stw", "stwu", "stwx", "stwux",
+        "lfs", "lfsu", "lfsx", "lfsux", "lfd", "lfdu", "lfdx", "lfdux", "stfs", "stfsu", "stfsx", "stfsux", "stfd", "stfdu", "stfdx", "stfdux", "stfiwx",
+        "psq_l", "psq_lu", "psq_lx", "psq_lux", "psq_st", "psq_stu", "psq_stx", "psq_stux"};
+    return ops;
+}
+size_t mark_mmio_bases(const FnPlanView& plan, const std::vector<RegNode>& nodes, std::vector<CrHints>& hints) {
+    using Gprs = std::bitset<32>;
+    const size_t n = nodes.size();
+    std::vector<Gprs> in(n + 1);
+    std::vector<bool> reached(n + 1, false);
+    auto transfer = [&](size_t i, Gprs g) {
+        if (!(*plan.comment)[i].empty()) return g;   // a folded compare: no code
+        const uint32_t w = (*plan.words)[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        const RegNode& nd = nodes[i];
+        if (nd.call) { g.reset(0); for (int r = 3; r <= 12; ++r) g.reset(size_t(r)); }
+        if (!op) return g;
+        const std::string name = op->name;
+        const uint32_t T = ppc::t(w), A = ppc::a(w), B = ppc::b(w);
+        auto clear_written = [&] { for (int r = 0; r < 32; ++r) if (nd.eff.may.test(size_t(res::R + r))) g.reset(size_t(r)); };
+        if (name == "addis" && A == 0) { const uint32_t hi = ppc::uimm(w); g.set(T, hi >= 0xCC00 && hi <= 0xCE00); return g; }
+        if (name == "addi" || name == "addis" || name == "addic") { const bool keep = A && g.test(A); g.set(T, keep); return g; }
+        if (name == "ori" || name == "oris") { const bool keep = g.test(T); g.set(A, keep); return g; }   // rA = rS | imm
+        if (name == "or" && T == B) { const bool keep = g.test(T); clear_written(); g.set(A, keep); return g; }   // mr rA, rS
+        if (guest_memory_ops().count(name)) {
+            const bool update = name.back() == 'u' || (name.size() > 2 && name.compare(name.size() - 2, 2, "ux") == 0);
+            const bool keep_a = A && g.test(A);
+            clear_written();
+            if (update) g.set(A, keep_a);   // rA = the effective address
+            return g;
+        }
+        clear_written();
+        return g;
+    };
+    reached[0] = true;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!reached[i]) continue;
+            const Gprs out = transfer(i, in[i]);
+            auto flow = [&](int to) {
+                if (to < 0 || size_t(to) > n) return;
+                const Gprs merged = in[size_t(to)] | out;
+                if (!reached[size_t(to)] || merged != in[size_t(to)]) { in[size_t(to)] = merged; reached[size_t(to)] = true; changed = true; }
+            };
+            if (nodes[i].fall || nodes[i].call) flow(int(i + 1));
+            if (nodes[i].target >= 0) flow(nodes[i].target);
+            for (int t : nodes[i].table) flow(t);
+        }
+    }
+    size_t marked = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!(*plan.comment)[i].empty()) continue;
+        const uint32_t w = (*plan.words)[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        if (!op || !guest_memory_ops().count(op->name)) continue;
+        const std::string name = op->name;
+        const uint32_t A = ppc::a(w), B = ppc::b(w);
+        const bool indexed = name.back() == 'x';
+        if ((A && in[i].test(A)) || (indexed && in[i].test(B))) { hints[i].io = true; ++marked; }
+    }
+    return marked;
 }
 }  // namespace
 
@@ -676,6 +750,13 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     const bool tail_end = plan.tail_end;
     auto sit = p.an.secondary.find(f.entry);
     const bool has_sec = sit != p.an.secondary.end();
+
+    // the loads and stores from a hardware-register base keep the explicit MMIO test (fastmem builds)
+    {
+        std::vector<RegNode> nodes(n);
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
+        st.mmio_sites += mark_mmio_bases({&words, &comment}, nodes, hints);
+    }
 
     // pass 2: register cache dataflow
     const bool local = p.reg_cache;

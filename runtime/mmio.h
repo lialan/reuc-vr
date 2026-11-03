@@ -43,4 +43,7 @@ private:
 MmioBus& mmio_bus();
 // Stores to the GX FIFO port (0xCC008000) are the hottest MMIO access (every immediate-mode vertex word): they skip the range search of the bus.
 void mmio_set_gx_fifo(MmioDevice* device);
+// Guest MMIO accesses so far (runtime/platform.cpp): reads, writes other than the FIFO's, FIFO writes (explicit calls and fastmem faults alike).
+struct MmioCounts { uint64_t reads, writes, fifo_writes; };
+MmioCounts mmio_counts();
 }  // namespace uc

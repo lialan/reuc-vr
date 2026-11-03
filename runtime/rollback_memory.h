@@ -7,28 +7,16 @@
 #include <string>
 #include <vector>
 #include "host_compat.h"
+#include "gx_write_watch.h"
 
 namespace uc {
-// Guest baton owns this tracker, including native HLE writes. Independent of GX cache epochs.
+// Guest baton owns this tracker, including native HLE writes. Its dirty pages are those whose write epoch (gx_write_watch.h, the one
+// mark every guest store makes) is newer than the stamp it took at its last capture or restore; a watch_reset (the texture caches'
+// epoch wrap) makes every page dirty once.
 UC_IMAGE_LOCAL inline uint8_t* rollback_memory_base=nullptr;
-UC_IMAGE_LOCAL inline std::array<uint8_t,1u<<18> rollback_dirty{};
-// The per-store marks do not test whether a tracker runs (a load and a branch at every guest store): marking costs one store, and a
-// tracker clears the table when it starts, so marks made while none runs are dropped.
-inline void rollback_note_write(uint32_t address) {
-    rollback_dirty[(address&0x3FFFFFFFu)>>12]=1;
-}
-inline void rollback_note_range(uint32_t address,size_t size) {
-    if(!rollback_memory_base || !size) return;
-    const uint64_t first=(address&0x3FFFFFFFu)>>12,last=((address&0x3FFFFFFFu)+uint64_t(size)-1)>>12;
-    for(uint64_t page=first;page<=last && page<rollback_dirty.size();++page) rollback_dirty[page]=1;
-}
-// rollback_note_range for one guest access of 1..8 bytes (at most two pages): the general loop became a memset call at every stack store
-// of the translated code, which kept a call (and its register saves) on the path of every function's prologue.
-inline void rollback_note_access(uint32_t address,uint32_t size) {
-    const uint32_t first=(address&0x3FFFFFFFu)>>12;
-    rollback_dirty[first]=1;
-    if((address&0xFFFu)+size-1>0xFFFu && first+1<rollback_dirty.size()) [[unlikely]] rollback_dirty[first+1]=1;   // the access ends in the next page
-}
+inline void rollback_note_write(uint32_t address) { gx::note_write(address); }
+inline void rollback_note_range(uint32_t address,size_t size) { gx::note_write_range(address,size); }
+inline void rollback_note_access(uint32_t address,uint32_t size) { gx::note_access(address,size); }
 inline void rollback_note_pointer(const uint8_t* pointer,size_t size) {
     if(rollback_memory_base) rollback_note_range(uint32_t(uintptr_t(pointer)-uintptr_t(rollback_memory_base)),size);
 }
@@ -47,8 +35,12 @@ public:
     static std::vector<uint32_t> chunk_hashes(const Snapshot&);
     // Desync diagnostic: the captured RAM in capture order (24 MiB, 64 MiB, 64 KiB), raw.
     static void dump(const Snapshot&,std::FILE*);
+    // A store reached the page holding `address` since the last capture or restore.
+    bool dirty(uint32_t address) const { return gx::watch_generation!=generation_ || gx::page_epoch[(address&0x3FFFFFFFu)>>12]>stamp_; }
 private:
+    void mark_clean() { stamp_=gx::watch_stamp(); generation_=gx::watch_generation; }
     uint8_t* memory_;
     std::shared_ptr<const Snapshot> current_;
+    uint32_t stamp_=0, generation_=0;
 };
 }

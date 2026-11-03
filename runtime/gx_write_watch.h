@@ -1,20 +1,29 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include "rollback_memory.h"
+#include "host_compat.h"
 
 namespace gx {
 // Guest write barrier. Every guest store (and every native bulk write into guest RAM) records the current epoch in its 4 KiB page, so a cache
-// holding a copy of guest memory can skip re-reading it when no store touched the pages since it last verified them. Written only by the thread
-// holding the guest baton; the native code that reads it runs on that thread too, while no guest code executes.
+// holding a copy of guest memory can skip re-reading it when no store touched the pages since it last verified them. The rollback tracker
+// (rollback_memory.h) reads the same table: a page is dirty for it when its epoch is newer than the tracker's last stamp, so a store's
+// bookkeeping is this one write. Written only by the thread holding the guest baton; the native code that reads it runs on that thread
+// too, while no guest code executes.
 inline constexpr uint32_t kWatchPages = 1u << 18;   // 1 GiB of guest address space / 4 KiB
 UC_IMAGE_LOCAL inline uint32_t write_epoch = 2;
 UC_IMAGE_LOCAL inline uint32_t page_epoch[kWatchPages];
+UC_IMAGE_LOCAL inline uint32_t watch_generation = 0;   // counts watch_reset: a stamp from an earlier generation compares against nothing
 
-inline void note_write(uint32_t address) { page_epoch[(address & 0x3FFFFFFFu) >> 12] = write_epoch; uc::rollback_note_write(address); }
+inline void note_write(uint32_t address) { page_epoch[(address & 0x3FFFFFFFu) >> 12] = write_epoch; }
+// One guest access of 1..8 bytes (at most two pages): the stack stores' barrier (they skip nothing else, the general range loop was a
+// memset call at every one).
+inline void note_access(uint32_t address, uint32_t size) {
+    const uint32_t first = (address & 0x3FFFFFFFu) >> 12;
+    page_epoch[first] = write_epoch;
+    if ((address & 0xFFFu) + size - 1 > 0xFFFu && first + 1 < kWatchPages) [[unlikely]] page_epoch[first + 1] = write_epoch;   // ends in the next page
+}
 inline void note_write_range(uint32_t address, size_t size) {
     if (!size) return;
-    uc::rollback_note_range(address,size);
     const uint64_t first = (address & 0x3FFFFFFFu) >> 12, last = ((address & 0x3FFFFFFFu) + uint64_t(size) - 1) >> 12;
     for (uint64_t page = first; page <= last && page < kWatchPages; ++page) page_epoch[page] = write_epoch;
 }
@@ -32,5 +41,5 @@ inline bool written_since(uint32_t address, size_t size, uint32_t stamp) {
 }
 // The epoch counter is 32 bit; callers drop their stamps and call this long before it wraps.
 inline bool watch_exhausted() { return write_epoch > 0xF0000000u; }
-inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; }
+inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; ++watch_generation; }
 }
