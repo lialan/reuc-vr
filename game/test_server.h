@@ -4,6 +4,8 @@
 #include "test_protocol.h"
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -20,7 +22,10 @@ public:
     TestServer(TestPipes&, TestInputSink&);
     // Called once per main-loop iteration with the latest published frame counter.
     struct Pump { bool capture = false; bool draws = false; bool quit = false; std::vector<uint32_t> host_keys; std::vector<std::string> options, gamepad, settings; std::vector<std::pair<float, float>> menu_clicks; };   // options: graphics JSON, gamepad: gamepad settings JSON, settings: root config keys JSON
-    Pump pump(uint64_t frame, const std::string& frame_json);
+    // The frame state is built only when something sends it (a new frame or a state request): the main loop runs several times per frame.
+    using FrameJson = std::function<std::string()>;
+    Pump pump(uint64_t frame, const FrameJson& frame_json);
+    Pump pump(uint64_t frame, const std::string& frame_json) { return pump(frame, FrameJson([&frame_json] { return frame_json; })); }
     void captured(const std::string& path);           // completes the oldest pending capture
     void capture_failed(const std::string& message);
     void draws_ready(const std::string& draws_json, const std::string& projection_json);        // completes pending `draws` requests with the screen-space summary
@@ -28,7 +33,8 @@ public:
 private:
     struct Item { uint64_t due; uint64_t request; TestDevice device; bool press; bool last; TestInput input; };
     struct Waiting { uint64_t id; uint64_t sequence; };   // input requests whose last item was applied
-    void handle(const std::string& line, uint64_t frame, const std::string& frame_json, Pump&);
+    struct LazyJson { const FrameJson& make; std::optional<std::string> text; const std::string& get() { if (!text) text = make(); return *text; } };
+    void handle(const std::string& line, uint64_t frame, LazyJson& frame_json, Pump&);
     bool apply(const Item&, uint64_t frame);
     void schedule(const TestRequest&, uint64_t frame);
     void fail_request(uint64_t request, const std::string& message);

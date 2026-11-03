@@ -7,7 +7,6 @@
 #include <mutex>
 
 namespace {
-std::atomic<bool> enabled{false};
 std::mutex mutex;
 std::map<uint32_t, uc::GxAuditEntry> entries;
 bool recording = false;
@@ -37,9 +36,9 @@ bool watched(uint32_t address, uint32_t link) {
 }
 }
 namespace uc {
-void gx_audit_enable() { enabled.store(true, std::memory_order_relaxed); }
-void gx_audit_enter(uint32_t address, const ppc::Ctx& ctx) {
-    if (!enabled.load(std::memory_order_relaxed) || !watched(address,ctx.lr)) return;
+void gx_audit_enable() { gx_audit_on.store(true, std::memory_order_relaxed); }
+void gx_audit_enter_slow(uint32_t address, const ppc::Ctx& ctx) {
+    if (!gx_audit_on.load(std::memory_order_relaxed) || !watched(address,ctx.lr)) return;
     std::lock_guard lock(mutex);
     auto& entry = entries[address];
     if(ctx.mem && (address==0x80366D3C || address==0x80366E14) && entry.resources.size()<4) {
@@ -80,8 +79,8 @@ void gx_audit_enter(uint32_t address, const ppc::Ctx& ctx) {
     if (address == 0x80288528) recording = true;
     if (address == 0x802885D8) recording = false;
 }
-void gx_audit_fifo_write(int size, uint32_t value) {
-    if (!enabled.load(std::memory_order_relaxed)) return;
+void gx_audit_fifo_write_slow(int size, uint32_t value) {
+    if (!gx_audit_on.load(std::memory_order_relaxed)) return;
     if (size != 1 && size != 2 && size != 4) throw std::invalid_argument("invalid GX audit write width");
     std::lock_guard lock(mutex);
     if (!recording) return;
@@ -92,7 +91,7 @@ void gx_audit_fifo_write(int size, uint32_t value) {
             entry.first_recording_prefix[entry.first_recording_size++] = uint8_t(value >> ((size - 1 - i) * 8));
 }
 void gx_audit_recorded_resource(uint32_t address, std::span<const std::byte> bytes) {
-    if (!enabled.load(std::memory_order_relaxed) || bytes.empty()) return;
+    if (!uc::gx_audit_on.load(std::memory_order_relaxed) || bytes.empty()) return;
     std::lock_guard lock(mutex);
     auto found = entries.find(0x80288528);
     if (found == entries.end() || found->second.resources.size() == 4) return;

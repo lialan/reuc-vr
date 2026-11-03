@@ -39,10 +39,12 @@ uint64_t Packets::seal_batch(FramePacket packet) {
         return serial;
     }
     const auto wait_start = std::chrono::steady_clock::now();
+    ++space_waiters_;
     space_.wait(lock, [&] { return canceled_ || outstanding_.size() < kMaxOutstandingPackets; });
     const auto window_done = std::chrono::steady_clock::now();
     total_window_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(window_done - wait_start).count();
     space_.wait(lock, [&] { return canceled_ || !packet.present || frames_in_flight_.size() < kMaxFramesInFlight; });
+    --space_waiters_;
     ++total_seals;
     total_seal_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count();
     if (canceled_) throw Error(ErrorCode::canceled, 0, 0, 0);
@@ -56,7 +58,7 @@ uint64_t Packets::seal_batch(FramePacket packet) {
     try { queued_.push_back(std::move(owned)); }
     catch (...) { outstanding_.erase(serial); frames_in_flight_.erase(serial); throw; }
     ++next_serial_;
-    ready_.notify_one();
+    if (ready_waiters_) ready_.notify_one();
     return serial;
 }
 std::unique_ptr<const FramePacket> Packets::try_take() {
@@ -90,12 +92,14 @@ bool Packets::complete(uint64_t serial) {
         }
         frames_in_flight_.erase(frame);
     }
-    space_.notify_all();
+    if (space_waiters_) space_.notify_all();
     return true;
 }
 bool Packets::wait_ready(std::chrono::nanoseconds timeout) {
     std::unique_lock lock(mutex_);
+    ++ready_waiters_;
     ready_.wait_for(lock,timeout,[&]{return canceled_ || latest_scene_ || !queued_.empty();});
+    --ready_waiters_;
     return !canceled_ && (latest_scene_ || !queued_.empty());
 }
 void Packets::cancel() {

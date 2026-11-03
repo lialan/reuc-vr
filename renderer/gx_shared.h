@@ -6,21 +6,21 @@
 
 namespace gx {
 // An immutable block shared by many draws (a mesh's 6 draws, a display list's draws) instead of a ~2 KB copy in each. Reads go through `->`/`*`;
-// a write goes through edit(), which copies first when the block is shared (copy on write). Never null: a default-constructed Shared points at one
+// a write goes through edit(), which copies first when the block is shared (copy on write). Never null: a default-constructed Shared reads one
 // shared default value.
 template<class T>
 class Shared {
 public:
-    Shared() : block_(default_block()) {}
+    Shared() = default;   // holds no block: reads see the shared default value (no reference count to touch for the many default-made draws)
     Shared(const T& value) : block_(std::allocate_shared<const T>(PoolAllocator<T>{},value)) {}
     Shared(std::shared_ptr<const T> block) : block_(std::move(block)) {}
     Shared& operator=(const T& value) { block_ = std::allocate_shared<const T>(PoolAllocator<T>{},value); return *this; }
-    const T* operator->() const { return block_.get(); }
-    const T& operator*() const { return *block_; }
-    operator const T&() const { return *block_; }
-    const std::shared_ptr<const T>& block() const { return block_; }
+    const T* operator->() const { return block().get(); }
+    const T& operator*() const { return *block(); }
+    operator const T&() const { return *block(); }
+    const std::shared_ptr<const T>& block() const { return block_ ? block_ : default_block(); }
     T& edit() {
-        if (block_.use_count() != 1 || block_ == default_block()) block_ = std::allocate_shared<const T>(PoolAllocator<T>{},*block_);
+        if (!block_ || block_.use_count() != 1 || block_ == default_block()) block_ = std::allocate_shared<const T>(PoolAllocator<T>{},*block());
         return const_cast<T&>(*block_);   // sole owner of a block that was created non-const above
     }
 private:

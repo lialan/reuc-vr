@@ -43,9 +43,8 @@ size_t classify(std::string& key) {
 
 void gx_gap_audit_enable(bool enabled) {
     std::lock_guard lock(g_mutex);
-    g_enabled = enabled; g_stream.clear(); g_rows.clear();
+    g_enabled = enabled; gx_gap_audit_on = enabled; g_stream.clear(); g_rows.clear();
 }
-bool gx_gap_audit_enabled() { return g_enabled; }
 
 void gx_gap_audit_write(int size, uint32_t value, bool in_primitive, bool recording, uint32_t (*attribute)()) {
     if (!g_enabled || in_primitive) return;

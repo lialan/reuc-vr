@@ -77,13 +77,13 @@ bool TestServer::apply(const Item& item, uint64_t) {
     }
     return false;
 }
-void TestServer::handle(const std::string& line, uint64_t frame, const std::string& frame_json, Pump& out) {
+void TestServer::handle(const std::string& line, uint64_t frame, LazyJson& frame_json, Pump& out) {
     if (line == "\x01too-long") { pipes_.send(test_reply_error(0, "command line too long"), false); return; }
     auto parsed = parse_test_request(line);
     if (auto* error = std::get_if<TestParseError>(&parsed)) { pipes_.send(test_reply_error(error->id, error->message), false); return; }
     const auto& r = std::get<TestRequest>(parsed);
     switch (r.kind) {
-    case TestRequestKind::state: pipes_.send(test_reply_ok(r.id, "\"state\":" + frame_json), false); break;
+    case TestRequestKind::state: pipes_.send(test_reply_ok(r.id, "\"state\":" + frame_json.get()), false); break;
     case TestRequestKind::speed:
         try { set_clock_speed(r.factor); pipes_.send(test_reply_ok(r.id, "\"factor\":" + std::to_string(r.factor)), false); }
         catch (const std::invalid_argument& e) { pipes_.send(test_reply_error(r.id, e.what()), false); }
@@ -116,8 +116,9 @@ void TestServer::handle(const std::string& line, uint64_t frame, const std::stri
         break;
     }
 }
-TestServer::Pump TestServer::pump(uint64_t frame, const std::string& frame_json) {
+TestServer::Pump TestServer::pump(uint64_t frame, const FrameJson& make_json) {
     Pump out;
+    LazyJson frame_json{make_json, {}};
     for (const auto& line : pipes_.take_lines()) handle(line, frame, frame_json, out);
     while (!items_.empty() && items_.front().due <= frame) {
         const Item item = items_.front(); items_.pop_front();
@@ -133,7 +134,7 @@ TestServer::Pump TestServer::pump(uint64_t frame, const std::string& frame_json)
     }
     for (const auto& a : test_state_take_actions())
         pipes_.send("{\"type\":\"action\",\"name\":" + json_string(a.name) + ",\"accepted\":" + (a.accepted ? "true" : "false") + ",\"frame\":" + std::to_string(a.frame) + "}", false);
-    if (frame != last_frame_sent_) { last_frame_sent_ = frame; pipes_.send(frame_json, true); }
+    if (frame != last_frame_sent_) { last_frame_sent_ = frame; pipes_.send(frame_json.get(), true); }
     out.draws = !draw_requests_.empty();
     if (!captures_.empty() && !capture_inflight_) { capture_inflight_ = true; out.capture = true; }
     return out;

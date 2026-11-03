@@ -179,17 +179,34 @@ std::shared_ptr<const TexturePixels> TextureCache::snapshot(uint32_t address, co
         seen_generation_ = generation;
         by_address_.clear(); entries_.clear(); resident_ = 0;
     }
+    const auto same_key = [&](const Entry& entry) {
+        return entry.address == address && entry.desc.width == desc.width && entry.desc.height == desc.height && entry.desc.format == desc.format &&
+               entry.desc.levels == desc.levels && entry.format == palette.format && same_bytes(entry.palette, palette.bytes);
+    };
+    // The pixel bytes are compared only when a guest store touched their pages since the last comparison (gx_write_watch.h), and anyway every
+    // 256th use as a net for native writers that miss the barrier.
+    const auto current = [&](Entry& entry) {
+        if (!written_since(address, required, entry.stamp) && entry.skips < 256) { ++entry.skips; return true; }
+        if (same_bytes(entry.encoded, pixels)) { entry.stamp = watch_stamp(); entry.skips = 0; return true; }
+        return false;
+    };
+    // The two most recently used entries first (the list is in use order): a draw's textures are mostly the previous draw's. An entry that
+    // matches and is current is the one the search below finds (two entries of one key never hold the same bytes).
+    {
+        auto it = entries_.begin();
+        for (int recent = 0; recent < 2 && it != entries_.end(); ++recent, ++it) {
+            if (!same_key(*it)) continue;
+            if (!current(*it)) break;   // the bytes changed: the search decides (another entry, or a new one)
+            auto result = it->pixels;
+            entries_.splice(entries_.begin(), entries_, it);
+            return result;
+        }
+    }
     const auto candidates = by_address_.equal_range(address);
     for (auto candidate = candidates.first; candidate != candidates.second; ++candidate) {
         const auto it = candidate->second;
-        if (it->address == address && it->desc.width == desc.width && it->desc.height == desc.height &&
-            it->desc.format == desc.format && it->desc.levels == desc.levels && it->format == palette.format &&
-            same_bytes(it->palette, palette.bytes)) {
-            // The pixel bytes are compared only when a guest store touched their pages since the last comparison (gx_write_watch.h), and anyway every
-            // 256th use as a net for native writers that miss the barrier.
-            if (!written_since(address, required, it->stamp) && it->skips < 256) ++it->skips;
-            else if (same_bytes(it->encoded, pixels)) { it->stamp = watch_stamp(); it->skips = 0; }
-            else continue;
+        if (same_key(*it)) {
+            if (!current(*it)) continue;
             auto result = it->pixels;
             entries_.splice(entries_.begin(), entries_, it);
             return result;

@@ -239,3 +239,100 @@ whole packet (a diagnostic) saved 1.3 of the 2.2 ms, viewport/push constants/dyn
 
 Harness note: frame captures accumulate in the app's private folder on the headset across runs (3.8 GB here); past ~600 MB the pull
 in `scripts/quest/run.py` times out and runs come back without `captures.tar`. Clear `files/.codex-xr-<id>/captures` now and then.
+
+## CPU: host side (waits, IO, HLE) (2026-11-03, branch quest-cpu-host)
+
+Question: the game is CPU-bound on the headset (guest thread ~31 ms a game frame). How much of that is host code (HLE, GX recording,
+scheduling, audio, IO, locks, copies) and the render thread, and what of it is unnecessary? (The translated code itself is the translator
+work, not this section.)
+
+Method: the deterministic `fightvr` replay at render scale 1 (CPU-bound: identical guest work, "wall ms per game second" over retraces
+8450-9352, base 3571/3573 ms, run-to-run ~0.1-1%) with `simpleperf record --call-graph fp` (4 kHz, 15 s) and `--call-graph dwarf`
+(1 kHz, 8 s) inside the fight window, per-thread `/proc/<pid>/task/<tid>/{stat,schedstat,status}` 15 s apart, and the game's `[gxtime]`,
+`[sched]`, `[profile]` lines. Scripts (not in the repository): `/tmp/qch/dbench.sh`, `dprof.sh`, `dstat.sh`, `ab.sh`, `detcmp.py`.
+
+### Where the CPU goes (8dcb08f)
+
+- The app runs on cores 3-5 (3 of the 6). In the window the guest thread is on a core ~87% of the time (runqueue wait 2%, kernel time 1%,
+  ~1000 minor page faults a second), the render thread ~52%; nothing else is above 2%. The cores are not saturated (37-56% each).
+- The guest holds the baton the whole window (`[sched]` #1 ~970 ms a second), but `[detbench]` counts only ~2900 ms of guest CPU per
+  ~3600-4000 ms game second: `[sched]` counts the deterministic idle wait (below) as run time.
+- Guest thread by code (fp profile, self time): translated code 58%, host code 27%, libc 9% (memcpy 4.1, memcmp 1.9, malloc/free ~2.5,
+  mostly called by the host code), SDK math HLE 4%. Host code by entry (dwarf profile, inclusive): `hle_ResMeshDraw` 12.5% (17k calls a
+  second, ~5 us each: mesh-cache and texture-cache hash lookups, copy-on-write of the 1-2 KB state/transform/uniform blocks, the shared_ptr
+  reference counts of every draw), `hle_GXCallDisplayList` 6.1% (540 calls, 12k draws, 64k vertices a second, ~80 us a call: vertex
+  decode, per-draw blocks), the FIFO write path ~5.5% (on the order of a million guest stores a second, by its share and cost per store, through `mmio_write` -> `FifoSink` -> `gx_fifo_write`,
+  most of them display-list recording), `hle_GXBegin` 4.3%, the `_savegpr/_restgpr` helpers 4.2%, texture snapshots 2.0%, material and state
+  snapshots 3.5%, `hle_GXEndDisplayList` 1.4% (mostly freeing the replaced recording), the AX mixer ~2% in live play (muted replays mix too).
+- **The game records its display lists again every frame and calls each once.** A cache of decoded list geometry (tried) never hit
+  (0 of 12k draws a second) and cost ~20 us per call to fill; removed. So every recorded primitive is paid for three times a frame:
+  recording (FIFO path + a 5 KB snapshot per primitive), the copy at GXEndDisplayList, the import at the call.
+- Render thread in the replays: `draw_bounds_ndc` 16% and `eye_extent` 3.6% are the `UC_GPU_PACKETS` diagnostics that `dbench.sh` turns on;
+  `test_frame_json` 8% (the test server formatted the frame state, dozens of floats, on every main-loop pass, ~800 a second; bionic's float
+  formatting takes a global lock, which is most of the render thread's `pthread_mutex_*` samples); `pipeline_for` 2.7% (a mutex and a
+  `std::map` search over 280-byte keys per draw); the per-packet texture set 4.5% (hash inserts, 8 per draw).
+- Waits: the guest never blocks on the packet window or the frames-in-flight limit in the replay (`[guest-blocked]` ~0 ms in the window).
+  The wait that is left is the deterministic draw-done: a replay delivers `GXDrawDone` when the GPU completes the packet, live and network
+  play when the render thread submits it (S15). **It is ~14% of the replay's wall time**: the same build with `UC_FINISH_AT_SUBMIT=1`
+  (same guest work: 151960 draws in the last game second either way, guest CPU 2903 / 2966 ms) takes 2999 instead of 3497 ms a game
+  second, and wall is then ~91% guest CPU. The replay's render thread is on that critical path, and with `UC_GPU_PACKETS` (dbench.sh)
+  it spends ~24% in the diagnostics (`draw_bounds_ndc`, `eye_extent`). So the replay overstates the live frame and understates what
+  render-thread savings give live; for live 60 fps the guest's CPU per frame is the number (~26 ms now).
+- Thread switches: ~920 a second in live play (the audio and streaming threads), each ~19 us from notify to running (`[sched] avg wake`):
+  ~1.8% of the guest's wall time goes to handing the baton between host threads. In the replay (muted) ~180 a second.
+- IO: DVD reads are asynchronous on their own worker thread (one `ifstream` per read, ~700 reads and 69 MB in the whole replay); nothing in
+  the fight window. Logging: no per-frame formatting on the guest thread outside `--profile` (`[gxtime]` timers are two clock reads per
+  native draw call with `--profile`, which the replays use).
+
+### Changes
+
+| commit | what |
+|---|---|
+| 4231bad | display-list recording into presized buffers (memcpy instead of per-byte `push_back`), the recorded draw filled in place, replaced recordings freed on a helper thread and only overlapping ones searched; `_savegpr` family: one range check and one write-watch mark per save area; AX mixer on locals (the parameter block read once and written back once); `gx::Memory::read` fast path inline; `written_since` as a vectorisable maximum; audit flags tested inline; default `gx::Shared` without a reference count; TextureCache tries its two most recent entries before hashing; draw-queue arena chunks pooled |
+| a43bf7c | condition variables notified only when a thread waits (packets ready/space, scheduler external events): a notify is a futex system call on Android |
+| 51ba440 | test-server frame state built only when sent; `pipeline_for` memo of the last specialized pipeline; fewer texture-set inserts; `UC_FINISH_AT_SUBMIT` diagnostic |
+
+Results, fightvr replay at render scale 1 (wall ms per game second, alternating runs on the headset, GPU at 545 MHz in all):
+
+| build | runs | mean |
+|---|---|---|
+| 8dcb08f | 3571, 3573, 3568, 3568, 3570 | 3570 |
+| 4231bad..51ba440 (v7) | 3512, 3497 | 3505 (**-1.8%**, outside the base's 0.1% spread) |
+| an intermediate (v2: recording buffer, mixer, Memory::read, written_since, Shared, test server, plus the list cache) | 3595, 3567 | 3581 (+0.3%: the list cache cost what the rest saved) |
+
+`[gxtime]` (with --profile): display-list calls 77.6 -> 75.0 us, mesh calls 5.13 -> 5.11 us. Guest thread profile after (v7, same
+method): host code 26.8% (27.2), `_savegpr` family 3.1% (4.2), `hle_ResMeshDraw` self 3.6% (4.4), `gx_fifo_write` 2.8% (3.7),
+`gx::Memory::read` and `hle_GXEndDisplayList` gone from the list, render thread without `test_frame_json`. Mac `sample` of the same window
+(fightmac, 10 s, top-of-stack samples): `gx_fifo_write` 108 -> 90, `import_resource` 62 -> 39, `hle_ResMeshDraw` 59 -> 45, SaveGpr25/26
+36 -> 17, `pipeline_for` 38 -> 15, `test_frame_json` 39 -> 7.
+
+Live train fight on the headset (`uctest run fight --quest --god --measure 30 --fight-fps-limit 0`, render scale 1, audio on), harness
+FPS over the active window, two alternating pairs: base 29.2 / 28.8, this branch 36.4 / 29.7 (p50 20 or 40). Live runs vary 7-13% and
+the frame rate is quantised (20/30/40 at the game's pacing): no live gain can be claimed beyond the replay's ~2%. The render-thread part
+(pipeline lookups; the test-server JSON exists only in harness runs) can matter more live than in the
+replay because live play waits for the render thread's submission of the draw-done packet.
+
+Determinism: `fightmac` replayed on the Mac with `--det-out` (guest memory hashed every retrace) by 8dcb08f and by this branch: identical
+over all 9226 retraces. 198/198 tests (test_ax_audio compares the new mixer with the old one on 3000 random voices; test_sdk_regs_hle 0
+mismatches in 1440 runs). Mac (`uctest bench --demo fightmac --runs 3`, rounds 2-3): 15.40/15.35 -> 15.05/15.04 s wall, guest Mcycles
+8219/8197 -> 8003/8026 (-2.4%).
+
+Tried and dropped: the decoded display-list geometry cache (above). Not done (each under ~0.3% by the profile): lazily copied palette and
+EFB-copy maps in `GXCallDisplayList`, a cheaper state snapshot, an LRU without list splices in the mesh cache.
+
+### What this means for 60 fps
+
+- The guest's translated code (with the register helpers) is ~58% of its thread and the host code ~27% (libc 9%, SDK math 4%): with
+  every host cost gone the guest would still be ~16 ms of its ~26 ms a frame at this fight. 60 fps needs the translator work and the structural host items below together.
+- Display lists recorded every frame and called once: the recording (FIFO path, a 5 KB snapshot per primitive, the copy at the end) and
+  the import at the call are the same work for the same bytes each frame. Recognising a re-recorded list whose bytes and recorded state
+  equal the previous recording, and reusing its native draws, would remove most of `GXBegin` (recording), `gx_fifo_write` and
+  `GXCallDisplayList` (~10-15% of the guest thread together).
+- FIFO stores: each of them (about a million a second) goes translated store -> `mmio_write` -> virtual `FifoSink::write` -> `gx_fifo_write`. A translator-side
+  direct call for stores to 0xCC008000 (or batching consecutive stores) would cut the per-store overhead.
+- Per-draw state blocks: `gx::State` 1 KB, `Transforms` 1.9 KB, `DrawUniform` 1.8 KB are compared (memcmp 1.8%) and copied (part of
+  memcpy 3.9%) per mesh, and each draw holds ~6-8 shared_ptrs whose reference counts both the guest (building) and the render thread
+  (destroying) touch. Smaller blocks (the rows that changed) or frame-owned indices instead of shared_ptrs are the next step there.
+- Guest threads on one host thread (fibres instead of a host thread each): the ~19 us baton handoff, ~920 a second live.
+- The replay bench: without `UC_GPU_PACKETS` (or with the per-packet area estimate made cheap) its render thread stops inflating the
+  draw-done wait; `UC_FINISH_AT_SUBMIT=1` measures the guest+render CPU path as live play has it.
