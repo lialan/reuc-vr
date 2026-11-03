@@ -32,6 +32,13 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES 
     add_compile_options(-mcpu=${UC_TARGET_CPU})
   endif()
 endif()
+if(ANDROID)
+  # The game is one shared library (libmain.so, -fPIC): with default visibility every call between its functions could be interposed,
+  # so the translated code called its own functions through the PLT (3% of the Quest's CPU samples) and the compiler could not inline
+  # across them. Bind them locally; the exports (SDL_main, JNI) stay.
+  add_compile_options(-fno-semantic-interposition)
+  add_link_options(-Wl,-Bsymbolic-functions)
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wno-deprecated-declarations)   # "unsafe CRT function" (getenv, fopen), winsock and std::filesystem::u8path notes in the tools and third-party code are noise
 endif()

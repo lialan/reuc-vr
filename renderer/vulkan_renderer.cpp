@@ -3227,7 +3227,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 static uint64_t cull_tested=0, cull_draws=0, cull_indices=0, all_indices=0; static auto cull_since=std::chrono::steady_clock::now();
                 static float reach[2]={0,0};   // the eyes' largest extent in the game's clip space (vr_cull.h eye_extent) over the period
                 all_indices+=info.index_count;
-                if (kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen)
+                static const bool cull_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;   // the [vr-cull] line (the eyes' reach is diagnostics only: a per-draw cost)
+                if (cull_stats && kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen)
                     for (int eye=0;eye<2;++eye) { const auto e=uc::eye_extent(block+16*eye); reach[0]=std::max(reach[0],e[0]); reach[1]=std::max(reach[1],e[1]); }
                 if (!no_cull && !probe_mono && kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer) {
                     ++cull_tested;
@@ -3249,7 +3250,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                         culled=true;
                     }
                 }
-                if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
+                if (cull_stats && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
                     std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds, %llu pipeline binds, %llu second destination-alpha draws\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_,(unsigned long long)pipeline_binds_,(unsigned long long)alpha_passes_);
                     cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=alpha_passes_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
