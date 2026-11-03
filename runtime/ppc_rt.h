@@ -81,8 +81,8 @@ PPC_INLINE uint32_t rd8_ram(Ctx& c, uint32_t ea) { return *hp(c, ea); }
 PPC_INLINE void wr32_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] gx::note_write(ea + 3); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
 PPC_INLINE void wr16_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] gx::note_write(ea + 1); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_ram(Ctx& c, uint32_t ea, uint32_t v) { gx::note_write(ea); *hp(c, ea) = uint8_t(v); }
-PPC_INLINE void wr32_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
-PPC_INLINE void wr16_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_range(ea,2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
+PPC_INLINE void wr32_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_access(ea,4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
+PPC_INLINE void wr16_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_access(ea,2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_stack(Ctx& c, uint32_t ea, uint32_t v) { uc::rollback_note_write(ea); *hp(c, ea) = uint8_t(v); }
 PPC_INLINE float rdf32(Ctx& c, uint32_t ea) { uint32_t b = rd32(c, ea); float f; std::memcpy(&f, &b, 4); return f; }
 PPC_INLINE double rdf64(Ctx& c, uint32_t ea) {
@@ -321,7 +321,7 @@ PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea
 PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32(c, e, float(c.f[t])); c.r[a] = e; }
 PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32(c, ea_x(c, a, b), float(c.f[t])); }
 PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32(c, e, float(c.f[t])); c.r[a] = e; }
-PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { gx::note_write(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(e + 7); } else uc::rollback_note_range(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64(c, e, c.f[t]); }
+PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { gx::note_write(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(e + 7); } else uc::rollback_note_access(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64(c, e, c.f[t]); }
 PPC_INLINE void op_stfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf64(c, e, c.f[t]); c.r[a] = e; }
 PPC_INLINE void op_stfdx(Ctx& c, int t, int a, int b) { wrf64(c, ea_x(c, a, b), c.f[t]); }
 PPC_INLINE void op_stfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf64(c, e, c.f[t]); c.r[a] = e; }
@@ -427,7 +427,7 @@ PPC_INLINE void op_ps_cmpo1(Ctx& c, int f, int a, int b) { fcmp(c, f, c.ps1[a], 
 
 // ---- quantized load/store (GQR: LD_SCALE bits 24-29, LD_TYPE 16-18, ST_SCALE 8-13, ST_TYPE 0-2; types 4=u8 5=u16 6=s8 7=s16, else float) ----
 // 2^e for e in -32..32 (the GQR scale range plus its negation): exact, and a table read instead of a libm call per quantized element.
-inline const std::array<double, 65> kGqPow2 = [] { std::array<double, 65> t{}; for (int e = -32; e <= 32; ++e) t[size_t(e + 32)] = std::ldexp(1.0, e); return t; }();
+UC_IMAGE_LOCAL inline const std::array<double, 65> kGqPow2 = [] { std::array<double, 65> t{}; for (int e = -32; e <= 32; ++e) t[size_t(e + 32)] = std::ldexp(1.0, e); return t; }();
 PPC_INLINE double gq_pow2(int e) { return kGqPow2[size_t(e + 32)]; }
 PPC_INLINE int gq_scale(uint32_t v) { int s = int(v & 0x3F); return s & 0x20 ? s - 64 : s; }
 PPC_INLINE int gq_bytes(int type) { return (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4; }
@@ -465,8 +465,24 @@ PPC_INLINE void ps_store_pair(uint8_t* p, PsDoublePair v) {
 }
 // An access of n bytes at ea touches MMIO (one compare instead of one per word).
 PPC_INLINE bool touches_mmio(uint32_t ea, uint32_t n) { return ea - (0xCC000000u - (n - 1)) < 0x02000000u + (n - 1); }
+// The quantized (and MMIO) cases out of line: inlined at every psq_l/psq_st they made a paired-single function several times larger than
+// its hot path (fn_802647AC: ~70 KB of code for 102 guest instructions). They take the guest memory base, not the context, so a translated
+// function's local register copy does not escape.
+[[gnu::noinline, gnu::cold]] inline PsDoublePair psq_load_slow(uint8_t* mem, uint32_t ea, int w, uint32_t g) {
+    Ctx t; t.mem = mem;
+    const int type = (g >> 16) & 7, scale = gq_scale(g >> 24);
+    const double p0 = gq_load1(t, ea, type, scale);
+    const double p1 = w ? 1.0 : gq_load1(t, ea + gq_bytes(type), type, scale);
+    return {p0, p1};
+}
+[[gnu::noinline, gnu::cold]] inline void psq_store_slow(uint8_t* mem, uint32_t ea, int w, uint32_t g, double p0, double p1) {
+    Ctx t; t.mem = mem;
+    const int type = g & 7, scale = gq_scale(g >> 8);
+    gq_store1(t, ea, type, scale, p0);
+    if (!w) gq_store1(t, ea + gq_bytes(type), type, scale, p1);
+}
 PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = false) {
-    uint32_t g = c.gqr[i]; int type = (g >> 16) & 7, scale = gq_scale(g >> 24);
+    const uint32_t g = c.gqr[i]; const int type = (g >> 16) & 7;
     if (type < 4 && w && (ram || !is_mmio(ea))) [[likely]] {   // single float: ps1 reads as 1.0
         const uint32_t bits = rd32_ram(c, ea); float f; std::memcpy(&f, &bits, 4);
         c.f[t] = f; c.ps1[t] = 1.0; return;
@@ -475,23 +491,21 @@ PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = fa
         const PsDoublePair v = ps_load_pair(hp(c, ea));
         c.f[t] = v[0]; c.ps1[t] = v[1]; return;
     }
-    double p0 = gq_load1(c, ea, type, scale);
-    double p1 = w ? 1.0 : gq_load1(c, ea + gq_bytes(type), type, scale);
-    c.f[t] = p0; c.ps1[t] = p1;
+    const PsDoublePair v = psq_load_slow(c.mem, ea, w, g);
+    c.f[t] = v[0]; c.ps1[t] = v[1];
 }
 PPC_INLINE void psq_store(Ctx& c, int t, uint32_t ea, int w, int i, bool stack = false) {
-    uint32_t g = c.gqr[i]; int type = g & 7, scale = gq_scale(g >> 8);
+    const uint32_t g = c.gqr[i]; const int type = g & 7;
     if (type < 4 && w && (stack || !is_mmio(ea))) [[likely]] {   // single float
         const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4);
         if (stack) wr32_stack(c, ea, bits); else wr32_ram(c, ea, bits); return;
     }
     if (type < 4 && !w && (stack || !touches_mmio(ea, 8))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
         if (!stack) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(ea + 7); }
-        else uc::rollback_note_range(ea,8);
+        else uc::rollback_note_access(ea,8);
         ps_store_pair(hp(c, ea), ps_pair(c, t)); return;
     }
-    gq_store1(c, ea, type, scale, c.f[t]);
-    if (!w) gq_store1(c, ea + gq_bytes(type), type, scale, c.ps1[t]);
+    psq_store_slow(c.mem, ea, w, g, c.f[t], c.ps1[t]);
 }
 PPC_INLINE void op_psq_l(Ctx& c, int t, int a, int32_t d, int w, int i) { psq_load(c, t, ea_d(c, a, d), w, i, ram_base(a)); }
 PPC_INLINE void op_psq_lu(Ctx& c, int t, int a, int32_t d, int w, int i) { uint32_t e = c.r[a] + uint32_t(d); psq_load(c, t, e, w, i); c.r[a] = e; }

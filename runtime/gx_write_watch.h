@@ -8,8 +8,8 @@ namespace gx {
 // holding a copy of guest memory can skip re-reading it when no store touched the pages since it last verified them. Written only by the thread
 // holding the guest baton; the native code that reads it runs on that thread too, while no guest code executes.
 inline constexpr uint32_t kWatchPages = 1u << 18;   // 1 GiB of guest address space / 4 KiB
-inline uint32_t write_epoch = 2;
-inline uint32_t page_epoch[kWatchPages];
+UC_IMAGE_LOCAL inline uint32_t write_epoch = 2;
+UC_IMAGE_LOCAL inline uint32_t page_epoch[kWatchPages];
 
 inline void note_write(uint32_t address) { page_epoch[(address & 0x3FFFFFFFu) >> 12] = write_epoch; uc::rollback_note_write(address); }
 inline void note_write_range(uint32_t address, size_t size) {

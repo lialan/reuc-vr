@@ -6,11 +6,12 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "host_compat.h"
 
 namespace uc {
 // Guest baton owns this tracker, including native HLE writes. Independent of GX cache epochs.
-inline uint8_t* rollback_memory_base=nullptr;
-inline std::array<uint8_t,1u<<18> rollback_dirty{};
+UC_IMAGE_LOCAL inline uint8_t* rollback_memory_base=nullptr;
+UC_IMAGE_LOCAL inline std::array<uint8_t,1u<<18> rollback_dirty{};
 inline void rollback_note_write(uint32_t address) {
     if(rollback_memory_base) rollback_dirty[(address&0x3FFFFFFFu)>>12]=1;
 }
@@ -18,6 +19,14 @@ inline void rollback_note_range(uint32_t address,size_t size) {
     if(!rollback_memory_base || !size) return;
     const uint64_t first=(address&0x3FFFFFFFu)>>12,last=((address&0x3FFFFFFFu)+uint64_t(size)-1)>>12;
     for(uint64_t page=first;page<=last && page<rollback_dirty.size();++page) rollback_dirty[page]=1;
+}
+// rollback_note_range for one guest access of 1..8 bytes (at most two pages): the general loop became a memset call at every stack store
+// of the translated code, which kept a call (and its register saves) on the path of every function's prologue.
+inline void rollback_note_access(uint32_t address,uint32_t size) {
+    if(!rollback_memory_base) return;
+    const uint32_t first=(address&0x3FFFFFFFu)>>12,last=uint32_t(((address&0x3FFFFFFFu)+uint64_t(size)-1)>>12);
+    rollback_dirty[first]=1;
+    if(last!=first && last<rollback_dirty.size()) rollback_dirty[last]=1;
 }
 inline void rollback_note_pointer(const uint8_t* pointer,size_t size) {
     if(rollback_memory_base) rollback_note_range(uint32_t(uintptr_t(pointer)-uintptr_t(rollback_memory_base)),size);
