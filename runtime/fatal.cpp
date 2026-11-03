@@ -1,5 +1,6 @@
 #include "fatal.h"
 #include "crash_report.h"
+#include "fastmem.h"
 #include "guest_mem.h"
 #include "trace.h"
 #include <cstdarg>
@@ -117,6 +118,7 @@ void install_crash_handlers() {
     sigemptyset(&action.sa_mask);
     for (int signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(signal, &action, nullptr);
 #endif
+    fastmem_install();   // in front of crash_signal: MMIO accesses are performed, every other fault reaches it as before
     std::set_terminate(terminate_handler);
 }
 

@@ -35,7 +35,7 @@ struct RollbackMemory::Snapshot {
 };
 RollbackMemory::RollbackMemory(uint8_t* memory):memory_(memory) {
     if(!memory || rollback_memory_base) throw std::logic_error("rollback memory tracker already active or invalid");
-    rollback_memory_base=memory; rollback_dirty.fill(0);
+    rollback_memory_base=memory; mark_clean();
 }
 RollbackMemory::~RollbackMemory() { rollback_memory_base=nullptr; }
 std::shared_ptr<const RollbackMemory::Snapshot> RollbackMemory::capture(bool verify_writes) {
@@ -47,7 +47,7 @@ std::shared_ptr<const RollbackMemory::Snapshot> RollbackMemory::capture(bool ver
     for(const auto [base,size]:regions) for(size_t offset=0;offset<size;offset+=page_size,++index) {
         const auto address=base+uint32_t(offset);
         if(index%pages_per_block==0) writable.reset();
-        if(current_ && !rollback_dirty[address>>12]) {
+        if(current_ && !dirty(address)) {
             const auto& page=current_->page(index);
             if(verify_writes && std::memcmp(page->bytes.data(),memory_+address,page_size)!=0) {
                 char message[80]; std::snprintf(message,sizeof(message),"untracked rollback write in page %08X",address);
@@ -64,17 +64,17 @@ std::shared_ptr<const RollbackMemory::Snapshot> RollbackMemory::capture(bool ver
             writable->pages[index%pages_per_block]=std::move(page);
         }
     }
-    current_=saved; rollback_dirty.fill(0); return saved;
+    current_=saved; mark_clean(); return saved;
 }
 void RollbackMemory::restore(const Snapshot& saved) {
     if(saved.owner!=this) throw std::logic_error("rollback memory snapshot belongs to another tracker");
     size_t index=0;
     for(const auto [base,size]:regions) for(size_t offset=0;offset<size;offset+=page_size,++index) {
         const auto address=base+uint32_t(offset);
-        if(!current_ || saved.page(index)!=current_->page(index) || rollback_dirty[address>>12])
+        if(!current_ || saved.page(index)!=current_->page(index) || dirty(address))
             std::memcpy(memory_+address,saved.page(index)->bytes.data(),page_size);
     }
-    current_=std::make_shared<Snapshot>(saved); rollback_dirty.fill(0);
+    current_=std::make_shared<Snapshot>(saved); mark_clean();
 }
 std::string RollbackMemory::difference(const Snapshot& a,const Snapshot& b) {
     size_t index=0;

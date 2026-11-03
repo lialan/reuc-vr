@@ -45,4 +45,7 @@ MmioBus& mmio_bus();
 // range search of the bus. direct: they go straight to uc::gx_fifo_store (gx_fifo.h) instead of the device (which keeps the audit hooks).
 void mmio_set_gx_fifo(MmioDevice* device, bool direct = false);
 uint64_t mmio_gx_fifo_direct_bytes();   // bytes the direct path took (the device counts its own)
+// Guest MMIO accesses so far (runtime/platform.cpp): reads, writes other than the FIFO's, FIFO writes (explicit calls and fastmem faults alike).
+struct MmioCounts { uint64_t reads, writes, fifo_writes; };
+MmioCounts mmio_counts();
 }  // namespace uc

@@ -56,7 +56,7 @@ PPC_INLINE void guest_note_stack(uint32_t, uint32_t) {}
 PPC_INLINE void guest_note_range(uint32_t, uint32_t) {}
 #else
 PPC_INLINE void guest_note(uint32_t ea) { gx::note_write(ea); }
-PPC_INLINE void guest_note_stack(uint32_t ea, uint32_t n) { uc::rollback_note_access(ea, n); }
+PPC_INLINE void guest_note_stack(uint32_t ea, uint32_t n) { gx::note_access(ea, n); }
 PPC_INLINE void guest_note_range(uint32_t ea, uint32_t n) { gx::note_write_range(ea, n); }
 #endif
 PPC_INLINE bool is_mmio(uint32_t ea) { return ea - 0xCC000000u < 0x02000000u; }
@@ -67,29 +67,65 @@ PPC_INLINE uint8_t* hp(Ctx& c, uint32_t ea) { return c.mem + ea; }
 PPC_INLINE bool ram_base(int a) { return a == 1 || a == 2 || a == 13; }
 PPC_INLINE bool stack_base(int a) { return a == 1; }
 
-PPC_INLINE uint32_t rd32(Ctx& c, uint32_t ea) {
-    if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 4);
-    uint32_t v; std::memcpy(&v, hp(c, ea), 4); return uc_bswap32(v);
+// fastmem (UC_FASTMEM, the default on macOS and Android arm64; -DUC_FASTMEM=OFF restores the test): an access needs no MMIO test. The
+// hardware-register window is part of the inaccessible guest reservation, so an access whose address reaches it faults and
+// runtime/fastmem.cpp performs it through mmio_read/mmio_write (decoding the faulting host instruction). Where the compiler proves the
+// address is in the window (a `lis rX,0xCC01` base: the GX FIFO stores, ~4 million a game second in the train fight) or the translator
+// marked the base register as one (IO below) the call stays explicit: a fault each would cost far more than the call. The other accesses
+// are volatile, so the compiler never merges, splits, drops or reorders them (the FIFO takes every store; a merged pair of 2-byte
+// stores would reach a device as one 4-byte write).
+#ifndef UC_FASTMEM
+#if defined(__aarch64__) && (defined(__APPLE__) || defined(__linux__))
+#define UC_FASTMEM 1
+#else
+#define UC_FASTMEM 0
+#endif
+#endif
+#if UC_FASTMEM
+// (The test is spelled out: clang folds __builtin_constant_p of a function call to false before inlining.)
+template <bool IO = false> PPC_INLINE bool mmio_route(uint32_t ea) { return IO ? is_mmio(ea) : __builtin_constant_p(ea - 0xCC000000u < 0x02000000u) && is_mmio(ea); }
+// may_alias: guest bytes are untyped (a float stored by stfs is read back by lwz). A store is also a compiler barrier: the device code the
+// fault handler runs (the GX FIFO path) may change memory, as the explicit mmio_write call could.
+template <class T> PPC_INLINE T guest_load(const uint8_t* p) { using U __attribute__((aligned(1), may_alias)) = T; return *reinterpret_cast<const volatile U*>(p); }
+template <class T> PPC_INLINE void guest_store(uint8_t* p, T v) {
+    using U __attribute__((aligned(1), may_alias)) = T; *reinterpret_cast<volatile U*>(p) = v; asm volatile("" ::: "memory");
 }
-PPC_INLINE uint32_t rd16(Ctx& c, uint32_t ea) {
-    if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 2);
-    uint16_t v; std::memcpy(&v, hp(c, ea), 2); return uc_bswap16(v);
+#else
+template <bool IO = false> PPC_INLINE bool mmio_route(uint32_t ea) { return is_mmio(ea); }
+template <class T> PPC_INLINE T guest_load(const uint8_t* p) { T v; std::memcpy(&v, p, sizeof v); return v; }
+template <class T> PPC_INLINE void guest_store(uint8_t* p, T v) { std::memcpy(p, &v, sizeof v); }
+#endif
+// An access of n bytes at ea touches MMIO (one compare instead of one per word).
+PPC_INLINE bool touches_mmio(uint32_t ea, uint32_t n) { return ea - (0xCC000000u - (n - 1)) < 0x02000000u + (n - 1); }
+#if UC_FASTMEM
+template <bool IO = false> PPC_INLINE bool mmio_route_n(uint32_t ea, uint32_t n) { return IO ? touches_mmio(ea, n) : __builtin_constant_p(ea - (0xCC000000u - (n - 1)) < 0x02000000u + (n - 1)) && touches_mmio(ea, n); }
+#else
+template <bool IO = false> PPC_INLINE bool mmio_route_n(uint32_t ea, uint32_t n) { return touches_mmio(ea, n); }
+#endif
+
+template <bool IO = false> PPC_INLINE uint32_t rd32(Ctx& c, uint32_t ea) {
+    if (mmio_route<IO>(ea)) [[unlikely]] return mmio_read(ea, 4);
+    return uc_bswap32(guest_load<uint32_t>(hp(c, ea)));
 }
-PPC_INLINE uint32_t rd8(Ctx& c, uint32_t ea) {
-    if (is_mmio(ea)) [[unlikely]] return mmio_read(ea, 1);
-    return *hp(c, ea);
+template <bool IO = false> PPC_INLINE uint32_t rd16(Ctx& c, uint32_t ea) {
+    if (mmio_route<IO>(ea)) [[unlikely]] return mmio_read(ea, 2);
+    return uc_bswap16(guest_load<uint16_t>(hp(c, ea)));
 }
-PPC_INLINE void wr32(Ctx& c, uint32_t ea, uint32_t v) {
-    if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 4, v); return; }
-    guest_note(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] guest_note(ea + 3); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4);
+template <bool IO = false> PPC_INLINE uint32_t rd8(Ctx& c, uint32_t ea) {
+    if (mmio_route<IO>(ea)) [[unlikely]] return mmio_read(ea, 1);
+    return guest_load<uint8_t>(hp(c, ea));
 }
-PPC_INLINE void wr16(Ctx& c, uint32_t ea, uint32_t v) {
-    if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 2, v & 0xFFFF); return; }
-    guest_note(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] guest_note(ea + 1); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2);
+template <bool IO = false> PPC_INLINE void wr32(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 4, v); return; }
+    guest_note(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] guest_note(ea + 3); guest_store<uint32_t>(hp(c, ea), uc_bswap32(v));
 }
-PPC_INLINE void wr8(Ctx& c, uint32_t ea, uint32_t v) {
-    if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 1, v & 0xFF); return; }
-    guest_note(ea); *hp(c, ea) = uint8_t(v);
+template <bool IO = false> PPC_INLINE void wr16(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 2, v & 0xFFFF); return; }
+    guest_note(ea); if ((ea & 0xFFFu) == 0xFFFu) [[unlikely]] guest_note(ea + 1); guest_store<uint16_t>(hp(c, ea), uc_bswap16(uint16_t(v)));
+}
+template <bool IO = false> PPC_INLINE void wr8(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 1, v & 0xFF); return; }
+    guest_note(ea); guest_store<uint8_t>(hp(c, ea), uint8_t(v));
 }
 PPC_INLINE uint32_t rd32_ram(Ctx& c, uint32_t ea) { uint32_t v; std::memcpy(&v, hp(c, ea), 4); return uc_bswap32(v); }
 PPC_INLINE uint32_t rd16_ram(Ctx& c, uint32_t ea) { uint16_t v; std::memcpy(&v, hp(c, ea), 2); return uc_bswap16(v); }
@@ -100,16 +136,16 @@ PPC_INLINE void wr8_ram(Ctx& c, uint32_t ea, uint32_t v) { guest_note(ea); *hp(c
 PPC_INLINE void wr32_stack(Ctx& c, uint32_t ea, uint32_t v) { guest_note_stack(ea,4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
 PPC_INLINE void wr16_stack(Ctx& c, uint32_t ea, uint32_t v) { guest_note_stack(ea,2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_stack(Ctx& c, uint32_t ea, uint32_t v) { guest_note_stack(ea, 1); *hp(c, ea) = uint8_t(v); }
-PPC_INLINE float rdf32(Ctx& c, uint32_t ea) { uint32_t b = rd32(c, ea); float f; std::memcpy(&f, &b, 4); return f; }
-PPC_INLINE double rdf64(Ctx& c, uint32_t ea) {
-    if (is_mmio(ea)) [[unlikely]] { uint64_t hi = mmio_read(ea, 4), lo = mmio_read(ea + 4, 4); uint64_t b = hi << 32 | lo; double d; std::memcpy(&d, &b, 8); return d; }
-    uint64_t v; std::memcpy(&v, hp(c, ea), 8); v = uc_bswap64(v); double d; std::memcpy(&d, &v, 8); return d;
+template <bool IO = false> PPC_INLINE float rdf32(Ctx& c, uint32_t ea) { uint32_t b = rd32<IO>(c, ea); float f; std::memcpy(&f, &b, 4); return f; }
+template <bool IO = false> PPC_INLINE double rdf64(Ctx& c, uint32_t ea) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { uint64_t hi = mmio_read(ea, 4), lo = mmio_read(ea + 4, 4); uint64_t b = hi << 32 | lo; double d; std::memcpy(&d, &b, 8); return d; }
+    uint64_t v = uc_bswap64(guest_load<uint64_t>(hp(c, ea))); double d; std::memcpy(&d, &v, 8); return d;
 }
-PPC_INLINE void wrf32(Ctx& c, uint32_t ea, float v) { uint32_t b; std::memcpy(&b, &v, 4); wr32(c, ea, b); }
-PPC_INLINE void wrf64(Ctx& c, uint32_t ea, double v) {
+template <bool IO = false> PPC_INLINE void wrf32(Ctx& c, uint32_t ea, float v) { uint32_t b; std::memcpy(&b, &v, 4); wr32<IO>(c, ea, b); }
+template <bool IO = false> PPC_INLINE void wrf64(Ctx& c, uint32_t ea, double v) {
     uint64_t b; std::memcpy(&b, &v, 8);
-    if (is_mmio(ea)) [[unlikely]] { mmio_write(ea, 4, uint32_t(b >> 32)); mmio_write(ea + 4, 4, uint32_t(b)); return; }
-    guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); b = uc_bswap64(b); std::memcpy(hp(c, ea), &b, 8);
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 4, uint32_t(b >> 32)); mmio_write(ea + 4, 4, uint32_t(b)); return; }
+    guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); guest_store<uint64_t>(hp(c, ea), uc_bswap64(b));
 }
 
 PPC_INLINE uint32_t ea_d(Ctx& c, int a, int32_t d) { return (a ? c.r[a] : 0u) + uint32_t(d); }
@@ -284,21 +320,24 @@ PPC_INLINE void op_twi(Ctx& c, int, int, int32_t) { (void)c; }
 // ---- loads and stores ----
 #define PPC_ID(x) (x)
 #define PPC_SX16(x) (uint32_t(int32_t(int16_t(x))))
+// IO (translator: the base register holds an address in the hardware-register window, e.g. from `lis rX,0xCC01`): the access tests for
+// MMIO explicitly in fastmem builds too, so a store to the GX FIFO through a register the compiler cannot follow (a loop with an interrupt
+// poll reloads it) is a call, not a fault. Without fastmem every access tests anyway.
 #define PPC_LOAD_FAMILY(nm, RD, RDR, CV) \
-    PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); c.r[t] = CV(ram_base(a) ? RDR(c, e) : RD(c, e)); } \
-    PPC_INLINE void op_##nm##u(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.r[t] = CV(RD(c, e)); c.r[a] = e; } \
-    PPC_INLINE void op_##nm##x(Ctx& c, int t, int a, int b) { c.r[t] = CV(RD(c, ea_x(c, a, b))); } \
-    PPC_INLINE void op_##nm##ux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.r[t] = CV(RD(c, e)); c.r[a] = e; }
+    template <bool IO = false> PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); c.r[t] = CV(ram_base(a) ? RDR(c, e) : RD<IO>(c, e)); } \
+    template <bool IO = false> PPC_INLINE void op_##nm##u(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.r[t] = CV(RD<IO>(c, e)); c.r[a] = e; } \
+    template <bool IO = false> PPC_INLINE void op_##nm##x(Ctx& c, int t, int a, int b) { c.r[t] = CV(RD<IO>(c, ea_x(c, a, b))); } \
+    template <bool IO = false> PPC_INLINE void op_##nm##ux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.r[t] = CV(RD<IO>(c, e)); c.r[a] = e; }
 PPC_LOAD_FAMILY(lwz, rd32, rd32_ram, PPC_ID)
 PPC_LOAD_FAMILY(lbz, rd8, rd8_ram, PPC_ID)
 PPC_LOAD_FAMILY(lhz, rd16, rd16_ram, PPC_ID)
 PPC_LOAD_FAMILY(lha, rd16, rd16_ram, PPC_SX16)
 
 #define PPC_STORE_FAMILY(nm, WR, WRR, WRS) \
-    PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (stack_base(a)) WRS(c, e, c.r[t]); else if (ram_base(a)) WRR(c, e, c.r[t]); else WR(c, e, c.r[t]); } \
-    PPC_INLINE void op_##nm##u(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); WR(c, e, c.r[t]); c.r[a] = e; } \
-    PPC_INLINE void op_##nm##x(Ctx& c, int t, int a, int b) { WR(c, ea_x(c, a, b), c.r[t]); } \
-    PPC_INLINE void op_##nm##ux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; WR(c, e, c.r[t]); c.r[a] = e; }
+    template <bool IO = false> PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (stack_base(a)) WRS(c, e, c.r[t]); else if (ram_base(a)) WRR(c, e, c.r[t]); else WR<IO>(c, e, c.r[t]); } \
+    template <bool IO = false> PPC_INLINE void op_##nm##u(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); WR<IO>(c, e, c.r[t]); c.r[a] = e; } \
+    template <bool IO = false> PPC_INLINE void op_##nm##x(Ctx& c, int t, int a, int b) { WR<IO>(c, ea_x(c, a, b), c.r[t]); } \
+    template <bool IO = false> PPC_INLINE void op_##nm##ux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; WR<IO>(c, e, c.r[t]); c.r[a] = e; }
 PPC_STORE_FAMILY(stw, wr32, wr32_ram, wr32_stack)
 PPC_STORE_FAMILY(stb, wr8, wr8_ram, wr8_stack)
 PPC_STORE_FAMILY(sth, wr16, wr16_ram, wr16_stack)
@@ -325,23 +364,23 @@ PPC_INLINE void op_dcbz_l(Ctx& c, int a, int b) { op_dcbz(c, a, b); }
 PPC_INLINE double rnd_s(double v) { return double(float(v)); }
 PPC_INLINE void fp_rc(Ctx& c, bool rc) { if (rc) c.cr[1] = uint8_t(c.fpscr >> 28); }
 
-PPC_INLINE void op_lfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const uint32_t bits = ram_base(a) ? rd32_ram(c, e) : rd32(c, e); float f; std::memcpy(&f, &bits, 4); double v = f; c.f[t] = v; c.ps1[t] = v; }
-PPC_INLINE void op_lfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); double v = rdf32(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
-PPC_INLINE void op_lfsx(Ctx& c, int t, int a, int b) { double v = rdf32(c, ea_x(c, a, b)); c.f[t] = v; c.ps1[t] = v; }
-PPC_INLINE void op_lfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; double v = rdf32(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
-PPC_INLINE void op_lfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, hp(c, e), 8); v = uc_bswap64(v); std::memcpy(&c.f[t], &v, 8); } else c.f[t] = rdf64(c, e); }
-PPC_INLINE void op_lfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.f[t] = rdf64(c, e); c.r[a] = e; }
-PPC_INLINE void op_lfdx(Ctx& c, int t, int a, int b) { c.f[t] = rdf64(c, ea_x(c, a, b)); }
-PPC_INLINE void op_lfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.f[t] = rdf64(c, e); c.r[a] = e; }
-PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4); if (stack_base(a)) wr32_stack(c, e, bits); else if (ram_base(a)) wr32_ram(c, e, bits); else wr32(c, e, bits); }
-PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32(c, e, float(c.f[t])); c.r[a] = e; }
-PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32(c, ea_x(c, a, b), float(c.f[t])); }
-PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32(c, e, float(c.f[t])); c.r[a] = e; }
-PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { guest_note(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(e + 7); } else guest_note_stack(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64(c, e, c.f[t]); }
-PPC_INLINE void op_stfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf64(c, e, c.f[t]); c.r[a] = e; }
-PPC_INLINE void op_stfdx(Ctx& c, int t, int a, int b) { wrf64(c, ea_x(c, a, b), c.f[t]); }
-PPC_INLINE void op_stfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf64(c, e, c.f[t]); c.r[a] = e; }
-PPC_INLINE void op_stfiwx(Ctx& c, int t, int a, int b) { uint64_t bt; std::memcpy(&bt, &c.f[t], 8); wr32(c, ea_x(c, a, b), uint32_t(bt)); }
+template <bool IO = false> PPC_INLINE void op_lfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const uint32_t bits = ram_base(a) ? rd32_ram(c, e) : rd32<IO>(c, e); float f; std::memcpy(&f, &bits, 4); double v = f; c.f[t] = v; c.ps1[t] = v; }
+template <bool IO = false> PPC_INLINE void op_lfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); double v = rdf32<IO>(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_lfsx(Ctx& c, int t, int a, int b) { double v = rdf32<IO>(c, ea_x(c, a, b)); c.f[t] = v; c.ps1[t] = v; }
+template <bool IO = false> PPC_INLINE void op_lfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; double v = rdf32<IO>(c, e); c.f[t] = v; c.ps1[t] = v; c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_lfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, hp(c, e), 8); v = uc_bswap64(v); std::memcpy(&c.f[t], &v, 8); } else c.f[t] = rdf64<IO>(c, e); }
+template <bool IO = false> PPC_INLINE void op_lfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.f[t] = rdf64<IO>(c, e); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_lfdx(Ctx& c, int t, int a, int b) { c.f[t] = rdf64<IO>(c, ea_x(c, a, b)); }
+template <bool IO = false> PPC_INLINE void op_lfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.f[t] = rdf64<IO>(c, e); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4); if (stack_base(a)) wr32_stack(c, e, bits); else if (ram_base(a)) wr32_ram(c, e, bits); else wr32<IO>(c, e, bits); }
+template <bool IO = false> PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32<IO>(c, ea_x(c, a, b), float(c.f[t])); }
+template <bool IO = false> PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { guest_note(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(e + 7); } else guest_note_stack(e,8); std::memcpy(hp(c, e), &v, 8); } else wrf64<IO>(c, e, c.f[t]); }
+template <bool IO = false> PPC_INLINE void op_stfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf64<IO>(c, e, c.f[t]); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_stfdx(Ctx& c, int t, int a, int b) { wrf64<IO>(c, ea_x(c, a, b), c.f[t]); }
+template <bool IO = false> PPC_INLINE void op_stfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf64<IO>(c, e, c.f[t]); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_stfiwx(Ctx& c, int t, int a, int b) { uint64_t bt; std::memcpy(&bt, &c.f[t], 8); wr32<IO>(c, ea_x(c, a, b), uint32_t(bt)); }
 
 // Single-precision results are written to both halves of the paired-single register (Gekko); double-precision ones only to ps0.
 #define PPC_SYNC_PPC_ID(c, t)
@@ -455,24 +494,24 @@ UC_IMAGE_LOCAL inline const std::array<double, 65> kGqPow2 = [] { std::array<dou
 PPC_INLINE double gq_pow2(int e) { return kGqPow2[size_t(e + 32)]; }
 PPC_INLINE int gq_scale(uint32_t v) { int s = int(v & 0x3F); return s & 0x20 ? s - 64 : s; }
 PPC_INLINE int gq_bytes(int type) { return (type == 4 || type == 6) ? 1 : (type == 5 || type == 7) ? 2 : 4; }
-PPC_INLINE double gq_load1(Ctx& c, uint32_t ea, int type, int scale) {
+template <bool IO = false> PPC_INLINE double gq_load1(Ctx& c, uint32_t ea, int type, int scale) {
     double v;
     switch (type) {
-        case 4: v = double(rd8(c, ea)); break;
-        case 5: v = double(rd16(c, ea)); break;
-        case 6: v = double(int8_t(rd8(c, ea))); break;
-        case 7: v = double(int16_t(rd16(c, ea))); break;
-        default: return double(rdf32(c, ea));
+        case 4: v = double(rd8<IO>(c, ea)); break;
+        case 5: v = double(rd16<IO>(c, ea)); break;
+        case 6: v = double(int8_t(rd8<IO>(c, ea))); break;
+        case 7: v = double(int16_t(rd16<IO>(c, ea))); break;
+        default: return double(rdf32<IO>(c, ea));
     }
     return v * gq_pow2(-scale);
 }
-PPC_INLINE void gq_store1(Ctx& c, uint32_t ea, int type, int scale, double v) {
-    if (type < 4 || type > 7) { wrf32(c, ea, float(v)); return; }
+template <bool IO = false> PPC_INLINE void gq_store1(Ctx& c, uint32_t ea, int type, int scale, double v) {
+    if (type < 4 || type > 7) { wrf32<IO>(c, ea, float(v)); return; }
     double x = std::trunc(v * gq_pow2(scale));
     double lo = type == 4 ? 0 : type == 5 ? 0 : type == 6 ? -128 : -32768;
     double hi = type == 4 ? 255 : type == 5 ? 65535 : type == 6 ? 127 : 32767;
     x = std::isnan(x) ? lo : x < lo ? lo : x > hi ? hi : x;
-    if (gq_bytes(type) == 1) wr8(c, ea, uint32_t(int32_t(x))); else wr16(c, ea, uint32_t(int32_t(x)));
+    if (gq_bytes(type) == 1) wr8<IO>(c, ea, uint32_t(int32_t(x))); else wr16<IO>(c, ea, uint32_t(int32_t(x)));
 }
 // A float pair in guest (big-endian) memory as one vector: one 8-byte access, a per-lane byte swap and a two-lane conversion (NEON
 // ld1/rev32/fcvtl and fcvtn/rev32/st1 on arm64) instead of two scalar loads, swaps and conversions. The conversions are exact (float to
@@ -487,58 +526,73 @@ PPC_INLINE void ps_store_pair(uint8_t* p, PsDoublePair v) {
     const PsBytes s = __builtin_shufflevector(b, b, 3, 2, 1, 0, 7, 6, 5, 4);
     std::memcpy(p, &s, 8);
 }
-// An access of n bytes at ea touches MMIO (one compare instead of one per word).
-PPC_INLINE bool touches_mmio(uint32_t ea, uint32_t n) { return ea - (0xCC000000u - (n - 1)) < 0x02000000u + (n - 1); }
+// The same through guest_load/guest_store (an address that may be MMIO: one 8-byte access the fastmem handler splits into ea, ea+4).
+#if !UC_FASTMEM
+PPC_INLINE PsDoublePair ps_load_pair_guest(const uint8_t* p) { return ps_load_pair(p); }
+PPC_INLINE void ps_store_pair_guest(uint8_t* p, PsDoublePair v) { ps_store_pair(p, v); }
+#else
+PPC_INLINE PsDoublePair ps_load_pair_guest(const uint8_t* p) {
+    const PsBytes b = __builtin_bit_cast(PsBytes, guest_load<uint64_t>(p));
+    return __builtin_convertvector(__builtin_bit_cast(PsFloatPair, __builtin_shufflevector(b, b, 3, 2, 1, 0, 7, 6, 5, 4)), PsDoublePair);
+}
+PPC_INLINE void ps_store_pair_guest(uint8_t* p, PsDoublePair v) {
+    const PsBytes b = __builtin_bit_cast(PsBytes, __builtin_convertvector(v, PsFloatPair));
+    guest_store<uint64_t>(p, __builtin_bit_cast(uint64_t, __builtin_shufflevector(b, b, 3, 2, 1, 0, 7, 6, 5, 4)));
+}
+#endif
 // The quantized (and MMIO) cases out of line: inlined at every psq_l/psq_st they made a paired-single function several times larger than
 // its hot path (fn_802647AC: ~70 KB of code for 102 guest instructions). They take the guest memory base, not the context, so a translated
-// function's local register copy does not escape.
+// function's local register copy does not escape. They always test for MMIO (gq_*1<true>): quantized stores to the GX FIFO take this path,
+// and next to the conversion the test costs nothing.
 [[gnu::noinline, gnu::cold]] inline PsDoublePair psq_load_slow(uint8_t* mem, uint32_t ea, int w, uint32_t g) {
     Ctx t; t.mem = mem;
     const int type = (g >> 16) & 7, scale = gq_scale(g >> 24);
-    const double p0 = gq_load1(t, ea, type, scale);
-    const double p1 = w ? 1.0 : gq_load1(t, ea + gq_bytes(type), type, scale);
+    const double p0 = gq_load1<true>(t, ea, type, scale);
+    const double p1 = w ? 1.0 : gq_load1<true>(t, ea + gq_bytes(type), type, scale);
     return {p0, p1};
 }
 [[gnu::noinline, gnu::cold]] inline void psq_store_slow(uint8_t* mem, uint32_t ea, int w, uint32_t g, double p0, double p1) {
     Ctx t; t.mem = mem;
     const int type = g & 7, scale = gq_scale(g >> 8);
-    gq_store1(t, ea, type, scale, p0);
-    if (!w) gq_store1(t, ea + gq_bytes(type), type, scale, p1);
+    gq_store1<true>(t, ea, type, scale, p0);
+    if (!w) gq_store1<true>(t, ea + gq_bytes(type), type, scale, p1);
 }
-PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = false) {
+template <bool IO = false> PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = false) {
     const uint32_t g = c.gqr[i]; const int type = (g >> 16) & 7;
-    if (type < 4 && w && (ram || !is_mmio(ea))) [[likely]] {   // single float: ps1 reads as 1.0
-        const uint32_t bits = rd32_ram(c, ea); float f; std::memcpy(&f, &bits, 4);
+    if (type < 4 && w && (ram || !mmio_route<IO>(ea))) [[likely]] {   // single float: ps1 reads as 1.0
+        const uint32_t bits = ram ? rd32_ram(c, ea) : uc_bswap32(guest_load<uint32_t>(hp(c, ea))); float f; std::memcpy(&f, &bits, 4);
         c.f[t] = f; c.ps1[t] = 1.0; return;
     }
-    if (type < 4 && !w && (ram || !touches_mmio(ea, 8))) [[likely]] {   // float pair: one 8-byte read instead of two 4-byte ones
-        const PsDoublePair v = ps_load_pair(hp(c, ea));
+    if (type < 4 && !w && (ram || !mmio_route_n<IO>(ea, 8))) [[likely]] {   // float pair: one 8-byte read instead of two 4-byte ones
+        const PsDoublePair v = ram ? ps_load_pair(hp(c, ea)) : ps_load_pair_guest(hp(c, ea));
         c.f[t] = v[0]; c.ps1[t] = v[1]; return;
     }
     const PsDoublePair v = psq_load_slow(c.mem, ea, w, g);
     c.f[t] = v[0]; c.ps1[t] = v[1];
 }
-PPC_INLINE void psq_store(Ctx& c, int t, uint32_t ea, int w, int i, bool stack = false) {
+template <bool IO = false> PPC_INLINE void psq_store(Ctx& c, int t, uint32_t ea, int w, int i, bool stack = false) {
     const uint32_t g = c.gqr[i]; const int type = g & 7;
-    if (type < 4 && w && (stack || !is_mmio(ea))) [[likely]] {   // single float
+    if (type < 4 && w && (stack || !mmio_route<IO>(ea))) [[likely]] {   // single float
         const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4);
-        if (stack) wr32_stack(c, ea, bits); else wr32_ram(c, ea, bits); return;
+        if (stack) wr32_stack(c, ea, bits);
+        else { guest_note(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] guest_note(ea + 3); guest_store<uint32_t>(hp(c, ea), uc_bswap32(bits)); }
+        return;
     }
-    if (type < 4 && !w && (stack || !touches_mmio(ea, 8))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
-        if (!stack) { guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); }
-        else guest_note_stack(ea,8);
-        ps_store_pair(hp(c, ea), ps_pair(c, t)); return;
+    if (type < 4 && !w && (stack || !mmio_route_n<IO>(ea, 8))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
+        if (!stack) { guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); ps_store_pair_guest(hp(c, ea), ps_pair(c, t)); }
+        else { guest_note_stack(ea,8); ps_store_pair(hp(c, ea), ps_pair(c, t)); }
+        return;
     }
     psq_store_slow(c.mem, ea, w, g, c.f[t], c.ps1[t]);
 }
-PPC_INLINE void op_psq_l(Ctx& c, int t, int a, int32_t d, int w, int i) { psq_load(c, t, ea_d(c, a, d), w, i, ram_base(a)); }
-PPC_INLINE void op_psq_lu(Ctx& c, int t, int a, int32_t d, int w, int i) { uint32_t e = c.r[a] + uint32_t(d); psq_load(c, t, e, w, i); c.r[a] = e; }
-PPC_INLINE void op_psq_st(Ctx& c, int t, int a, int32_t d, int w, int i) { psq_store(c, t, ea_d(c, a, d), w, i, stack_base(a)); }
-PPC_INLINE void op_psq_stu(Ctx& c, int t, int a, int32_t d, int w, int i) { uint32_t e = c.r[a] + uint32_t(d); psq_store(c, t, e, w, i); c.r[a] = e; }
-PPC_INLINE void op_psq_lx(Ctx& c, int t, int a, int b, int w, int i) { psq_load(c, t, ea_x(c, a, b), w, i); }
-PPC_INLINE void op_psq_lux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_load(c, t, e, w, i); c.r[a] = e; }
-PPC_INLINE void op_psq_stx(Ctx& c, int t, int a, int b, int w, int i) { psq_store(c, t, ea_x(c, a, b), w, i); }
-PPC_INLINE void op_psq_stux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_store(c, t, e, w, i); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_psq_l(Ctx& c, int t, int a, int32_t d, int w, int i) { psq_load<IO>(c, t, ea_d(c, a, d), w, i, ram_base(a)); }
+template <bool IO = false> PPC_INLINE void op_psq_lu(Ctx& c, int t, int a, int32_t d, int w, int i) { uint32_t e = c.r[a] + uint32_t(d); psq_load<IO>(c, t, e, w, i); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_psq_st(Ctx& c, int t, int a, int32_t d, int w, int i) { psq_store<IO>(c, t, ea_d(c, a, d), w, i, stack_base(a)); }
+template <bool IO = false> PPC_INLINE void op_psq_stu(Ctx& c, int t, int a, int32_t d, int w, int i) { uint32_t e = c.r[a] + uint32_t(d); psq_store<IO>(c, t, e, w, i); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_psq_lx(Ctx& c, int t, int a, int b, int w, int i) { psq_load<IO>(c, t, ea_x(c, a, b), w, i); }
+template <bool IO = false> PPC_INLINE void op_psq_lux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_load<IO>(c, t, e, w, i); c.r[a] = e; }
+template <bool IO = false> PPC_INLINE void op_psq_stx(Ctx& c, int t, int a, int b, int w, int i) { psq_store<IO>(c, t, ea_x(c, a, b), w, i); }
+template <bool IO = false> PPC_INLINE void op_psq_stux(Ctx& c, int t, int a, int b, int w, int i) { uint32_t e = c.r[a] + c.r[b]; psq_store<IO>(c, t, e, w, i); c.r[a] = e; }
 
 
 // ---- the SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; r11 points just above the save area) ----

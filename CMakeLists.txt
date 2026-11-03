@@ -80,6 +80,12 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(STATUS "PGO profile: ${UC_PGO_PROFILE}")
   endif()
 endif()
+# fastmem (runtime/ppc_rt.h, runtime/fastmem.cpp): on macOS and Android arm64 the guest's loads and stores carry no MMIO test, an access to
+# the hardware registers faults and the signal handler performs it. OFF restores the explicit test (A/B, debugging); Windows and x64 always test.
+option(UC_FASTMEM "guest accesses without the MMIO test on arm64 macOS/Android" ON)
+if(NOT UC_FASTMEM)
+  add_compile_definitions(UC_FASTMEM=0)
+endif()
 # ThinLTO across the translated game, runtime and renderer (lets the small native helpers be inlined into generated code); the link is slow.
 option(UC_THINLTO "build with ThinLTO (build.bat and scripts/dev.bat turn it on)" OFF)
 if(UC_THINLTO AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND UC_MSVC_FRONTEND)

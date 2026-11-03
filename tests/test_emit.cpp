@@ -201,5 +201,22 @@ int main() {
             if(name=="game_table.cpp") registered=source.find("{0x80003104u, fn_80003100_80003104}")!=std::string::npos;
         CHECK(registered);
     }
+    {   // loads/stores from a hardware-register base keep the explicit MMIO test (op_*<true>): lis r3,0xCC01 reaches the stores of a loop
+        // whose poll reloads r3 (the compiler cannot follow it), through mr and an update form; a RAM base, a base the loop overwrote and
+        // the volatile registers after a call do not
+        auto q = make_prog({lis(3, -13311), mr(5, 3), mtctr(4),
+                            stw(4, -32768, 3), stfs(1, -32768, 5), stwu(6, 4, 5), lwz(7, 0, 5), lwz(8, 0, 9), bdnz(-20),
+                            lis(9, 0x8000), stw(4, 0, 9), lis(10, -13312), bl(20), stw(4, 0, 10), lis(3, -13311), stw(4, 0x1000, 3), blr,
+                            blr});
+        const size_t before = st.mmio_sites;
+        const std::string t = uc::emit_function(q, q.an.functions[0], st);
+        auto has = [&](const char* text) { return t.find(text) != std::string::npos; };
+        CHECK(has("ppc::op_stw<true>(c, 4, 3, -32768);") && has("ppc::op_stfs<true>(c, 1, 5, -32768);"));
+        CHECK(has("ppc::op_stwu<true>(c, 6, 5, 4);") && has("ppc::op_lwz<true>(c, 7, 5, 0);"));
+        CHECK(has("ppc::op_lwz(c, 8, 9, 0);") && has("ppc::op_stw(c, 4, 9, 0);"));   // r9: never an MMIO base, then RAM
+        CHECK(has("ppc::op_stw(c, 4, 10, 0);"));                                         // r10 is volatile across the call
+        CHECK(has("ppc::op_stw<true>(c, 4, 3, 4096);"));
+        CHECK(st.mmio_sites - before == 5);
+    }
     return 0;
 }
