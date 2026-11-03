@@ -768,7 +768,7 @@ its copy: ~5.4 scene screens of shading become ~1.4 plus one full-screen composi
 so the picture (sprites meeting geometry take the half-size depth; the haze samples a half-resolution copy anyway) is checked on the
 headset's captures first.
 
-### Draw merging and textures (evaluated, not done)
+### Draw merging and textures (evaluated; built in "Texture-only draw merging" below)
 
 `UC_MERGE_WHY=1` in the VR preview's fight (~92 presents a second): ~520 draws issued a frame (~585 more merged into them); runs end on
 textures 45 k / 2 s, pipelines 22 k, uniform blocks 6 k. Counted boundaries where only the textures differ (same pipeline, uniform block,
@@ -806,3 +806,59 @@ where it is used).
 - Present ~4.4 ms: the screen pass over 2 x 2064x2208 with FXAA and the layers' composite.
 - The colour pass and the composite (~2.8 ms) are full-resolution by nature (they carry the scene); the full-size copy between them
   (a 2 x 9 Mpx blit) could become a tile-local read (input attachment) if the copy is read only by the next full-screen pass.
+
+## Texture-only draw merging (2026-11-03, branch quest-tex-merge)
+
+Question: ~180 run ends a frame differ only in their textures and samplers (the "textures only" count above). Can those draws be one
+`vkCmdDrawIndexed` without changing the picture? Opt-in until the headset A/B: `UC_TEX_MERGE=1`.
+
+### Design
+
+- **The texture table**: each packet's distinct texture/sampler sets (the headset's per-combination sets) also go into one array of combined
+  image samplers, set 1 (descriptor indexing: runtime array, partially bound, variable count, non-uniform indexing; update-after-bind only
+  when the plain limits are under 4096 entries, or `UC_TEX_MERGE_UAB=1`). A set takes maps 0 .. the highest one its draws read (~21 entries
+  a packet in the fight). Written before the packet is recorded, one set per frame slot, its pool grown to the largest packet. A packet
+  larger than the limit (8192 entries at most) draws as before (`overflows`).
+- **The index**: the vertex pre-pass writes each draw's first table entry as the last attribute word of its vertices (XformJob `table`);
+  `smoke.stereo.xform.tex.vert.spv` passes it as a flat input to the TEX_TABLE fragment stages (`tev.slang`: `tableImages[NonUniform(base +
+  map)]`, the indirect path's run-time map an index instead of eight samples). Set 0 is the packet's first set (its maps unused, the uniform
+  and eye blocks dynamic offsets as before).
+- **Pipelines**: key bit 20 (`kTexTableKeyBit`, never recorded in a key file) selects the TEX_TABLE modules and the two-set layout. Folded
+  modules: `tools/fold_tev_shaders.py` folds every key also as variants 2/3 (table, table early-Z): 657 -> 1314 modules (18 MB). The
+  variants are compiled on the loading screen with the other known keys; a key not compiled yet keeps the draw on its own pipeline and set
+  (`waiting`), never the ubershader. Not for the particle layer's pipelines, nor draws that need the second destination-alpha draw.
+- **The merger**: two table runs join when pipeline, key, uniform block, eye block, push constants, viewport, scissor, rate and the index
+  range continue (everything but the textures).
+- **Logs**: `[vulkan] descriptor indexing: ...` (features and limits, every headset start), `[vr] texture table on|off (...)`, and with
+  UC_GPU_PACKETS `[tex-merge] packets, overflows, entries, runs, joins, waiting` per 2 s. Diagnostics: `UC_TEX_MERGE_LOG=1` (each joined
+  callsite pair once), `UC_TEX_MERGE_SKIP=<hex>,...` (callsites kept on their own sets).
+
+### Measured (Mac VR preview, KosmicKrisp, fightvr replay, retraces 8450-9352, per presented frame)
+
+| | draws issued | merged into them | run ends: pipeline / textures / uniform / textures only |
+|---|---|---|---|
+| UC_TEX_MERGE off | 443 | 546 | 120 / 252 / 34 / 195 |
+| UC_TEX_MERGE=1 | 231-240 (**-46%**) | 706-729 | 112-116 / 53-55 / 32-33 / 0 |
+
+More than the ~340 estimated: a join lets the next draw continue the same run. No overflows; the table pipelines were ready before the
+fight (`waiting 0`). Mac build 203/203 tests; Quest APK builds. GPU time on the headset: not measured yet (`/tmp/qgs/plan_texmerge.sh`: off
+vs on at native and 1.0x, alternating, then EFB captures off/on).
+
+### Pictures
+
+EFB captures at 8700/9060/9300, off vs on: 500-760 pixels differ per 5120x1440 capture, peak 2-5/255, along a few seams. Tracked down:
+- only joins of callsite 80366E14 (opaque, depth-writing perspective meshes, two stages, linear filtering) cause it (`UC_TEX_MERGE_SKIP=80366E14`:
+  <= 1/255); the table shader without merging (`UC_NO_MERGE=1`) matches off; the replays repeat exactly;
+- not texture selection or LOD: a manual waterfall (subgroup-uniform index), an interpolated instead of flat index, and anisotropy off all
+  leave the same pixels; explicit gradients (SampleGrad) change ~220k pixels (KosmicKrisp's explicit and implicit LOD differ), not used;
+- **early depth**: with `UC_NO_EARLY_Z=1` (both runs on the module with the alpha test, no `[earlydepthstencil]`) off vs on is identical,
+  0 pixels. KosmicKrisp does not keep equal-depth ties in primitive order under early fragment tests: even without the table, early vs late Z
+  moves 12-18k pixels per capture. Overlapping surfaces of two draws that now are one draw resolve their ties differently there; with the
+  same texture (the old merging) that cannot be seen, with different textures it can.
+So the table path itself is exact; the remaining difference is the Mac driver's early-depth tie order. The headset's captures (the plan's
+last step; a late-Z pair is commented in it) decide whether the Adreno shows any.
+
+### Left
+
+- Headset A/B (GPU ms of the main scene and the frame, native and 1.0x) and its captures; then the default.
+- The APK grows 48.6 -> 59 MB (the folded table variants, also in folded_rp): fold only the scene's keys if that matters.

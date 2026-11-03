@@ -1298,6 +1298,8 @@ void VulkanRenderer::warm_pipelines(const std::function<void(size_t,size_t)>& pr
     compile_limit_=compilers_.size(); compile_cv_.notify_all();   // nothing else runs on the loading screen: every thread compiles
     for (const auto& key:uber_key_closure(warm_keys_)) queue_pipeline(key,true);   // the ubershader variants first: they cover any key still missing
     for (const auto& key:warm_keys_) queue_pipeline(key,false);
+    if (tex_merge_)   // the texture-table variants of the EFB keys too (the HUD and particle layers draw without the table)
+        for (auto key:warm_keys_) if (!(key[0]&(kHudLayerKeyBit|kParticleLayerKeyBit))) { key[0]|=kTexTableKeyBit; queue_pipeline(key,false); }
     const size_t base=jobs_done_, total=compile_queue_.size()+compiling_;
     while (!compile_queue_.empty() || compiling_) {
         const size_t done=jobs_done_-base;
@@ -4042,7 +4044,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                         set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
                 // The texture table: the draw's pipeline variant that reads its textures from the packet's table, once compiled (meanwhile the
                 // draw keeps its own). Not for the particle layer's pipelines, nor a draw whose second destination-alpha draw reads its own set.
-                if (table_ok && !particle_pass) {
+                // UC_TEX_MERGE_SKIP=<hex>[,<hex>...] (diagnostics): those callsites keep their own sets
+                static const std::vector<uint32_t> table_skipped=[] {
+                    std::vector<uint32_t> sites;
+                    if (const char* text=std::getenv("UC_TEX_MERGE_SKIP")) for (const char* at=text;*at;) { char* end=nullptr; const auto value=std::strtoul(at,&end,16); if (end==at) break; sites.push_back(uint32_t(value)); at=*end==',' ? end+1 : end; }
+                    return sites;
+                }();
+                if (table_ok && !particle_pass && std::find(table_skipped.begin(),table_skipped.end(),draw.callsite)==table_skipped.end()) {
                     const auto depth=draw.uniforms->pixel[1]&31;
                     const bool second_alpha=(draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0) && (fuse_off() || !fused_destination_alpha(draw));
                     if (!second_alpha) { if (const VkPipeline table=table_pipeline(info.key)) { run.pipeline=table; run.table=true; } else ++table_pending_; }
@@ -4076,7 +4084,21 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 if (joins) {
                     pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_;
-                    if (run.table && !std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin())) ++table_joins_;   // joined only through the table
+                    if (run.table && !std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin())) {   // joined only through the table
+                        ++table_joins_;
+                        static const bool log_joins=std::getenv("UC_TEX_MERGE_LOG")!=nullptr;   // diagnostics: each pair of callsites the table joins, once, with their maps
+                        static std::set<std::pair<uint32_t,uint32_t>> logged;
+                        if (log_joins && logged.insert({packet.draws[pending->d].callsite,draw.callsite}).second) {
+                            std::string maps; char text[160];
+                            for (size_t map=0;map<8;++map) if (set_keys[run.set][map]) {
+                                const auto& a=draw_texture(packet.draws[pending->d],map); const auto& b=draw_texture(draw,map);
+                                std::snprintf(text,sizeof text," map%zu %ux%u/%ux%u wrap %02X/%02X",map,a ? a->levels[0].width : 0,a ? a->levels[0].height : 0,b ? b->levels[0].width : 0,b ? b->levels[0].height : 0,
+                                              unsigned(packet.draws[pending->d].texture_wrap[map]),unsigned(draw.texture_wrap[map]));
+                                maps+=text;
+                            }
+                            std::fprintf(stderr,"[tex-merge-join] %08X + %08X key0 %08X stages %u depth %02X persp %d%s\n",packet.draws[pending->d].callsite,draw.callsite,info.key[0],info.key[1],info.key[68],int(draw.transforms->projection[3][3]==0),maps.c_str());
+                        }
+                    }
                 }
                 else { if (pending) issue_run(*pending); pending=run; }
                 continue;
