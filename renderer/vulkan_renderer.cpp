@@ -310,7 +310,8 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (!xr_) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);   // the headset's swapchain is the runtime's
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     if (layers_ > 1) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
-    xform_ = layers_ > 1 && supported12.bufferDeviceAddress && !std::getenv("UC_NO_XFORM");   // the headset's vertex pre-pass reads the vertices by address
+    xform_ = layers_ > 1 && supported12.bufferDeviceAddress && !std::getenv("UC_NO_XFORM");
+    static_depth_ = layers_ > 1 && std::getenv("UC_STATIC_DEPTH");   // diagnostics: does dynamic depth state cost the tiler its LRZ?   // the headset's vertex pre-pass reads the vertices by address
     if (xform_) {
         features12.bufferDeviceAddress = VK_TRUE;
         if (!features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; features12_chained = true; }
@@ -732,7 +733,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     return key;
 }
 VulkanRenderer::PipelineChoice VulkanRenderer::pipeline_for(const PipelineKey& requested) {
-    const auto key=static_key(requested);
+    const auto key=static_depth_ ? requested : static_key(requested);   // static_depth_: cull and depth state baked into the pipeline
     const auto fixed=uber_key(key);
     PipelineChoice choice;
     bool fresh=false;
@@ -932,7 +933,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     {
         if (!layout_) {
         VkPushConstantRange projection{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof(DrawPush))};
-        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{7,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};   // 5: the headset's eye block (uniform) or motion blocks; 6, 7: the pre-pass's positions and attributes (xform_)
+        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{7,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};   // 5: the headset's eye block (uniform) or motion blocks; 6, 7: the pre-pass's positions and attributes (xform_)
         VkDescriptorSetLayoutCreateInfo texture_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; texture_layout.bindingCount=xform_ ? 8 : 6; texture_layout.pBindings=texture_bindings;
         vk_check(vkCreateDescriptorSetLayout(device,&texture_layout,nullptr,&texture_layout_),"texture descriptor layout");
         create_samplers();
@@ -984,7 +985,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blending.attachmentCount = scene_color_attachments(); blending.pAttachments = blends;
         blending.logicOpEnable=mode.mode==2; blending.logicOp=VkLogicOp(mode.logic);
         VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP};   // the last four: set_draw_state
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)); dynamic.pDynamicStates = dynamic_states;
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount = static_depth_ ? 2u : uint32_t(std::size(dynamic_states)); dynamic.pDynamicStates = dynamic_states;
         const VkFormat formats[5] = {VK_FORMAT_R8G8B8A8_UNORM, kMotionFormat, kGBufferFormat, kMaterialFormat, kAlbedoFormat};
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachmentFormats = formats; rendering.viewMask = layers_>1 ? 0b11u : 0u;
         rendering.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
@@ -2282,7 +2283,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     struct XformDraw { uint32_t positions=0, attributes=0, word=0, count=0, first=0; };   // word: stride | mask << 8 (the draws' currentRow)
     std::vector<XformDraw> xform_draws;
     std::vector<uint32_t> draw_uniform(packet.draws.size(),0);   // each draw's uniform block index (offset / uniform_stride_)
-    std::vector<std::array<uint64_t,17>> set_keys(xform_ ? packet.draws.size() : 0);   // per draw: image views, samplers, uniform offset
+    std::vector<std::array<uint64_t,17>> set_keys(layers_>1 ? packet.draws.size() : 0);   // per draw: image views, samplers, uniform offset
+    // The headset: one descriptor set per distinct texture/sampler combination (the uniform block and the eye block are dynamic offsets)
+    std::map<std::array<uint64_t,16>,uint32_t> set_of;
+    std::vector<uint32_t> draw_set(layers_>1 ? packet.draws.size() : 0,0), draw_uniform_offset(layers_>1 ? packet.draws.size() : 0,0);
     if (xform_ && !packet.draws.empty()) {
         xform_draws.resize(packet.draws.size());
         uint32_t positions=0, attributes=0, indices=0;
@@ -2316,7 +2320,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if(count>slot.descriptor_capacity) {
             if(slot.texture_pool) vkDestroyDescriptorPool(device,slot.texture_pool,nullptr);
             slot.texture_pool=VK_NULL_HANDLE; slot.descriptor_capacity=0; slot.texture_sets.clear();
-            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,layers_>1 ? count*2 : count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,layers_>1 ? count*(xform_ ? 4 : 2) : count*3}};
+            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,layers_>1 ? count*2 : count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,layers_>1 ? count*(xform_ ? 4 : 2) : count*3}};
             VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=count; pool.poolSizeCount=4; pool.pPoolSizes=sizes;
             vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.texture_pool),"texture descriptor pool");
             std::vector<VkDescriptorSetLayout> layouts(count,texture_layout_);
@@ -2400,7 +2404,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             VkDescriptorBufferInfo motion{slot.motions.buffer,0,VK_WHOLE_SIZE};
             if (layers_>1) motion={slot.motions.buffer,VkDeviceSize(i)*stereo_stride_,kStereoBlockBytes};   // this draw's eye block
             draw_uniform[i]=uint32_t(uniform_offset/uniform_stride_);
-            if (xform_) {   // what the draw's set holds besides its eye block: draws with the same can share one set (and one draw)
+            if (layers_>1) {   // what the draw's set holds besides its uniform block and eye block (dynamic offsets): draws with the same share one set
                 auto& key=set_keys[i];
                 // only the maps the draw's TEV stages sample (and their indirect maps) count: the others are never read
                 const auto& pk=gpu_draws[i].key; const auto& u=*packet.draws[i].uniforms;
@@ -2412,17 +2416,25 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 for (size_t map=0;map<8;++map) { const bool used=(maps>>map)&1; key[map]=used ? uint64_t(image[map].imageView) : 0; key[8+map]=used ? uint64_t(samplers[map].sampler) : 0; }
                 key[16]=uniform_offset;
+                draw_uniform_offset[i]=uint32_t(uniform_offset);
+                std::array<uint64_t,16> textures; std::copy(key.begin(),key.begin()+16,textures.begin());
+                const auto [found,added]=set_of.try_emplace(textures,uint32_t(set_of.size()));
+                draw_set[i]=found->second;
+                if (!added) continue;   // that set is written
+                uniform={slot.uniforms.buffer,0,kDrawUniformBytes};
+                motion={slot.motions.buffer,0,kStereoBlockBytes};
             }
             const VkDescriptorBufferInfo xform_positions{slot.xform_positions.buffer,0,VK_WHOLE_SIZE}, xform_attributes{slot.xform_attributes.buffer,0,VK_WHOLE_SIZE};
             VkWriteDescriptorSet writes[8]{};
             const uint32_t binding_count=xform_ ? 8 : 6;
-            for (uint32_t binding=0;binding<binding_count;++binding) { writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=slot.texture_sets[i]; writes[binding].dstBinding=binding; writes[binding].descriptorCount=1; }
+            const VkDescriptorSet target_set=slot.texture_sets[layers_>1 ? draw_set[i] : i];
+            for (uint32_t binding=0;binding<binding_count;++binding) { writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=target_set; writes[binding].dstBinding=binding; writes[binding].descriptorCount=1; }
             writes[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[0].descriptorCount=8; writes[0].pImageInfo=image.data();
             writes[1].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER; writes[1].descriptorCount=8; writes[1].pImageInfo=samplers.data();
-            writes[2].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[2].pBufferInfo=&uniform;
+            writes[2].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[2].pBufferInfo=&uniform;
             writes[3].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[3].pBufferInfo=&palette;
             writes[4].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[4].pBufferInfo=&bank;
-            writes[5].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
+            writes[5].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
             writes[6].descriptorType=writes[7].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[6].pBufferInfo=&xform_positions; writes[7].pBufferInfo=&xform_attributes;
             vkUpdateDescriptorSets(device,binding_count,writes,0,nullptr);
         }
@@ -2833,6 +2845,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); bound_pipeline=pipeline;
         };
         const auto set_draw_state=[&](const PipelineKey& key) {
+            if (static_depth_) return;   // in the pipeline
             const uint32_t state=((key[0]>>14)&3)|((key[68]&31)<<2);
             if (state==bound_state) return;
             bound_state=state;
@@ -2842,6 +2855,19 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdSetDepthCompareOp(slot.command,VkCompareOp((key[68]>>1)&7));
         };
         bool probe_bound=false;
+        // The headset's descriptor binding: the draw's shared set with its uniform block and eye block as dynamic offsets; nothing is
+        // recorded when the set and both offsets are the ones bound. An eye block equal to the bound one keeps the bound offset.
+        VkDescriptorSet bound_set=VK_NULL_HANDLE; uint32_t bound_offsets[2]{~0u,~0u};
+        const auto bind_draw_set=[&](size_t d,bool compare_eye) {
+            uint32_t offsets[2]={draw_uniform_offset[d],uint32_t(d*stereo_stride_)};
+            if (compare_eye && bound_offsets[1]!=~0u && std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+offsets[1],static_cast<std::byte*>(slot.motions.mapped)+bound_offsets[1],kStereoBlockBytes)==0)
+                offsets[1]=bound_offsets[1];
+            const VkDescriptorSet set=slot.texture_sets[draw_set[d]];
+            if (set==bound_set && offsets[0]==bound_offsets[0] && offsets[1]==bound_offsets[1] && !no_dedup) return;
+            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&set,2,offsets);
+            ++set_binds_;
+            bound_set=set; bound_offsets[0]=offsets[0]; bound_offsets[1]=offsets[1];
+        };
         // The pre-pass (xform_): consecutive draws that differ only in their vertices (same pipeline, textures, samplers, uniform block, eye
         // block, push constants, viewport, scissor; consecutive in the rebased index buffer) are one draw. UC_NO_MERGE=1: a draw each.
         static const bool no_merge=std::getenv("UC_NO_MERGE")!=nullptr;
@@ -2854,7 +2880,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (bound_indices!=&slot.xform_indices) { vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32); bound_indices=&slot.xform_indices; bound_index_offset=0; }
             bind_pipeline(run.pipeline);
             set_draw_state(info.key);
-            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
+            if (layers_>1) bind_draw_set(run.set,true);
+            else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
             DrawPush push=run.push;
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
             const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
@@ -2920,7 +2947,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             bind_pipeline(info.choice.pipeline);
             set_draw_state(info.key);
             static const bool probe_sets=std::getenv("UC_PROBE_SETS")!=nullptr;   // diagnostics: one descriptor set for the whole pass (wrong textures and uniforms)
-            if (!probe_sets || !probe_bound)
+            if (layers_>1) { if (!probe_sets || !probe_bound) bind_draw_set(set_index,false); }
+            else if (!probe_sets || !probe_bound)
             vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[set_index],0,nullptr);
             probe_bound=true;
             }
@@ -3049,8 +3077,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     }
                 }
                 if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
-                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_);
-                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
+                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_);
+                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
             }
             if (culled) continue;

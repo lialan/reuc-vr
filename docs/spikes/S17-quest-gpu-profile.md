@@ -114,3 +114,17 @@ What still ends a run (VR preview, `UC_MERGE_WHY=1`): a texture change 55%, a pi
 | same build, `UC_NO_MERGE=1` | 17.2 | |
 
 Trace: Binning 2.0 -> 1.0 ms, Render 11.6 -> 7.9 ms, top bins 3.1/2.6 ms.
+
+### What is left: fragments
+
+With both fixes the fragment stage is most of the main scene: `UC_PROBE_FS` (the vertex colour as the fragment) takes it from 11.2
+to 4.8 ms at scale 1, and at 3.07x the pass is fragment-bound (Render 18.4 ms for ~27 M fragments at ~150 instructions; the top
+bins still carry ~1 ms of per-draw cost each). Tried and not kept:
+- A fragment density map on the EFB (VK_EXT_fragment_density_map on non-subsampled images, full density in the centre, 2x2 / 4x4
+  fragments towards the edges; every EFB pass with the map): main scene 23.5 -> 27.1 ms at 3.07x, frame 60.3 -> 72.8 ms. The
+  fragment count did not drop (29 M) and the passes gained load/store stages; the bins became 192x992. Patch kept out of the tree.
+- Anisotropic filtering off (`--anisotropy 1`, the default is 16): main scene 23.4 -> 23.0 ms at 3.07x (within noise; not worth
+  the blurrier floor and ceiling).
+- Relaxed precision (`UC_RELAXED_TEV=1`: the folded TEV modules' colour arithmetic marked RelaxedPrecision, texture coordinates and
+  the fog's depth kept full precision; tools/spirv_relaxed_precision.py): main scene 23.4 -> 22.2 ms, the heat-haze packet 10.3 ->
+  9.9 ms, frame 60.0 -> 58.6 ms at 3.07x. Small; kept opt-in until its pictures are compared on the headset.

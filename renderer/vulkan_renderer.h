@@ -190,7 +190,7 @@ private:
     std::function<std::array<float,2>(double)> aim_history_;
     std::atomic<double> wake_seconds_{0};
     std::atomic<uint64_t> late_aim_draws_{0};
-    uint64_t merged_draws_=0, issued_draws_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
+    uint64_t merged_draws_=0, issued_draws_=0, set_binds_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
     struct Buffer { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; VkDeviceSize size = 0; };
     struct Texture {
         VkImage image=VK_NULL_HANDLE;
@@ -460,6 +460,7 @@ private:
     // The headset's vertex pre-pass (smoke.slang xformMain): each packet's vertices are shaded once by a compute dispatch, the draws read
     // the results (smoke.stereo.xform.vert.spv). Needs bufferDeviceAddress (the jobs point at the mesh slabs); UC_NO_XFORM=1 turns it off.
     bool xform_ = false;
+    bool static_depth_ = false;   // UC_STATIC_DEPTH=1 (headset): cull and depth state in the pipelines instead of dynamic
     std::vector<std::array<float,4>> cull_points_;   // the headset's culling: one draw's clip-space points (scratch)
     VkShaderModule xform_vertex_module_ = VK_NULL_HANDLE, xform_compute_module_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout xform_set_layout_ = VK_NULL_HANDLE;
