@@ -29,11 +29,23 @@ static void test_alpha_test_bit() {   // pipelines whose draws cannot fail the G
     CHECK(uc::valid_pipeline_key(uc::without_logic_op(k),false));
     k[0]|=1u<<17; CHECK(uc::valid_pipeline_key(k,true));    // bit 17: per-vertex texture matrices (the headset's bank vertex stage)
     CHECK((uc::without_logic_op(k)[0]>>17&1)==1u);
-    k[0]|=1u<<18; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 17
+    k[0]|=uc::kHudLayerKeyBit; CHECK(uc::valid_pipeline_key(k,true));   // bit 18: the headset's HUD layer variant
+    k[0]|=1u<<19; CHECK(!uc::valid_pipeline_key(k,true));   // nothing above bit 18
+}
+// The headset's direct-stage marks (order word bit 16): a key recorded before them reads as all-direct, a marked one stays as it is.
+void test_headset_direct_key() {
+    uc::PipelineKey k{}; k[1]=3; k[5]=0x48; k[9]=0x50; k[13]=0x41; k[17]=0x7;   // three stages (the fourth order word is past the count)
+    const auto all=uc::headset_direct_key(k);
+    for (int i=0;i<3;++i) CHECK((all[5+4*i]&uc::kTevDirectStage)!=0 && (all[5+4*i]&0xFFFF)==(k[5+4*i]&0xFFFF));
+    CHECK(all[17]==k[17]);
+    uc::PipelineKey mixed=k; mixed[9]|=uc::kTevDirectStage;   // stage 1 direct, stages 0 and 2 read an indirect coordinate
+    CHECK(uc::headset_direct_key(mixed)==mixed);
+    uc::PipelineKey none{}; CHECK(uc::headset_direct_key(none)==none);   // no stages: nothing to mark
 }
 int main() {
     test_without_logic_op();
     test_alpha_test_bit();
+    test_headset_direct_key();
     const auto path=std::filesystem::temp_directory_path()/"uc_test_pipeline_keys.bin";
     std::filesystem::remove(path);
     CHECK(uc::load_pipeline_keys(path).empty());

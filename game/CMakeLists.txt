@@ -144,8 +144,11 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)
   if(UC_FOLD_TEV)   # the headset's build-time specialized TEV modules (renderer/CMakeLists.txt)
     add_dependencies(uc uc_folded_tev)
+    # replaced, not merged: modules of keys no longer listed (or of an older key form) must not pile up in the APK
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E rm -rf $<TARGET_FILE_DIR:uc>/data/shaders/folded $<TARGET_FILE_DIR:uc>/data/shaders/folded_rp)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_directory ${UC_FOLDED_DIR} $<TARGET_FILE_DIR:uc>/data/shaders/folded)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_directory ${UC_FOLDED_DIR}_rp $<TARGET_FILE_DIR:uc>/data/shaders/folded_rp)   # UC_RELAXED_TEV
+    list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/project/pipeline_keys.quest $<TARGET_FILE_DIR:uc>/data)   # the headset's warm-up keys
   endif()
   if(UC_DIRECTX_SHADER_FILES)
     list(APPEND uc_post_build COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UC_DIRECTX_SHADER_FILES} $<TARGET_FILE_DIR:uc>/data/shaders)

@@ -30,6 +30,27 @@ def fnv1a64(data: bytes) -> int:
     return h
 
 
+DIRECT_STAGE = 1 << 16   # pipeline_keys.h kTevDirectStage: order-word bit of a stage without indirect texturing (the headset's keys)
+
+
+def headset_key(key):
+    """pipeline_keys.h headset_direct_key: a key recorded before the headset marked its direct stages is read as all-direct."""
+    stages = min(key[1], 16)
+    if any(key[5 + 4 * i] & DIRECT_STAGE for i in range(stages)):
+        return key
+    key = list(key)
+    for i in range(stages):
+        key[5 + 4 * i] |= DIRECT_STAGE
+    return tuple(key)
+
+
+def stripped_key(key):
+    key = list(key)
+    for i in range(min(key[1], 16)):
+        key[5 + 4 * i] &= ~DIRECT_STAGE
+    return tuple(key)
+
+
 def constants(key):
     """The fragment stage's specialization constants (make_pipeline): 0..66 = key words 1..67, 67 = key word 0 bit 16."""
     return list(key[1:68]) + [(key[0] >> 16) & 1]
@@ -76,8 +97,12 @@ def main():
     for path in args.keys:
         if os.path.exists(path):
             for key in read_keys(path):
-                values, var = constants(key), variant(key)
-                wanted[name(values, var)] = (values, var)
+                # both forms: the headset's (direct stages marked, their indirect path compiled out) and the one with every stage able to
+                # read an indirect coordinate, which the renderer falls back to for a key whose own form is not listed (a stage that does
+                # read one, in a scene no recording covered): never slower than before the marks
+                for form in (headset_key(key), stripped_key(key)):
+                    values, var = constants(form), variant(form)
+                    wanted[name(values, var)] = (values, var)
     jobs = []
     for file, (values, var) in sorted(wanted.items()):
         target = os.path.join(args.out, file)

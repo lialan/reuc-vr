@@ -321,7 +321,10 @@ float2 indirectCoord(uint map, float2 coord, float3 uv[8], uint command, inout i
 void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertexColor1,
               uint ce, uint ae, uint order, uint konst, uint stageIndex, inout int2 previousCoord) {
     float4 tex = float4(1.0);
-    uint command = drawState.indCmd[stageIndex / 4][stageIndex % 4];
+    // order bit 16 (the headset's keys, pipeline_keys.h kTevDirectStage): the stage reads no indirect coordinate, so the indirect path, with its
+    // run-time choice among the eight textures (eight samples and eight size queries), leaves the folded module: a typical stage took about
+    // 400 instructions and 16 registers a fragment with it, about 120 and 6 without (ir3, Adreno 740).
+    uint command = (order & 0x10000u) != 0 ? 0u : drawState.indCmd[stageIndex / 4][stageIndex % 4];
     if ((order & 64) != 0) {
         float2 coord = uvOf(uv[(order >> 3) & 7]);
         if (command != 0) coord = indirectCoord(order & 7, coord, uv, command, previousCoord);

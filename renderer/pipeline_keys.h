@@ -26,9 +26,21 @@ inline PipelineKey without_logic_op(PipelineKey key) {
     else key[0]=0u|(1u<<2)|(0u<<5)|(3u<<8)|writes;                 // COPY and the rest: no blending
     return key;
 }
+// The headset's keys mark every TEV stage that reads no indirect texture coordinate (its IND_CMD is 0) in bit 16 of the stage's order word
+// (key[5 + 4 * stage], specialization constant 4 + 4 * stage): tev.slang then compiles the indirect path out of that stage. Desktop keys never
+// set it (their recorded seed stays valid). Keys recorded before the bit existed are read as all-direct (headset_direct_key).
+constexpr uint32_t kTevDirectStage=1u<<16;
+inline PipelineKey headset_direct_key(PipelineKey key) {
+    const uint32_t stages=std::min<uint32_t>(key[1],16);
+    for(uint32_t i=0;i<stages;++i) if(key[5+4*i]&kTevDirectStage) return key;   // already in the headset's form
+    for(uint32_t i=0;i<stages;++i) key[5+4*i]|=kTevDirectStage;
+    return key;
+}
+// key[0] bit 18: the headset's HUD layer variant (hud_layer.h): no multiview, two colour attachments (L, T), no depth.
+constexpr uint32_t kHudLayerKeyBit=1u<<18;
 inline bool valid_pipeline_key(const PipelineKey& key,bool logic_ops) {
     const bool topology=key[69]==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || key[69]==VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>18)==0 && ((key[0]&3)!=2 || logic_ops);
+    return topology && key[1]<=16 && key[67]<=1 && key[68]<32 && (key[0]>>19)==0 && ((key[0]&3)!=2 || logic_ops);
 }
 }  // namespace uc (pipeline keys)
 namespace gx {

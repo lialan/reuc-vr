@@ -834,6 +834,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     for(size_t i=0;i<material.stages;++i) {
         const auto& stage=material.stage[i];
         key[3+i*4]=stage.color; key[4+i*4]=stage.alpha; key[5+i*4]=stage.order; key[6+i*4]=stage.konst;
+        if(layers_>1 && draw.uniforms->ind_cmd[i]==0) key[5+i*4]|=kTevDirectStage;   // the headset: this stage's indirect path compiled out (pipeline_keys.h)
     }
     return key;
 }
@@ -1064,7 +1065,15 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         stages[1].pSpecializationInfo=uber ? &uber_specialization : &specialization;
         // The headset: a module specialized at build time for exactly these constants (tools/fold_tev_shaders.py), when there is one. The
         // driver's own specialization left most of the 600 KB module in (a one-stage quad ran 160-200 instructions a fragment).
-        if (!uber && layers_>1 && !probe_fragment_) if (const VkShaderModule folded=folded_module(spec_values,fragment==early_module_)) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
+        if (!uber && layers_>1 && !probe_fragment_) {
+            VkShaderModule folded=folded_module(spec_values,fragment==early_module_);
+            if (!folded) {   // a key not listed for the build (pipeline_keys.quest): the module of the same key with every stage's indirect path in
+                auto all_indirect=spec_values;
+                for (uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) all_indirect[4+4*stage]&=~kTevDirectStage;
+                if (all_indirect!=spec_values) folded=folded_module(all_indirect,fragment==early_module_);
+            }
+            if (folded) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
+        }
         static_assert(sizeof(gx::GpuMeshVertex)==108 && sizeof(gx::Projection)==64);
         VkVertexInputBindingDescription binding; std::array<VkVertexInputAttributeDescription,14> attributes;
         mesh_vertex_input(binding,attributes);
@@ -1121,9 +1130,12 @@ void VulkanRenderer::load_pipeline_cache() {
     vk_check(vkCreatePipelineCache(device,&info,nullptr,&pipeline_cache_),"pipeline cache");   // the driver ignores data from another driver or version
     pipeline_cache_loaded_=data.size();
     std::fprintf(stderr,"[pipeline] disk cache bytes=%zu\n",data.size());
-    for (const char* name:{"pipeline_keys.seed","pipeline_keys.bin"})
+    for (const char* name:{"pipeline_keys.seed","pipeline_keys.quest","pipeline_keys.bin"})   // .quest: the headset's own keys (stereo builds ship it)
         for (const auto& recorded:load_pipeline_keys(cache_dir_/name))
-            if (const auto key=logic_ops_ ? static_key(recorded) : without_logic_op(static_key(recorded)); valid_pipeline_key(key,logic_ops_) && known_keys_.insert(key).second) warm_keys_.push_back(key);
+            if (auto key=logic_ops_ ? static_key(recorded) : without_logic_op(static_key(recorded)); valid_pipeline_key(key,logic_ops_)) {
+                if (layers_>1) key=headset_direct_key(key);   // a key recorded before the headset marked its direct stages
+                if (known_keys_.insert(key).second) warm_keys_.push_back(key);
+            }
     std::fprintf(stderr,"[pipeline] known pipeline keys=%zu\n",warm_keys_.size());
 }
 void VulkanRenderer::save_pipeline_cache() {
