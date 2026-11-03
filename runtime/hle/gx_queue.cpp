@@ -76,6 +76,7 @@ void CommandQueue::loop() {
         if (read < published) {
             idle = 0;
             uint64_t ran = 0;
+            const auto batch_start = std::chrono::steady_clock::now();
             while (read < published) {
                 auto* header = reinterpret_cast<Header*>(chunk->data + read);
                 const uint32_t size = header->size;
@@ -90,6 +91,7 @@ void CommandQueue::loop() {
                 }
                 read += size; ran += size;
             }
+            busy_ns_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batch_start).count()), std::memory_order_relaxed);
             done_.fetch_add(ran, std::memory_order_seq_cst);
             if (drain_waiting_.load(std::memory_order_seq_cst)) { std::lock_guard lock(mutex_); drained_.notify_all(); }
             continue;

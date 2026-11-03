@@ -42,7 +42,7 @@ void tramp(void* p) {
 Sched::Sched(uint8_t* mem, size_t host_stack) : mem_(mem), host_stack_(host_stack) {
     irq_ctx_.mem = mem;
     const char* spin = std::getenv("UC_SCHED_SPIN_US");
-    spin_ns_ = uint64_t(spin ? std::strtoul(spin, nullptr, 10) : 50) * 1000;
+    spin_ns_ = uint64_t(spin ? std::strtoul(spin, nullptr, 10) : 0) * 1000;   // off by default: the headset replay showed no shorter wake-ups at 50 us
 }
 
 PendingHle::PendingHle(Sched& scheduler,ppc::Ctx& c,void (*retry)(ppc::Ctx&),uint32_t entry)

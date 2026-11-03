@@ -14,6 +14,11 @@ void gx_fifo_write(int size, uint32_t value);   // hle/gx.cpp: every FIFO store'
 // window. The buffers have at least 4 bytes after `end` (the 4-byte copy below). Guest baton only.
 struct GxFifoWindow { std::byte* at = nullptr; std::byte* end = nullptr; };
 inline GxFifoWindow gx_fifo_window;
+// Outside a recording and a primitive the bytes are state commands of SDK code that is not replaced (counted, otherwise ignored); only a
+// raw display-list call (0x40, then two 4-byte words) needs gx_fifo_write, which follows it through gx_fifo_raw_state.
+inline bool gx_fifo_outside = true;
+inline uint8_t gx_fifo_raw_state = 0;
+inline uint64_t gx_fifo_outside_bytes = 0;   // guest baton writes; the statistics read it racily
 inline void gx_fifo_store(int size, uint32_t value) {
     auto& window = gx_fifo_window;
     if (window.end - window.at > size) [[likely]] {
@@ -22,6 +27,7 @@ inline void gx_fifo_store(int size, uint32_t value) {
         window.at += size;
         return;
     }
+    if (gx_fifo_outside && !gx_fifo_raw_state && !(size == 1 && value == 0x40)) { gx_fifo_outside_bytes += uint32_t(size); return; }
     gx_fifo_write(size, value);
 }
 }

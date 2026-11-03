@@ -309,8 +309,8 @@ struct CallTimer {
                 for(int w=0;w<2;++w) { for(int k=0;k<4;++k) { size_t best=0; for(size_t o=0;o<0x560/4;++o) if(cache_diff[w][o]>cache_diff[w][best]) best=o; if(cache_diff[w][best]) { std::fprintf(stderr," +%zX:%llu",best*4,(unsigned long long)cache_diff[w][best]); cache_diff[w][best]=0; } } std::fprintf(stderr,w?" (material)":" |"); }
                 std::fprintf(stderr,"\n"); std::memset(cache_diff,0,sizeof cache_diff); }
             for(auto& v:cache_stat) v=0;
-            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call; list draws %llu, %llu vertices, decoded %llu reused %llu; builder backlog %llu KiB\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0,
-                (unsigned long long)list_stat[0],(unsigned long long)list_stat[1],(unsigned long long)list_decodes.exchange(0),(unsigned long long)list_reuses.exchange(0),(unsigned long long)(queue.backlog()>>10));
+            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call; list draws %llu, %llu vertices, decoded %llu reused %llu; builder backlog %llu KiB busy %.1f ms\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0,
+                (unsigned long long)list_stat[0],(unsigned long long)list_stat[1],(unsigned long long)list_decodes.exchange(0),(unsigned long long)list_reuses.exchange(0),(unsigned long long)(queue.backlog()>>10),[] { static uint64_t last_busy=0; const uint64_t busy=queue.busy_ns(); const double ms=(busy-last_busy)/1e6; last_busy=busy; return ms; }());
             for(auto& v:list_stat) v=0;
             last=t; ns[0]=ns[1]=calls[0]=calls[1]=0;
         }
@@ -1100,7 +1100,7 @@ void reset_watch() {
 }
 void close_primitive() {
     auto& prim=front_prim;
-    prim.active=false; uc::gx_fifo_window={};
+    prim.active=false; uc::gx_fifo_window={}; uc::gx_fifo_outside=true;
     if(prim.expected>gx::CommandQueue::kMaxBytes) {   // more than a chunk: the bytes travel in their own buffer
         back([who=prim.producer,bytes=std::vector<std::byte>(prim.bytes.begin(),prim.bytes.begin()+std::ptrdiff_t(prim.expected))] { live_end(who,bytes); });
         return;
@@ -1173,7 +1173,7 @@ void gx_restore(const GxSnapshot& saved) {
     live_texture_wrap=saved.texture_wrap; live_texture=saved.texture; live_texture_maps=saved.texture_maps;
     copy_state=saved.copy; texture_copy_source=saved.copy_source; texture_copy_width=saved.copy_width;
     texture_copy_height=saved.copy_height; texture_copy_format=saved.copy_format; copied_textures=saved.copied;
-    capture=std::make_unique<gx::Vertices>(saved.vertices); brec.reset(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={}; draws=saved.draws;
+    capture=std::make_unique<gx::Vertices>(saved.vertices); brec.reset(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={}; uc::gx_fifo_outside=true; draws=saved.draws;
     resources=saved.resources; front_resources=saved.front_resources; finishes=saved.finishes; prompt_batch=saved.prompt_batch; carried_prompts=saved.prompts;
     // State/material snapshots belong to the abandoned timeline.
     back_derived.clear(); material_cache.valid=false; dirty_state(); dirty_material();
@@ -1227,7 +1227,7 @@ void gx_hle_init(Sched& sched, uint8_t* base, gx::Packets* packet_queue, bool pr
     bound_textures={}; palettes.clear(); live_texture.reset(); live_texture_maps={};
     draw_count = 0; vertex_count = 0; submitted = 0; completed = 0; outside_bytes = 0;
     back_derived.clear(); material_cache={};
-    known_sdk=0; front_resources.clear(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={};
+    known_sdk=0; front_resources.clear(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={}; uc::gx_fifo_outside=true; uc::gx_fifo_raw_state=0; uc::gx_fifo_outside_bytes=0;
     back_sdk_last.reset(); front_view_valid=false;
     { std::lock_guard lock(det_finish_m); det_finishes.clear(); det_early.clear(); }
     front_serial=back_serial=packets ? packets->next_serial()-1 : 0;
@@ -1309,7 +1309,7 @@ void gx_fifo_write(int size, uint32_t value) {
         return;
     }
     if (!front_prim.active) {
-        static int raw_state=0; static uint32_t raw_address=0;   // a raw display list call is three writes: 0x40, address, length
+        auto& raw_state=gx_fifo_raw_state; static uint32_t raw_address=0;   // a raw display list call is three writes: 0x40, address, length
         if (raw_state==0) { if (size==1 && value==0x40) raw_state=1; }
         else if (raw_state==1) { if (size==4) { raw_address=value; raw_state=2; } else raw_state=0; }
         else {
@@ -1352,7 +1352,7 @@ std::string gx_state_summary() {   // crash bundle gx.txt: bound arrays (12 = po
     if (brec) add("recorded", brec->input_state);
     return text;
 }
-GxStats gx_stats() { return {draw_count.load(), vertex_count.load(), submitted.load(), completed.load(), outside_bytes.load(),copies.load(),texture_decodes.load(),geometry_hits.load(),geometry_misses.load(),prompt_annotations.load(),prompt_present.load(),prompt_fallback.load(),texture_evictions.load(),texture_resident.load()}; }
+GxStats gx_stats() { return {draw_count.load(), vertex_count.load(), submitted.load(), completed.load(), outside_bytes.load()+uc::gx_fifo_outside_bytes,copies.load(),texture_decodes.load(),geometry_hits.load(),geometry_misses.load(),prompt_annotations.load(),prompt_present.load(),prompt_fallback.load(),texture_evictions.load(),texture_resident.load()}; }
 }
 namespace {
 // The checks every GX call between primitives makes (sequence, producer).
@@ -1404,7 +1404,7 @@ void hle_GXBegin(ppc::Ctx& c) {
     auto& prim=front_prim;
     prim.active=true; prim.producer=who; prim.callsite=callsite; prim.expected=expected;
     if(prim.bytes.size()<expected+8) prim.bytes.resize(expected+8);
-    uc::gx_fifo_window={prim.bytes.data(),prim.bytes.data()+expected};
+    uc::gx_fifo_window={prim.bytes.data(),prim.bytes.data()+expected}; uc::gx_fifo_outside=false;
 }
 void hle_GXSetArray(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802841DC, c);
@@ -1466,7 +1466,7 @@ void hle_GXBeginDisplayList(ppc::Ctx& c) {
         brec=std::move(recording); dirty_state();
     });
     front_list=std::move(list);
-    uc::gx_fifo_window={front_list->bytes.get(),nullptr}; list_window();
+    uc::gx_fifo_window={front_list->bytes.get(),nullptr}; uc::gx_fifo_outside=false; list_window();
 }
 void hle_GXEndDisplayList(ppc::Ctx& c) {
     uc::gx_audit_enter(0x802885D8,c);
@@ -1476,7 +1476,7 @@ void hle_GXEndDisplayList(ppc::Ctx& c) {
         throw gx::Error(gx::ErrorCode::truncated,front_list->prim_callsite,front_list->prim_expected,front_list->prim_expected-size_t(front_list->prim_end-uc::gx_fifo_window.at));
     uc::call_guest(c,0x80284504,{}); // verified GXFlush: dirty state followed by 32 NOP bytes
     const size_t used=list_used();
-    auto list=std::move(front_list); uc::gx_fifo_window={};
+    auto list=std::move(front_list); uc::gx_fifo_window={}; uc::gx_fifo_outside=true;
     const uint32_t length=list->overflow ? 0 : uint32_t(used) & ~31u;
     if (length) { std::memcpy(c.mem+(list->address & 0x3FFFFFFF),list->bytes.get(),length); gx::note_write_range(list->address,length); }
     std::shared_ptr<const std::vector<std::byte>> bytes;

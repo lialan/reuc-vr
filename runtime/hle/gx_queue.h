@@ -80,6 +80,7 @@ public:
     [[noreturn]] void rethrow();
     bool failed() const { return failed_.load(std::memory_order_acquire); }
     uint64_t backlog() const { return emitted_ - done_.load(std::memory_order_relaxed); }   // front: bytes of commands not yet run
+    uint64_t busy_ns() const { return busy_ns_.load(std::memory_order_relaxed); }   // time the builder spent running commands so far
 
 private:
     static constexpr size_t kAlign = 16;
@@ -115,7 +116,7 @@ private:
     uint32_t tail_ = 0;
     uint64_t emitted_ = 0;
     // shared
-    std::atomic<uint64_t> done_{0};
+    std::atomic<uint64_t> done_{0}, busy_ns_{0};
     std::atomic<bool> sleeping_{false}, stop_{false}, failed_{false}, drain_waiting_{false};
     std::exception_ptr failure_;
     std::mutex mutex_;

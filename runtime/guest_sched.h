@@ -128,7 +128,7 @@ private:
     std::vector<void*> handles_;
     Thread* running_ = nullptr;
     std::atomic<Thread*> baton_{nullptr};   // running_ for the spin in handoff (written with running_, under baton_m_)
-    uint64_t spin_ns_ = 0;                  // how long a thread that handed the baton on spins for it before sleeping (UC_SCHED_SPIN_US)
+    uint64_t spin_ns_ = 0;                  // how long a thread that handed the baton on spins for it before sleeping (UC_SCHED_SPIN_US, default 0 = sleep at once)
     Thread* main_ = nullptr;
     ppc::Ctx irq_ctx_{};
     std::atomic<bool> shutdown_{false}, main_done_{false};
