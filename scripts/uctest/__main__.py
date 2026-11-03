@@ -18,7 +18,7 @@ def run_once(name, args):
         return {"scenario": name, "ok": True, "seconds": 0, "result": {"skipped": skipped}}, "(skipped)"
     if getattr(args, "quest", False):
         return run_on_quest(name, args)
-    g = Game(**({"exe": args.exe} if args.exe else {}), speed=args.speed, god=args.god, skip_tutorials=args.skip_tutorials or name == "fight", saves=resolve_saves(args.saves_from), game_args=args.game_arg,
+    g = Game(**({"exe": args.exe} if args.exe else {}), speed=args.speed, god=args.god, skip_tutorials=args.skip_tutorials or name in ("fight", "play"), seconds=4 * 3600 if name == "play" else 600, saves=resolve_saves(args.saves_from), game_args=args.game_arg,
              mods=SCENARIO_MODS.get(name, False), mod_settings=SCENARIO_MOD_SETTINGS.get(name))
     start = time.monotonic()
     report = {"scenario": name, "ok": False, "speed": args.speed, "god": args.god}
@@ -52,7 +52,7 @@ def run_on_quest(name, args):
     run_dir = root / "build-android" / "quest-runs" / f"uctest-{name}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     adb = ["adb", "-s", QUEST_SERIAL]
-    game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", "1800", "--speed", str(args.speed)] + list(args.game_arg)
+    game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", str(4 * 3600 if name == "play" else 1800), "--speed", str(args.speed)] + list(args.game_arg)
     runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)
                               + [f"--arg={a}" for a in game_args] + [f"--set={s}" for s in getattr(args, "quest_set", [])]
                               + ([f"--saves={SAVE_SOURCE}"] if SAVE_SOURCE and Path(SAVE_SOURCE).is_dir() else []),   # the desktop runs' save snapshot: the menu route needs slot 1
@@ -111,6 +111,7 @@ def main(argv=None):
     run.add_argument("--wave-offset", type=int, default=None, help="fight: game seconds after the 30-actor wave starts where the run drops to x1 (default: the learned F5 point)")
     run.add_argument("--slow-at", type=int, default=0, help="fight: drop to speed 1 at this game second (retraces / 60) instead of the learned point")
     run.add_argument("--mark", action="store_true", help="fight: ignore the saved slowdown point and wait for F5 to set a new one")
+    run.add_argument("--at", choices=("fight", "start"), default="fight", help="play: hand over at the heavy train fight (default) or when chapter gameplay starts")
     run.add_argument("--max-minutes", type=float, default=10, help="autoplay wall-time limit")
     bench = sub.add_parser("bench", help="compare game builds on the heavy fight: cycles per frame at one scene weight, alternating runs, 95%% CI (see uctest/bench.py)")
     bench.add_argument("--demo", help="replay this recorded demo (python -m uctest demo record NAME) instead of playing the fight live: identical guest work in every run")

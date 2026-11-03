@@ -398,6 +398,28 @@ def fight(g, args):
     ignores the saved point and waits for F5 again (F5 always works and replaces the saved point). With UC_CPU_SAMPLE_FLAG=<file> set for the run,
     the game's CPU sampler starts at the slowdown (the scenario creates that file). Tutorials are skipped; fight_trace.csv lists actors, living
     enemies and draws per game second."""
+    import os
+    from pathlib import Path
+    marked = reach_fight(g, args)
+    flag = os.environ.get("UC_CPU_SAMPLE_FLAG")
+    if flag:
+        Path(flag).write_text("go")
+    result = {"marked": marked, "capture": g.capture()}
+    window_from = g.frame.get("retraces", 0)
+    with g.step("measure_fps"):
+        result.update(steps.measure_fps(g, args.measure or 15, csv_path=g.run_dir / "fps50.csv"))
+    result["demo_window"] = {"from": window_from, "to": g.frame.get("retraces", 0)}   # retrace range a demo replay measures (uctest demo / bench --demo)
+    burst = int(os.environ.get("UC_CAPTURE_BURST", "0"))   # UC_CAPTURE_BURST=N: N captures one game tick apart after the measurement (ghosting and smear checks of the upscalers)
+    if burst:
+        result["burst"] = []
+        for _ in range(burst):
+            result["burst"].append(g.capture())
+            g.advance(1)
+    return result
+
+
+def reach_fight(g, args):
+    """The menus and the bot at speed 8 up to the fight's slowdown point (see fight), then speed 1 in gameplay; returns the scene fingerprint."""
     import collections
     import ctypes
     import json
@@ -475,22 +497,37 @@ def fight(g, args):
     with g.step("normal_speed"):
         g.set_speed(1)
         g.wait(lambda f: f.get("speed") == 1 and f.get("context") == "gameplay", seconds=10, awaited="speed 1 in gameplay")
-    flag = os.environ.get("UC_CPU_SAMPLE_FLAG")
-    if flag:
-        Path(flag).write_text("go")
-    result = {"marked": marked, "capture": g.capture()}
-    window_from = g.frame.get("retraces", 0)
-    with g.step("measure_fps"):
-        result.update(steps.measure_fps(g, args.measure or 15, csv_path=g.run_dir / "fps50.csv"))
-    result["demo_window"] = {"from": window_from, "to": g.frame.get("retraces", 0)}   # retrace range a demo replay measures (uctest demo / bench --demo)
-    burst = int(os.environ.get("UC_CAPTURE_BURST", "0"))   # UC_CAPTURE_BURST=N: N captures one game tick apart after the measurement (ghosting and smear checks of the upscalers)
-    if burst:
-        result["burst"] = []
-        for _ in range(burst):
-            result["burst"].append(g.capture())
-            g.advance(1)
-    return result
+    return marked
 
+
+def play(g, args):
+    """Hand the game to a human at the heavy train fight (default) or, with --at start, as soon as chapter gameplay begins: menus (and the bot)
+    at speed 8, then speed 1, then the harness disconnects (the game releases every input it held) and the game keeps running until its window
+    is closed (Quest: until Ctrl-C). For playing and profiling by hand; --god keeps health and ammo full."""
+    import time
+    if getattr(args, "at", "fight") == "start":
+        g.set_speed(8)
+        reach_gameplay(g, args.chapter)
+        with g.step("normal_speed"):
+            g.set_speed(1)
+            g.wait(lambda f: f.get("speed") == 1 and f.get("context") == "gameplay", seconds=10, awaited="speed 1 in gameplay")
+        result = {}
+    else:
+        result = {"marked": reach_fight(g, args)}
+    result["capture"] = g.capture()
+    started = time.monotonic()
+    print("play: your turn -- the game is at speed 1; close the game window to end" + (" (Ctrl-C on Quest)" if not g.process else ""), flush=True)
+    g.transport.close()
+    try:
+        if g.process:
+            g.process.wait()
+        else:
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    result["played_seconds"] = round(time.monotonic() - started)
+    return result
 
 def autoplay(g, args):
     """Play from the train chapter start as far as the bot gets; the report says where and why it stopped."""
@@ -1672,7 +1709,7 @@ def pointer_range(g, args):
     return result
 
 
-SCENARIOS = {"boot_to_title": boot_to_title, "create_saves": create_saves, "train_gameplay": train_gameplay, "no_tutorials": no_tutorials, "controls": controls, "weapon_switch": weapon_switch, "perf": perf, "fight": fight, "autoplay": autoplay, "resize": resize,
+SCENARIOS = {"boot_to_title": boot_to_title, "create_saves": create_saves, "train_gameplay": train_gameplay, "no_tutorials": no_tutorials, "controls": controls, "weapon_switch": weapon_switch, "perf": perf, "fight": fight, "play": play, "autoplay": autoplay, "resize": resize,
              "pause": pause, "overlay": overlay, "mods_smoke": mods_smoke, "hook_probe": hook_probe, "hook_block": hook_block, "weapon_damage": weapon_damage, "fire_rate": fire_rate, "hook_replace": hook_replace, "camera_api": camera_api, "player_api": player_api, "input_force": input_force, "input_block": input_block, "enemy_api": enemy_api, "state_dump": state_dump, "player_dump": player_dump, "game_api": game_api, "timers_api": timers_api, "arc_grow": train_gameplay, "arc_member": arc_member, "movie_probe": movie_probe, "movie_replace": movie_replace, "inspector_live": inspector_live, "randomizer_live": randomizer_live, "randomizer_plain": randomizer_live, "camera_capture": camera_capture, "arc_member_plain": arc_member, "guest_api": guest_api, "text_replace": text_replace, "text_replace_plain": text_replace, "audio_replace": audio_replace, "audio_replace_silent": audio_replace_silent, "dol_names": dol_names}
 SCENARIO_MODS = {"mods_smoke": MODS_SMOKE_MODS, "hook_probe": ["hook_probe"], "hook_block": ["hook_block"], "weapon_damage": ["damage_big"], "fire_rate": ["fire_rate_2"], "hook_replace": ["hook_replace"], "camera_api": ["camera_probe"], "player_api": ["player_probe"], "input_force": ["input_force"], "input_block": ["input_block"], "enemy_api": ["enemy_kill"], "game_api": ["game_probe"], "timers_api": ["timer_probe"], "arc_grow": ["arc_grow"], "arc_member": ["arc_member"], "movie_probe": ["movie_probe"], "movie_replace": ["movie_replace"], "inspector_live": ["inspector"], "randomizer_live": ["randomizer"], "guest_api": ["guest_probe"], "text_replace": ["text_marker"], "audio_replace": ["audio_tone"], "audio_replace_silent": ["audio_silent"], "dol_names": ["dol_names"]}   # example mods a scenario needs installed before the game starts (Game(mods=[...]))
 SCENARIO_MODS["weapon_switch"] = ["timer_probe"]   # enable the input API with a fixture that leaves input unchanged
