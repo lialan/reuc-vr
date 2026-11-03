@@ -259,6 +259,45 @@ int main() {
             CHECK(same(c.f[target],expected0) && same(c.ps1[target],expected1));
             CHECK(c.cr[1]==10);
         }
+    {   // the two-lane vector forms of the other paired-single ops give the per-half scalar results bit for bit (NaN payloads included)
+        const uint64_t specials[]={0x0000000000000000ull,0x8000000000000000ull,0x3FF0000000000000ull,0xBFF0000000000000ull,0x0000000000000001ull,
+                                   0x7FF0000000000000ull,0xFFF0000000000000ull,0x7FF8000000000123ull,0xFFF4000000000456ull,0x7FF0000000000789ull,
+                                   0x47EFFFFFE0000000ull,0x47EFFFFFF0000000ull,0x3810000000000000ull,0x36A0000000000000ull,0x3FF0000010000000ull,
+                                   0xC08F400000000000ull,0x4059000000000000ull,0x3E7AD7F29ABCAF48ull};
+        constexpr size_t n=sizeof specials/sizeof specials[0];
+        auto d=[&](uint64_t b){ double v; std::memcpy(&v,&b,8); return v; };
+        auto bits_of=[](double v){ uint64_t b; std::memcpy(&b,&v,8); return b; };
+        auto rs=[](double v){ volatile double x=v; volatile float f=float(x); return double(f); };
+        size_t mismatches=0;
+        for(size_t i=0;i<n;++i) for(size_t j=0;j<n;++j) {
+            const double a0=d(specials[i]),a1=d(specials[(i+5)%n]),b0=d(specials[j]),b1=d(specials[(j+7)%n]),c0=d(specials[(i+j)%n]),c1=d(specials[(i*3+j)%n]);
+            auto load=[&]{ c.f[1]=a0;c.ps1[1]=a1;c.f[2]=b0;c.ps1[2]=b1;c.f[3]=c0;c.ps1[3]=c1; };
+            auto expect=[&](const char* name,double e0,double e1) {
+                if(bits_of(c.f[4])!=bits_of(e0) || bits_of(c.ps1[4])!=bits_of(e1)) {
+                    if(++mismatches<10) std::fprintf(stderr,"%s(%016llx,%016llx): got %016llx %016llx want %016llx %016llx\n",name,(unsigned long long)specials[i],
+                        (unsigned long long)specials[j],(unsigned long long)bits_of(c.f[4]),(unsigned long long)bits_of(c.ps1[4]),(unsigned long long)bits_of(e0),(unsigned long long)bits_of(e1));
+                }
+            };
+            volatile double va0=a0,va1=a1,vb0=b0,vb1=b1,vc0=c0,vc1=c1;
+            load(); op_ps_div(c,4,1,2,false); expect("ps_div",rs(va0/vb0),rs(va1/vb1));
+            load(); op_ps_sel(c,4,1,2,3,false); expect("ps_sel",rs(va0>=0.0 ? vc0 : vb0),rs(va1>=0.0 ? vc1 : vb1));
+            load(); op_ps_sum0(c,4,1,2,3,false); expect("ps_sum0",rs(va0+vb1),rs(vc1));
+            load(); op_ps_sum1(c,4,1,2,3,false); expect("ps_sum1",rs(vc0),rs(va0+vb1));
+            load(); op_ps_res(c,4,1,false); expect("ps_res",rs(1.0/va0),rs(1.0/va1));
+            load(); op_ps_rsqrte(c,4,1,false); expect("ps_rsqrte",rs(1.0/std::sqrt(double(va0))),rs(1.0/std::sqrt(double(va1))));
+            load(); op_ps_neg(c,4,1,false); expect("ps_neg",-va0,-va1);
+            load(); op_ps_abs(c,4,1,false); expect("ps_abs",std::fabs(double(va0)),std::fabs(double(va1)));
+            load(); op_ps_nabs(c,4,1,false); expect("ps_nabs",-std::fabs(double(va0)),-std::fabs(double(va1)));
+            load(); op_ps_mr(c,4,1,false); expect("ps_mr",a0,a1);
+            load(); op_ps_merge00(c,4,1,2,false); expect("ps_merge00",a0,b0);
+            load(); op_ps_merge01(c,4,1,2,false); expect("ps_merge01",a0,b1);
+            load(); op_ps_merge10(c,4,1,2,false); expect("ps_merge10",a1,b0);
+            load(); op_ps_merge11(c,4,1,2,false); expect("ps_merge11",a1,b1);
+        }
+        CHECK(mismatches==0);
+        // the destination may be a source
+        c.f[1]=2.0;c.ps1[1]=-4.0; op_ps_merge10(c,1,1,1,false); CHECK(c.f[1]==-4.0 && c.ps1[1]==2.0);
+    }
     // ps_cmpu0 / ps_cmpu1 write a CR field like fcmp
     c.f[1]=1.0;c.ps1[1]=2.0;c.f[2]=10.0;c.ps1[2]=20.0;
     op_ps_cmpu0(c, 2, 1, 2);           CHECK(c.cr[2] == 8);

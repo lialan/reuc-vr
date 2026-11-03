@@ -1,4 +1,4 @@
-add_library(uc_common STATIC dol.cpp dol_scan.cpp ppc/isa.cpp analyzer/config.cpp analyzer/analyzer.cpp translator/emit.cpp sig/dsy.cpp ppc/format.cpp)
+add_library(uc_common STATIC dol.cpp dol_scan.cpp ppc/isa.cpp analyzer/config.cpp analyzer/analyzer.cpp translator/emit.cpp translator/regeffect.cpp sig/dsy.cpp ppc/format.cpp)
 target_include_directories(uc_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(uc_input STATIC input_bindings.cpp)
 add_library(uc_netplay STATIC netplay.cpp netplay_stream.cpp netplay_datagram.cpp)

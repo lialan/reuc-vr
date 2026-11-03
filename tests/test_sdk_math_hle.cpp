@@ -157,7 +157,19 @@ void compare(const char* name, void (*hle)(Ctx&), void (*ref)(Ctx&), bool return
         Fix expected, got;
         const auto want = run(expected, ref, words, args, fp, constants);
         const auto have = run(got, hle, words, args, fp, constants);
-        const bool same = same_memory(want.memory, have.memory) && (!returns || (same_double(want.f1, have.f1) && same_double(want.ps1_1, have.ps1_1)));
+        bool same = same_memory(want.memory, have.memory) && (!returns || (same_double(want.f1, have.f1) && same_double(want.ps1_1, have.ps1_1)));
+        // The translator's leaf calls (emit.cpp analyze_leaves) rely on these natives writing no register but their result (f1 for the
+        // returning ones): a call of one reloads only what the guest routine may write.
+        const Ctx& c = got.c;
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t r = i == 2 ? kSda : i >= 3 && i <= 5 ? args[i - 3] : 0u;
+            if (c.r[i] != r) same = false;
+            if (i == 1 && returns) continue;
+            const double f = i >= 1 && i <= 3 ? fp[i - 1] : 123.0 + i, p = i >= 1 && i <= 3 ? fp[i - 1] : -7.0 - i;
+            if (bits(c.f[i]) != bits(f) || bits(c.ps1[i]) != bits(p)) same = false;
+        }
+        for (int i = 0; i < 8; ++i) if (c.cr[i] || c.gqr[i]) same = false;
+        if (c.xer_ca || c.xer_ov || c.xer_so || c.lr || c.ctr || c.fpscr) same = false;
         if (!same && ++mismatches <= 3) std::printf("%s differs at iteration %d (args %08X %08X %08X)\n", name, n, args[0], args[1], args[2]);
     }
     std::printf("%s: %d mismatches in %d randomised runs\n", name, mismatches, iterations);

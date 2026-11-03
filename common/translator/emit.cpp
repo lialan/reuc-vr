@@ -1,4 +1,5 @@
 #include "translator/emit.h"
+#include "translator/regeffect.h"
 #include "ppc/insn.h"
 #include "ppc/isa.h"
 #include <algorithm>
@@ -97,16 +98,80 @@ static std::string cond_expr(uint32_t bo, uint32_t bi, std::string& pre) {
     return e.empty() ? "true" : e;
 }
 
-static std::string branch_action(const Program& p, const Function& f, uint32_t pc, uint32_t target, bool lk, EmitStats& st) {
+// Sync code of one instruction in register-cache mode (CrHints::local); empty strings and the context `c` otherwise.
+struct SyncText {
+    std::string cx = "c", flush, reload, not_taken;
+    const std::map<uint32_t, std::string>* edges = nullptr;
+    const CrHints* h = nullptr;
+    explicit SyncText(const CrHints* hints) {
+        if (hints && hints->local) {
+            cx = "ctx"; h = hints; flush = h->flush; reload = h->reload + h->after_call; not_taken = h->not_taken; edges = &h->edge;
+        }
+    }
+    bool local() const { return cx == "ctx"; }
+    // the else branch of a conditional call: what the path that skips the call flushes (code after the call would also run after it)
+    std::string otherwise(bool lk) const { return lk && !not_taken.empty() ? " else { " + not_taken + "}" : ""; }
+    std::string edge(uint32_t target) const {   // a forward jump to an internal label
+        if (!edges) return "";
+        auto it = edges->find(target);
+        return it == edges->end() ? "" : it->second;
+    }
+};
+
+// The SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; HLE entries SaveGprN ... RestFprN, see
+// runtime/hle/sdk_regs.cpp): a call of one does what the helper does (ppc::save_gpr<N> ..., ppc_rt.h), so in register-cache mode the translator
+// writes them in place of the call; no sync of the register copy around every prologue and epilogue.
+struct RegHelper { char kind = 0; uint32_t first = 0; };   // 'S' SaveGpr, 'R' RestGpr, 's' SaveFpr, 'r' RestFpr
+static RegHelper reg_helper(const Program& p, uint32_t target) {
+    auto it = p.cfg.hle.find(target);
+    if (it == p.cfg.hle.end() || it->second.size() < 8) return {};
+    const std::string& n = it->second;
+    const std::string head = n.substr(0, 7);
+    const char kind = head == "SaveGpr" ? 'S' : head == "RestGpr" ? 'R' : head == "SaveFpr" ? 's' : head == "RestFpr" ? 'r' : 0;
+    if (!kind || n.find_first_not_of("0123456789", 7) != std::string::npos) return {};
+    const uint32_t first = uint32_t(std::stoul(n.substr(7)));
+    return first >= 14 && first <= 31 ? RegHelper{kind, first} : RegHelper{};
+}
+static std::string reg_helper_text(const RegHelper& h) {   // the helper's own code (ppc_rt.h), in the local register copy
+    const char* fn = h.kind == 'S' ? "save_gpr" : h.kind == 'R' ? "rest_gpr" : h.kind == 's' ? "save_fpr" : "rest_fpr";
+    return std::string("ppc::") + fn + "<" + num(h.first) + ">(c); ";
+}
+static RegEffect reg_helper_effect(const RegHelper& h) {
+    RegEffect e;
+    e.use.set(size_t(res::R + 11));
+    for (uint32_t i = h.first; i < 32; ++i) {
+        const size_t r = size_t((h.kind == 'S' || h.kind == 'R' ? res::R : res::F) + int(i));
+        if (h.kind == 'S' || h.kind == 's') e.use.set(r); else { e.may.set(r); e.must.set(r); }
+    }
+    return e;
+}
+
+static std::string branch_action(const Program& p, const Function& f, uint32_t pc, uint32_t target, bool lk, EmitStats& st, const SyncText& s) {
     Target tk = classify(p, f, target);
-    if (tk.kind == Target::Internal && !lk) return std::string(target <= pc ? "ppc::poll(c); " : "") + "goto L_" + hex8(target) + ";";   // a loop is a safe point
+    if (s.local() && tk.kind == Target::Entry) {
+        if (const RegHelper h = reg_helper(p, target); h.kind) {
+            if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + reg_helper_text(h);
+            return reg_helper_text(h) + s.flush + "return;";
+        }
+    }
+    if (tk.kind == Target::Internal && !lk) {
+        if (target > pc) return s.edge(target) + "goto L_" + hex8(target) + ";";
+        // a loop is a safe point; the interrupts that may run there see the registers in the real context
+        if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + "} goto L_" + hex8(target) + ";";
+        return "ppc::poll(c); goto L_" + hex8(target) + ";";
+    }
     if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) {
         ++st.traps_midfunc;
-        return trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
+        return s.flush + trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
     }
     std::string fn = tk.kind == Target::Secondary ? sec_name(tk.owner, target) : callee(p, target);
-    if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + fn + "(c);";
-    return fn + "(c); return;";
+    if (lk && s.h && s.h->leaf_call) {   // partial sync unless native code runs at the callee's entry
+        const std::string lr = "c.lr = 0x" + hex8(pc + 4) + "u; ";
+        return "if constexpr (UC_PLAIN_ENTRY(0x" + hex8(target) + "u)) { " + lr + s.flush + fn + "(ctx); " + s.reload + "} else { " + lr + s.h->full_flush +
+               fn + "(ctx); " + s.h->full_reload + s.h->after_call + "}";
+    }
+    if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + fn + "(" + s.cx + ");" + (s.reload.empty() ? "" : " " + s.reload);
+    return s.flush + fn + "(" + s.cx + "); return;";
 }
 
 // Branch condition from a compare that was not written to CR: bit 0..3 of BI = LT GT EQ SO of that compare.
@@ -118,61 +183,82 @@ static std::string fused_cond(const FusedCmp& cmp, uint32_t bo, uint32_t bi) {
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t w, EmitStats& st, const CrHints* hints) {
     ++st.instructions;
+    const SyncText s(hints);
     const ppc::OpInfo* op = ppc::decode(w);
     if (!op) {
         ++st.invalid;
-        return trap_str(pc, "illegal or data word " + hex8(w));
+        return s.flush + trap_str(pc, "illegal or data word " + hex8(w));
     }
     using ppc::Kind;
     std::string name = op->name;
-    if ((name == "twi" || name == "tw") && ppc::t(w) == 31) return trap_str(pc, "unconditional trap");
-    if (op->sub == ppc::Sub::X9 && ppc::oe(w)) { ++st.oe_traps; return trap_str(pc, "OE (overflow-enabled) form of " + name + " is not implemented"); }
-    if (op->kind == Kind::UNSUP) { ++st.unsupported; return trap_str(pc, "unsupported instruction " + name); }
+    if ((name == "twi" || name == "tw") && ppc::t(w) == 31) return s.flush + trap_str(pc, "unconditional trap");
+    if (op->sub == ppc::Sub::X9 && ppc::oe(w)) { ++st.oe_traps; return s.flush + trap_str(pc, "OE (overflow-enabled) form of " + name + " is not implemented"); }
+    if (op->kind == Kind::UNSUP) { ++st.unsupported; return s.flush + trap_str(pc, "unsupported instruction " + name); }
 
     switch (op->kind) {
-        case Kind::SC: return "uc::hle_sc(c, 0x" + hex8(pc) + "u);";
+        case Kind::SC: return s.flush + "uc::hle_sc(" + s.cx + ", 0x" + hex8(pc) + "u);" + (s.reload.empty() ? "" : " " + s.reload);
         case Kind::BR: {
             int32_t li = ppc::li(w);
             uint32_t target = ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li);
-            return branch_action(p, f, pc, target, ppc::lk(w), st);
+            return branch_action(p, f, pc, target, ppc::lk(w), st, s);
         }
         case Kind::BC: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
             uint32_t target = ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w));
             std::string pre;
             std::string cond = hints && hints->fused ? fused_cond(*hints->fused, bo, bi) : cond_expr(bo, bi, pre);
-            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st) + " } }";
+            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st, s) + " }" + s.otherwise(ppc::lk(w)) + " }";
         }
         case Kind::BCLR: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
             std::string pre;
             std::string cond = hints && hints->fused ? fused_cond(*hints->fused, bo, bi) : cond_expr(bo, bi, pre);
-            std::string act = ppc::lk(w) ? "{ uint32_t t_ = c.lr; c.lr = 0x" + hex8(pc + 4) + "u; uc::call_indirect(c, t_); }" : "return;";
+            std::string act = ppc::lk(w) ? "{ uint32_t t_ = c.lr; c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", t_); " + s.reload + "}"
+                                         : s.flush + "return;";
             if (cond == "true" && pre.empty()) return act;
-            return "{ " + pre + "if (" + cond + ") { " + act + " } }";
+            return "{ " + pre + "if (" + cond + ") { " + act + " }" + s.otherwise(ppc::lk(w)) + " }";
         }
         case Kind::BCCTR: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
             std::string pre;
             std::string cond = cond_expr(bo | 4, bi, pre);   // bcctr never decrements CTR
             if (ppc::lk(w)) {
-                std::string act = "c.lr = 0x" + hex8(pc + 4) + "u; uc::call_indirect(c, c.ctr);";
-                return cond == "true" ? act : "if (" + cond + ") { " + act + " }";
+                std::string act = "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", c.ctr);" + (s.reload.empty() ? "" : " " + s.reload);
+                return cond == "true" ? act : "if (" + cond + ") { " + act + " }" + s.otherwise(true);
             }
             for (const auto& jt : p.an.jump_tables) {
                 if (jt.bctr_addr != pc) continue;
                 std::set<uint32_t> seen;
-                std::string s = "switch (c.ctr) { ";
-                for (uint32_t t : jt.targets) if (seen.insert(t).second) s += "case 0x" + hex8(t) + "u: goto L_" + hex8(t) + "; ";
-                s += "default: " + trap_str(pc, "jump table index out of range") + " }";
-                return s;
+                std::string sw = "switch (c.ctr) { ";
+                for (uint32_t t : jt.targets) if (seen.insert(t).second) sw += "case 0x" + hex8(t) + "u: " + s.edge(t) + "goto L_" + hex8(t) + "; ";
+                sw += "default: " + s.flush + trap_str(pc, "jump table index out of range") + " }";
+                return sw;
             }
             if (std::find(p.an.unresolved_bctr.begin(), p.an.unresolved_bctr.end(), pc) != p.an.unresolved_bctr.end()) ++st.unresolved_bctr;
             else ++st.indirect_tail;
-            std::string act = "uc::call_indirect(c, c.ctr); return;";
+            std::string act = s.flush + "uc::call_indirect(" + s.cx + ", c.ctr); return;";
             return cond == "true" ? "{ " + act + " }" : "if (" + cond + ") { " + act + " }";
         }
         default: break;
+    }
+    if (s.local()) {
+        // State the register cache does not hold lives in the real context; lmw/stmw become one access per register so every register index
+        // stays a compile-time constant (the local copy is then kept in host registers).
+        const uint32_t T = ppc::t(w), spr = ppc::spr(w);
+        const bool cached_spr = spr == 1 || spr == 8 || spr == 9 || (spr >= 912 && spr <= 919);
+        if (name == "mfspr" && !cached_spr) return "c.r[" + num(T) + "] = ctx.spr[" + num(spr & 1023) + "];";
+        if (name == "mtspr" && !cached_spr) return "ctx.spr[" + num(spr & 1023) + "] = c.r[" + num(T) + "];";
+        if (name == "mfmsr") return "c.r[" + num(T) + "] = ctx.msr;";
+        if (name == "mtmsr") return "ctx.msr = c.r[" + num(T) + "];";
+        if (name == "lmw" || name == "stmw") {
+            const uint32_t A = ppc::a(w);
+            std::string o = "const uint32_t e_ = " + (A ? "c.r[" + num(A) + "] + " : std::string()) + "uint32_t(" + num(ppc::simm(w)) + ");";
+            for (uint32_t i = T; i < 32; ++i) {
+                const std::string at = "e_ + " + num(4 * (i - T)) + "u";
+                o += name == "lmw" ? " c.r[" + num(i) + "] = ppc::rd32(c, " + at + ");" : " ppc::wr32(c, " + at + ", c.r[" + num(i) + "]);";
+            }
+            return o;
+        }
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
@@ -374,8 +460,143 @@ CrLive analyze_cr(const Program& p) {
     return live;
 }
 
-std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live) {
-    std::set<uint32_t> labels{f.entry};
+// ---- register cache ----
+// In register-cache mode every translated function works on a local ppc::Ctx `c` (only the parts it uses survive the optimiser, as host
+// registers) and syncs it with the real context `ctx` where other code can look: before a call, a return, a tail call, a trap or an interrupt
+// poll it stores the registers written since the last sync ("dirty", forward dataflow), and after a call or a poll it reloads the registers
+// that are read before being written again ("live", backward dataflow; a later flush counts as a read, so a flushed copy is always current).
+// Guest memory stores can no longer alias the registers, so the compiler keeps them in host registers across loads and stores.
+namespace {
+struct RegNode {
+    RegEffect eff;
+    bool fall = true;          // continues at the next instruction on a path without a sync
+    bool call = false;         // a call on some path, after which execution continues at the next instruction
+    bool exit = false;         // a path that flushes and leaves (return, tail call, trap)
+    int target = -1;           // internal branch target (instruction index; n = past the end)
+    bool poll = false;         // the internal branch is a loop back edge (an interrupt poll on its slow path)
+    std::vector<int> table;    // jump table targets
+    RegSet pass;               // a call of a leaf function: dirty registers it neither loads nor stores (they stay dirty across it)
+    RegSet call_writes;        // the registers the call can change in the real context (all, unless a leaf)
+    bool tail = false;         // the exit is a jump into another function
+};
+
+RegSet cached_mask() { RegSet m; for (int i = 0; i < res::COUNT; ++i) m.set(size_t(i)); return m; }
+
+std::string copy_text(const RegSet& set, bool to_ctx) {
+    std::string s;
+    for (int i = 0; i < res::COUNT; ++i) {
+        if (!set.test(size_t(i))) continue;
+        s += to_ctx ? reg_field(i, "ctx") + " = " + reg_field(i, "c") + "; " : reg_field(i, "c") + " = " + reg_field(i, "ctx") + "; ";
+    }
+    return s;
+}
+
+// Control flow of one instruction as emit_insn writes it.
+RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment,
+                 const std::unordered_map<uint32_t, LeafRegs>* leaves) {
+    using ppc::Kind;
+    RegNode nd;
+    auto index = [&](uint32_t t) { return int((t - f.entry) / 4); };
+    const ppc::OpInfo* op = ppc::decode(w);
+    if (comment) return nd;   // a dead or folded compare: no code
+    if (!op || ((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31) || (op->sub == ppc::Sub::X9 && ppc::oe(w)) ||
+        op->kind == Kind::UNSUP) { nd.fall = false; nd.exit = true; return nd; }
+    auto use = [&](int i) { nd.eff.use.set(size_t(i)); };
+    auto def = [&](int i, bool always) { nd.eff.may.set(size_t(i)); if (always) nd.eff.must.set(size_t(i)); };
+    // a taken branch to `target` (lk: a call): the same classification as branch_action; true when the taken path goes on at the next
+    // instruction without a sync (a save/restore helper written in place)
+    auto action = [&](uint32_t target, bool lk, bool always) {
+        const Target tk = classify(p, f, target);
+        if (tk.kind == Target::Internal && !lk) {
+            nd.target = index(target); nd.poll = target <= pc;
+            if (nd.poll) { use(res::POLL); def(res::POLL, false); }   // the back edge counts in the local copy of poll_count
+            return false;
+        }
+        if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) { nd.exit = true; return false; }
+        if (tk.kind == Target::Entry) {
+            if (const RegHelper rh = reg_helper(p, target); rh.kind) {
+                const RegEffect he = reg_helper_effect(rh);
+                nd.eff.use |= he.use; nd.eff.may |= he.may;
+                if (always) nd.eff.must |= he.must;
+                if (lk) { def(res::LR, always); return true; }
+                nd.exit = true;
+                return false;
+            }
+        }
+        if (lk) {
+            def(res::LR, always); nd.call = true;
+            auto leaf = leaves && tk.kind == Target::Entry ? leaves->find(target) : decltype(leaves->end()){};
+            if (leaves && tk.kind == Target::Entry && leaf != leaves->end()) { nd.pass = cached_mask() & ~leaf->second.touched; nd.call_writes = leaf->second.written; }
+            else nd.call_writes = cached_mask();
+            return false;
+        }
+        nd.exit = true; nd.tail = true;
+        return false;
+    };
+    // the condition of a conditional branch; true when it is always taken
+    auto condition = [&](uint32_t bo, uint32_t bi, bool ctr_ok) {
+        if (!(bo & 4) && ctr_ok) { use(res::CTR); def(res::CTR, true); }
+        if (!(bo & 16)) { if (h.fused) nd.eff.use |= fused_use; else use(res::CR + int(bi >> 2)); }
+        return (bo & 16) && ((bo & 4) || !ctr_ok);
+    };
+    switch (op->kind) {
+        case Kind::SC: nd.fall = false; nd.call = true; nd.call_writes = cached_mask(); return nd;
+        case Kind::BR: {
+            const int32_t li = ppc::li(w);
+            nd.fall = action(ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li), ppc::lk(w), true);
+            return nd;
+        }
+        case Kind::BC: {
+            const bool always = condition(ppc::bo(w), ppc::bi(w), true);
+            const bool goes_on = action(ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w)), ppc::lk(w), always);
+            nd.fall = !always || goes_on;
+            return nd;
+        }
+        case Kind::BCLR: {
+            const bool always = condition(ppc::bo(w), ppc::bi(w), true);
+            if (ppc::lk(w)) { use(res::LR); def(res::LR, always); nd.call = true; nd.call_writes = cached_mask(); }
+            else nd.exit = true;
+            nd.fall = !always;
+            return nd;
+        }
+        case Kind::BCCTR: {
+            const bool table = !ppc::lk(w) && std::any_of(p.an.jump_tables.begin(), p.an.jump_tables.end(), [&](const auto& jt) { return jt.bctr_addr == pc; });
+            use(res::CTR);
+            if (table) {
+                for (const auto& jt : p.an.jump_tables)
+                    if (jt.bctr_addr == pc) for (uint32_t t : jt.targets) if (t >= f.entry && t < f.end) nd.table.push_back(index(t));
+                nd.fall = false; nd.exit = true;   // the default case traps
+                return nd;
+            }
+            const bool always = condition(ppc::bo(w) | 4, ppc::bi(w), false);
+            if (ppc::lk(w)) { def(res::LR, always); nd.call = true; nd.call_writes = cached_mask(); }
+            else { nd.exit = true; nd.tail = true; }
+            nd.fall = !always;
+            return nd;
+        }
+        default: break;
+    }
+    bool ok = false;
+    nd.eff = reg_effect(*op, w, op->rc && ppc::rc(w) && !h.drop_rc, ok);
+    if (!ok) { nd.eff.use = cached_mask(); }   // not expected: read everything, write nothing
+    return nd;
+}
+}  // namespace
+
+// What each instruction of a function becomes (labels, CR liveness decisions). The hints point into the plan: it is filled in place.
+struct FnPlan {
+    std::set<uint32_t> labels;
+    size_t n = 0;
+    std::vector<uint32_t> words;
+    std::vector<CrHints> hints;
+    std::vector<std::string> comment;   // a dead or folded compare: emitted as this comment
+    std::vector<FusedCmp> fused;        // compare operands for the branch at i
+    std::vector<RegSet> fused_use;
+    bool tail_end = false;              // the last instruction falls into the next function
+};
+static void plan_function(const Program& p, const Function& f, const CrLive* live, EmitStats& st, FnPlan& plan) {
+    std::set<uint32_t>& labels = plan.labels;
+    labels = {f.entry};
     for (uint32_t pc = f.entry; pc < f.end; pc += 4) {
         uint32_t w = 0;
         if (!p.img.word(pc, w)) continue;
@@ -390,68 +611,205 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     }
     for (const auto& jt : p.an.jump_tables) if (jt.bctr_addr >= f.entry && jt.bctr_addr < f.end) for (uint32_t t : jt.targets) labels.insert(t);
     auto sit = p.an.secondary.find(f.entry);
-    bool has_sec = sit != p.an.secondary.end();
-    if (has_sec) for (uint32_t t : sit->second) labels.insert(t);
+    if (sit != p.an.secondary.end()) for (uint32_t t : sit->second) labels.insert(t);
 
-    std::ostringstream o;
-    if (has_sec) {
-        o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n  switch (at) { ";
-        for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
-        o << "default: break; }\n";
-    } else {
-        o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
-    }
+    const size_t n = plan.n = (f.end - f.entry) / 4;
+    auto& words = plan.words; words.assign(n, 0);
+    auto& hints = plan.hints; hints.assign(n, CrHints{});
+    auto& comment = plan.comment; comment.assign(n, std::string());
+    auto& fused = plan.fused; fused.assign(n, FusedCmp{});
+    auto& fused_use = plan.fused_use; fused_use.assign(n, RegSet());
     const std::vector<uint8_t>* after = nullptr;   // CR fields still readable after each instruction
     if (live) { auto it = live->out.find(f.entry); if (it != live->out.end()) after = &it->second; }
-    FusedCmp fused;
-    bool fuse_next = false;   // the previous compare was folded into this instruction's branch
-    for (uint32_t pc = f.entry; pc < f.end; pc += 4) {
-        uint32_t w = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pc = f.entry + uint32_t(i) * 4;
+        uint32_t& w = words[i];
         p.img.word(pc, w);
-        if (labels.count(pc)) o << "L_" << hex8(pc) << ":;\n";
-        CrHints hints;
-        if (fuse_next) { hints.fused = &fused; fuse_next = false; }
-        std::string code;
         const ppc::OpInfo* op = after ? ppc::decode(w) : nullptr;
         if (op && op->kind != ppc::Kind::UNSUP && !(op->sub == ppc::Sub::X9 && ppc::oe(w)) && !((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31)) {
-            const uint8_t live_after = (*after)[(pc - f.entry) / 4];
+            const uint8_t live_after = (*after)[i];
             const std::string name = op->name;
             if (name == "cmp" || name == "cmpl" || name == "cmpi" || name == "cmpli") {
                 const uint32_t field = ppc::crfd(w);
                 uint32_t next = 0;
                 const ppc::OpInfo* nop = pc + 4 < f.end && !labels.count(pc + 4) && p.img.word(pc + 4, next) ? ppc::decode(next) : nullptr;
-                if (!(live_after & fld(field))) { code = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
+                if (!(live_after & fld(field))) { comment[i] = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
                 else if (nop && (nop->kind == ppc::Kind::BC || nop->kind == ppc::Kind::BCLR) && !ppc::lk(next) && (ppc::bo(next) & 4) && !(ppc::bo(next) & 16) &&
-                         (ppc::bi(next) >> 2) == field && !((*after)[(pc + 4 - f.entry) / 4] & fld(field))) {
+                         (ppc::bi(next) >> 2) == field && !((*after)[i + 1] & fld(field))) {
                     // the only reader is the next branch: test the operands there and skip the CR write
                     const std::string a = "c.r[" + num(ppc::a(w)) + "]";
                     const bool is_signed = name == "cmp" || name == "cmpi";
                     const std::string lhs = is_signed ? "int32_t(" + a + ")" : a;
                     std::string rhs;
-                    if (name == "cmp" || name == "cmpl") rhs = is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]";
+                    RegSet u;
+                    u.set(size_t(res::R + int(ppc::a(w)))); u.set(size_t(res::SO));
+                    if (name == "cmp" || name == "cmpl") { rhs = is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]"; u.set(size_t(res::R + int(ppc::b(w)))); }
                     else rhs = is_signed ? num(ppc::simm(w)) : num(ppc::uimm(w)) + "u";
-                    fused = {lhs, rhs};
-                    fuse_next = true;
-                    code = "/* cr" + num(field) + " compare is folded into the next branch */";
+                    fused[i + 1] = {lhs, rhs};
+                    fused_use[i + 1] = u;
+                    hints[i + 1].fused = &fused[i + 1];
+                    comment[i] = "/* cr" + num(field) + " compare is folded into the next branch */";
                     ++st.cr_fused_branches;
                 }
             } else if (op->rc && ppc::rc(w) && !(live_after & fld(fp_name(name) ? 1 : 0))) {
-                hints.drop_rc = true;
+                hints[i].drop_rc = true;
                 ++st.cr_dropped_records;
             }
         }
-        if (code.empty()) code = emit_insn(p, f, pc, w, st, &hints);
-        else ++st.instructions;
-        o << "  /*" << hex8(pc) << "*/ { " << code << " }\n";
     }
     uint32_t last = 0;
     p.img.word(f.end - 4, last);
-    if (!is_terminator_word(last) && p.an.is_entry(f.end)) {
-        ++st.fallthrough_tail;
-        o << "  " << callee(p, f.end) << "(c); return;\n}\n";
-    } else {
-        o << "  " << trap_str(f.end, "fell off the end of function " + hex8(f.entry)) << "\n}\n";
+    plan.tail_end = !is_terminator_word(last) && p.an.is_entry(f.end);
+}
+
+
+
+std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live, const std::unordered_map<uint32_t, LeafRegs>* leaves) {
+    FnPlan plan;
+    plan_function(p, f, live, st, plan);
+    const std::set<uint32_t>& labels = plan.labels;
+    const size_t n = plan.n;
+    const auto& words = plan.words;
+    auto& hints = plan.hints;
+    const auto& comment = plan.comment;
+    const auto& fused_use = plan.fused_use;
+    const bool tail_end = plan.tail_end;
+    auto sit = p.an.secondary.find(f.entry);
+    const bool has_sec = sit != p.an.secondary.end();
+
+    // pass 2: register cache dataflow
+    const bool local = p.reg_cache;
+    RegSet entry_load;
+    std::vector<RegSet> dirty_after(n + 1), live_in(n + 1);
+    std::vector<std::string> fall_flush(n);   // flush on the fall-through edge into the next instruction
+    if (local) {
+        std::vector<RegNode> nodes(n);
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
+        // Control-flow edges. Dirty = written since the last sync on *every* path: where paths with different dirty sets meet over a forward
+        // edge, the edge itself flushes the difference (a join after a conditional write stores there, once); over a back edge the loop head
+        // keeps the union (the loop runs without stores) and the entry path keeps those registers current instead (the liveness below makes
+        // them reloaded at its last sync). So a flush never stores a copy that a path left stale.
+        struct Edge { int from, to; bool sync, back, fall; };   // sync: the edge leaves a call (nothing is dirty after it); fall: the fall-through edge
+        std::vector<Edge> edges;
+        std::vector<std::vector<int>> into(n + 1);
+        auto add = [&](int from, int to, bool sync, bool fall = false) { into[size_t(to)].push_back(int(edges.size())); edges.push_back({from, to, sync, from >= 0 && to <= from, fall}); };
+        add(-1, 0, true);
+        if (has_sec) for (uint32_t t : sit->second) if (t >= f.entry && t < f.end) add(-1, int((t - f.entry) / 4), true);
+        for (size_t i = 0; i < n; ++i) {
+            const RegNode& nd = nodes[i];
+            if (nd.fall) add(int(i), int(i + 1), false, true);
+            if (nd.call) add(int(i), int(i + 1), true);
+            if (nd.target >= 0) add(int(i), nd.target, false);
+            for (int t : nd.table) add(int(i), t, false);
+        }
+        std::vector<RegSet> dirty_in(n + 1);
+        auto edge_out = [&](const Edge& e) {   // a call leaves only what a leaf callee does not touch dirty
+            return e.from < 0 ? RegSet() : e.sync ? (dirty_after[size_t(e.from)] & nodes[size_t(e.from)].pass) : dirty_after[size_t(e.from)];
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t m = 0; m <= n; ++m) {
+                RegSet fwd, back;
+                bool any_fwd = false;
+                for (int k : into[m]) {
+                    const Edge& e = edges[size_t(k)];
+                    if (e.back) back |= edge_out(e);
+                    else { fwd = any_fwd ? (fwd & edge_out(e)) : edge_out(e); any_fwd = true; }
+                }
+                const RegSet in = fwd | back;
+                if (in != dirty_in[m]) { dirty_in[m] = in; changed = true; }
+                if (m < n) dirty_after[m] = dirty_in[m] | nodes[m].eff.may;
+            }
+        }
+        dirty_after[n] = dirty_in[n];
+        std::vector<RegSet> edge_flush(edges.size());
+        for (size_t k = 0; k < edges.size(); ++k) if (!edges[k].back) edge_flush[k] = edge_out(edges[k]) & ~dirty_in[size_t(edges[k].to)];
+        std::vector<std::vector<int>> out(n);
+        for (size_t k = 0; k < edges.size(); ++k) if (edges[k].from >= 0) out[size_t(edges[k].from)].push_back(int(k));
+        live_in[n] = dirty_in[n];   // past the end: a tail call or a trap flushes
+        for (bool changed = true; changed;) {   // backward: needed (read, or flushed) before the next write
+            changed = false;
+            for (size_t i = n; i-- > 0;) {
+                const RegNode& nd = nodes[i];
+                RegSet x;
+                if (nd.exit || nd.poll) x |= dirty_after[i];
+                // a call flushes what the callee may touch; the copies it cannot change must be current before it
+                if (nd.call) x |= (dirty_after[i] & ~nd.pass) | (live_in[i + 1] & ~nd.call_writes);
+                for (int k : out[i]) x |= (edges[size_t(k)].sync ? RegSet() : live_in[size_t(edges[size_t(k)].to)]) | edge_flush[size_t(k)];
+                const RegSet in = nd.eff.use | (nd.eff.may & ~nd.eff.must) | (x & ~nd.eff.must);
+                if (in != live_in[i]) { live_in[i] = in; changed = true; }
+            }
+        }
+        entry_load = live_in[0];
+        for (size_t i = 0; i < n; ++i) {
+            const RegNode& nd = nodes[i];
+            hints[i].local = true;
+            const RegSet flush = nd.call ? dirty_after[i] & ~nd.pass : dirty_after[i];
+            if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(flush, true); st.reg_flushes += flush.count(); }
+            if (nd.call) { hints[i].reload = copy_text(live_in[i + 1] & nd.call_writes, false); st.reg_reloads += (live_in[i + 1] & nd.call_writes).count(); }
+            if (nd.call && nd.pass.any()) {
+                ++st.reg_leaf_calls;
+                hints[i].leaf_call = true;
+                hints[i].full_flush = copy_text(dirty_after[i], true);
+                hints[i].full_reload = copy_text(live_in[i + 1] | (dirty_after[i] & nd.pass), false);   // copies the leaf path keeps must stay current
+            }
+            else if (nd.poll) { hints[i].reload = copy_text(live_in[size_t(nd.target)], false); st.reg_reloads += live_in[size_t(nd.target)].count(); }
+        }
+        for (size_t k = 0; k < edges.size(); ++k) {
+            const Edge& e = edges[size_t(k)];
+            if (e.from < 0 || e.back || edge_flush[k].none()) continue;
+            st.reg_flushes += edge_flush[k].count();
+            const std::string text = copy_text(edge_flush[k], true);
+            if (e.sync) {   // after a leaf call: on the call's own path
+                if (nodes[size_t(e.from)].fall) hints[size_t(e.from)].after_call = text;
+                else fall_flush[size_t(e.from)] = text;
+            }
+            else if (e.fall && nodes[size_t(e.from)].call) hints[size_t(e.from)].not_taken = text;   // a conditional call: in its else branch
+            else if (e.fall) fall_flush[size_t(e.from)] = text;   // after the instruction, before the next label
+            else hints[size_t(e.from)].edge[f.entry + uint32_t(e.to) * 4] = text;   // on the jump (a jump table: in its case)
+        }
+        st.reg_entry_loads += entry_load.count();
     }
+
+    // pass 3: text
+    std::ostringstream o;
+    if (has_sec) o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
+    else o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
+    if (local) {
+        // a resume through a secondary entry (rare) loads what is read from there on; the normal entry only what the entry reads
+        o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n";
+        if (has_sec) {
+            o << "  if (at != 0) [[unlikely]] switch (at) { ";
+            for (uint32_t t : sit->second) {
+                const RegSet load = t >= f.entry && t < f.end ? live_in[(t - f.entry) / 4] : RegSet();
+                st.reg_entry_loads += load.count();
+                o << "case 0x" << hex8(t) << "u: " << copy_text(load, false) << "goto L_" << hex8(t) << "; ";
+            }
+            o << "default: break; }\n";
+        }
+        o << "  " << copy_text(entry_load, false) << "\n";
+    } else if (has_sec) {
+        o << "  switch (at) { ";
+        for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
+        o << "default: break; }\n";
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pc = f.entry + uint32_t(i) * 4;
+        if (labels.count(pc)) o << "L_" << hex8(pc) << ":;\n";
+        std::string code = comment[i];
+        if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
+        else ++st.instructions;
+        o << "  /*" << hex8(pc) << "*/ { " << code << " }" << (fall_flush[i].empty() ? "" : " { " + fall_flush[i] + "}") << "\n";
+    }
+    const std::string end_flush = local ? copy_text(dirty_after[n], true) : "";
+    if (local) st.reg_flushes += dirty_after[n].count();
+    if (tail_end) {
+        ++st.fallthrough_tail;
+        o << "  " << end_flush << callee(p, f.end) << (local ? "(ctx)" : "(c)") << "; return;\n";
+    } else {
+        o << "  " << end_flush << trap_str(f.end, "fell off the end of function " + hex8(f.entry)) << "\n";
+    }
+    o << (local ? "  }\n}\n" : "}\n");
     if (has_sec) {
         o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) { body_" << hex8(f.entry) << "(c, 0); }\n";
         for (uint32_t t : sit->second) {
@@ -461,6 +819,39 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     }
     ++st.functions;
     return o.str();
+}
+
+// The translated functions a call may sync with partially: no call (the save/restore helpers are written in place), no loop (so no
+// interrupt poll: no safe point where the scheduler or an interrupt could look at the context), no jump table, no tail or indirect jump
+// and no fall into the next function. Their loads and stores of the real context are their entry loads and flushes, all within the
+// registers they read or write. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very
+// instructions) qualify the same way: they copy in and out only registers their guest code uses. So do the native SDK matrix/vector
+// routines below: they read the guest routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both).
+static bool leaf_hle(const std::string& name) {
+    static const std::set<std::string> math = {"PSMTXIdentity", "PSMTXCopy", "PSMTXConcat", "PSMTXTransApply", "PSMTXScaleApply", "PSMTXMultVec",
+        "PSVECAdd", "PSVECSubtract", "PSVECScale", "PSVECNormalize", "PSVECSquareMag", "PSVECMag", "PSQUATDotProduct", "PSVECCrossProduct"};
+    return name.compare(0, 5, "Leaf_") == 0 || math.count(name);
+}
+static std::unordered_map<uint32_t, LeafRegs> analyze_leaves(const Program& p, const CrLive* live) {
+    std::unordered_map<uint32_t, LeafRegs> out;
+    EmitStats scratch;
+    for (const auto& f : p.an.functions) {
+        if (f.end <= f.entry) continue;
+        if (auto h = p.cfg.hle.find(f.entry); h != p.cfg.hle.end() && !leaf_hle(h->second)) continue;
+        FnPlan plan;
+        plan_function(p, f, live, scratch, plan);
+        if (plan.tail_end) continue;
+        LeafRegs regs;
+        bool leaf = true;
+        for (size_t i = 0; i < plan.n && leaf; ++i) {
+            const RegNode nd = reg_node(p, f, f.entry + uint32_t(i) * 4, plan.words[i], plan.hints[i], plan.fused_use[i], !plan.comment[i].empty(), nullptr);
+            if (nd.call || nd.poll || nd.tail || !nd.table.empty()) leaf = false;
+            regs.touched |= nd.eff.use | nd.eff.may;
+            regs.written |= nd.eff.may;
+        }
+        if (leaf) out[f.entry] = regs;
+    }
+    return out;
 }
 
 Output emit_program(const Program& p, size_t shard, EmitStats& st) {
@@ -487,9 +878,11 @@ Output emit_program(const Program& p, size_t shard, EmitStats& st) {
         cur.clear(); in_cur = 0;
     };
     const CrLive live = p.cr_opt ? analyze_cr(p) : CrLive{};
+    const auto leaves = p.reg_cache ? analyze_leaves(p, p.cr_opt ? &live : nullptr) : std::unordered_map<uint32_t, LeafRegs>{};
+    st.reg_leaves = leaves.size();
     for (const auto& f : p.an.functions) {
         if (p.cfg.hle.count(f.entry)) continue;
-        cur += emit_function(p, f, st, p.cr_opt ? &live : nullptr);
+        cur += emit_function(p, f, st, p.cr_opt ? &live : nullptr, &leaves);
         if (++in_cur >= shard) flush();
     }
     flush();

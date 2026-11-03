@@ -30,6 +30,9 @@ DetTrace::~DetTrace() { if (file_) std::fclose(file_); }
 
 void DetTrace::on_retrace(uint64_t retrace) {
     if (done_) return;
+    // UC_DET_EVERY=<n>: hash only every n-th retrace, so a long replay (a whole demo) can be compared at a bearable cost
+    static const uint64_t every = [] { const char* e = std::getenv("UC_DET_EVERY"); const long v = e ? std::strtol(e, nullptr, 10) : 1; return uint64_t(v > 1 ? v : 1); }();
+    if (retrace % every) return;
     std::vector<uint64_t> hashes(kChunks);
     for (uint32_t i = 0; i < kMem1 / kChunk; ++i) hashes[i] = hash_chunk(mem_ + size_t(i) * kChunk, kChunk);
     for (uint32_t i = 0; i < kMem2 / kChunk; ++i) hashes[kMem1 / kChunk + i] = hash_chunk(mem_ + 0x10000000u + size_t(i) * kChunk, kChunk);

@@ -39,9 +39,13 @@ int main() {
     CHECK(a.find("fell off the end") != std::string::npos);
     {   // a backward branch polls for pending interrupts; a forward branch does not
         auto lp = make_prog({addi(3, 3, 1), 0x4BFFFFFC /* b -4 */, blr});
+        lp.reg_cache = false;
         std::string t = uc::emit_function(lp, lp.an.functions[0], st);
         CHECK(t.find("ppc::poll(c); goto L_80003100;") != std::string::npos);
-        auto fw = make_prog({0x48000008 /* b +8 */, addi(3, 3, 1), blr});
+        lp.reg_cache = true;   // the poll's slow path syncs the register cache with the real context around the safe point
+        t = uc::emit_function(lp, lp.an.functions[0], st);
+        CHECK(t.find("if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { ctx.r[3] = c.r[3]; ctx.poll_count = c.poll_count; ppc::poll_slow(ctx); "
+                     "c.r[3] = ctx.r[3]; c.poll_count = ctx.poll_count; } goto L_80003100;") != std::string::npos);        auto fw = make_prog({0x48000008 /* b +8 */, addi(3, 3, 1), blr});
         std::string u = uc::emit_function(fw, fw.an.functions[0], st);
         CHECK(u.find("goto L_80003108;") != std::string::npos && u.find("ppc::poll") == std::string::npos);
     }
@@ -71,9 +75,13 @@ int main() {
         auto q = make_prog(a.w, cfg);
         std::string t = uc::emit_function(q, q.an.functions[0], st);
         char buf[64];
-        std::snprintf(buf, sizeof buf, "fn_%08X(c); return;", g);
+        std::snprintf(buf, sizeof buf, "ctx.r[3] = c.r[3]; fn_%08X(ctx); return;", g);
         CHECK(t.find(buf) != std::string::npos);
         CHECK(t.find("fell off") == std::string::npos);
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        std::snprintf(buf, sizeof buf, "  fn_%08X(c); return;", g);
+        CHECK(t.find(buf) != std::string::npos);
     }
     {   // a branch target that is inside no function traps at run time and is counted
         Asm a;
@@ -83,6 +91,86 @@ int main() {
         std::string t = uc::emit_insn(q, q.an.functions[0], a.addr(0), a.w[0], s2);
         CHECK(t.find("not inside any translated function") != std::string::npos);
         CHECK(s2.traps_midfunc == 1);
+    }
+    {   // register cache: registers are loaded on entry only when read before written, stored before a call or return only when written
+        // since the last sync, and reloaded after a call only when read again before the next write
+        Asm a;
+        a.emit(addi(3, 3, 1)); a.emit(addi(4, 0, 7));
+        size_t call = a.emit(0);
+        a.emit(addi(3, 3, 2)); a.emit(addi(5, 4, 0)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(blr);
+        a.patch_bl(call, g);
+        auto q = make_prog(a.w);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        auto has = [&](const std::string& s) { return t.find(s) != std::string::npos; };
+        CHECK(has("ppc::Ctx& ctx = c;"));
+        CHECK(has("ppc::Ctx c; c.mem = ctx.mem;\n  c.r[3] = ctx.r[3]; \n"));   // r4 and lr are written before any read
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.lr = c.lr; fn_%08X(ctx); c.r[3] = ctx.r[3]; c.r[4] = ctx.r[4]; ",
+                      a.addr(call) + 4, g);
+        CHECK(has(buf));
+        CHECK(has("{ ctx.r[3] = c.r[3]; ctx.r[5] = c.r[5]; return; }"));   // r4 was not written after the call
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        CHECK(!has("ctx"));
+    }
+    {   // where a path that wrote a register meets one that did not, the edge flushes it: the call after the join stores only what every
+        // path wrote, and nothing is reloaded just to be stored again; a conditional call's skipping path flushes in its else branch
+        Asm a;
+        size_t br = a.emit(0);
+        a.emit(addi(4, 4, 1));
+        uint32_t skip = a.here();
+        size_t call = a.emit(0);
+        size_t ccall = a.emit(0);
+        a.emit(addi(5, 4, 0)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(blr);
+        a.patch_bc(br, 12, 2, skip); a.patch_bl(call, g); a.w[ccall] = enc::bc(12, 2, int32_t(g - a.addr(ccall))) | 1;   // beq skip; bl g; beql g
+        auto q = make_prog(a.w);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        auto has = [&](const std::string& s) { return t.find(s) != std::string::npos; };
+        CHECK(has("ppc::op_addi(c, 4, 4, 1); } { ctx.r[4] = c.r[4]; }"));
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "{ c.lr = 0x%08Xu; ctx.lr = c.lr; fn_%08X(ctx); c.r[4] = ctx.r[4]; c.cr[0] = ctx.cr[0]; c.lr = ctx.lr;  }", a.addr(call) + 4, g);
+        CHECK(has(buf));
+        std::snprintf(buf, sizeof buf, "{ c.lr = 0x%08Xu; ctx.lr = c.lr; fn_%08X(ctx); c.r[4] = ctx.r[4];  } else { ctx.lr = c.lr; } }", a.addr(ccall) + 4, g);
+        CHECK(has(buf));
+    }
+    {   // a call of a leaf function (no calls, no loops) syncs only the registers it touches: r20 stays dirty across it and is stored at the
+        // return (so is the link register: the leaf never reads it); the form for an entry with native probes (UC_PLAIN_ENTRY false) syncs
+        // everything
+        Asm a;
+        a.emit(addi(3, 3, 1)); a.emit(addi(20, 20, 5));
+        size_t call = a.emit(0);
+        a.emit(addi(3, 3, 1)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(addi(3, 3, 2)); a.emit(blr);
+        a.patch_bl(call, g);
+        auto q = make_prog(a.w);
+        auto emitted = uc::emit_program(q, 1000, st);
+        std::string t;
+        for (const auto& [name, source] : emitted.files) if (name == "game_000.cpp") t = source;
+        char buf[400];
+        std::snprintf(buf, sizeof buf, "if constexpr (UC_PLAIN_ENTRY(0x%08Xu)) { c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; fn_%08X(ctx); c.r[3] = ctx.r[3]; } "
+                      "else { c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; ctx.r[20] = c.r[20]; ctx.lr = c.lr; fn_%08X(ctx); c.r[3] = ctx.r[3]; c.r[20] = ctx.r[20]; c.lr = ctx.lr; }",
+                      g, a.addr(call) + 4, g, a.addr(call) + 4, g);
+        CHECK(t.find(buf) != std::string::npos);
+        CHECK(t.find("{ ctx.r[3] = c.r[3]; ctx.r[20] = c.r[20]; ctx.lr = c.lr; return; }") != std::string::npos);
+    }
+    {   // a call of a register save/restore helper becomes its stores in place (no call, no sync); without the cache it stays an HLE call
+        Asm a;
+        size_t call = a.emit(0); a.emit(blr);
+        uint32_t g = a.here(); a.emit(0x93ABFFF4u); a.emit(0x93CBFFF8u); a.emit(0x93EBFFFCu); a.emit(blr);   // stw r29..r31,-12..-4(r11)
+        a.patch_bl(call, g);
+        uc::Config cfg; cfg.hle[g] = "SaveGpr29";
+        auto q = make_prog(a.w, cfg);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ppc::save_gpr<29>(c); ", a.addr(call) + 4);
+        CHECK(t.find(buf) != std::string::npos);
+        CHECK(t.find("invoke_hle") == std::string::npos);
+        CHECK(t.find("c.r[29] = ctx.r[29]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31];") != std::string::npos);   // read on entry
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        CHECK(t.find("uc::invoke_hle<hle_SaveGpr29>(c);") != std::string::npos);
     }
     {   // every translated function starts with the trace hook (a no-op macro unless UC_TRACE is defined)
         std::string t = uc::emit_function(p, f, st);

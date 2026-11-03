@@ -8,8 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from leaf_hybrid import OP, ROLES  # noqa: E402
 from timing_audit import FUNCTION, INSTRUCTION, resolve_generation  # noqa: E402
 
-CALL = re.compile(r"\bfn_([0-9A-F]{8})\(c\)")
-HLE = re.compile(r"\bhle_(\w+)\(c\)")
+CALL = re.compile(r"\bfn_([0-9A-F]{8})\((?:c|ctx)\)")
+HLE = re.compile(r"\bhle_(\w+)\((?:c|ctx)\)")
 GOTO = re.compile(r"goto L_([0-9A-F]{8})")
 LABEL = re.compile(r"^L_([0-9A-F]{8}):;")
 ROLE_OVERRIDES = {"addic": "Id Is N", "addic_": "Id Is N"}

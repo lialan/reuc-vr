@@ -19,7 +19,7 @@ STORES = {"stw", "stb", "sth", "stfs", "stfd", "stwu", "stbu", "sthu", "stfsu", 
 UPDATE = {"lwzu", "lbzu", "lhzu", "lfsu", "lfdu", "stwu", "stbu", "sthu", "stfsu", "stfdu"}
 FP_DEST = {"lfs", "lfd", "lfsu", "lfdu"}   # first operand is an FPR
 OP = re.compile(r"ppc::op_(\w+)\(c,\s*([^)]*)\)")
-CALL = re.compile(r"\bfn_[0-9A-F]+\(c\)|call_indirect")
+CALL = re.compile(r"\bfn_[0-9A-F]+\((?:c|ctx)\)|call_indirect")
 LABEL = re.compile(r"^L_[0-9A-F]+:;")
 
 

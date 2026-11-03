@@ -553,11 +553,16 @@ foreach(t test_ppc_int test_ppc_mem test_ppc_float test_clock test_mmio test_low
   endif()
 endforeach()
 
-add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/opcheck.cpp
-  COMMAND opcheck_gen ${CMAKE_CURRENT_BINARY_DIR}/opcheck.cpp DEPENDS opcheck_gen)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/opcheck.cpp ${CMAKE_CURRENT_BINARY_DIR}/regcheck.cpp
+  COMMAND opcheck_gen ${CMAKE_CURRENT_BINARY_DIR}/opcheck.cpp ${CMAKE_CURRENT_BINARY_DIR}/regcheck.cpp DEPENDS opcheck_gen)
 add_library(opcheck_obj OBJECT ${CMAKE_CURRENT_BINARY_DIR}/opcheck.cpp)
 target_include_directories(opcheck_obj PRIVATE ${CMAKE_SOURCE_DIR}/runtime ${CMAKE_SOURCE_DIR}/common)
 target_compile_options(opcheck_obj PRIVATE -Wno-unused-variable)
+# The translator's register-cache model (translator/regeffect.h) against the ops it describes.
+add_executable(test_reg_effects test_reg_effects.cpp ${CMAKE_CURRENT_BINARY_DIR}/regcheck.cpp)
+target_link_libraries(test_reg_effects PRIVATE test_support uc_common)
+target_include_directories(test_reg_effects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_reg_effects COMMAND test_reg_effects)
 add_subdirectory(e2e)
 add_executable(test_test_protocol test_test_protocol.cpp ${CMAKE_SOURCE_DIR}/game/test_protocol.cpp)
 target_include_directories(test_test_protocol PRIVATE ${CMAKE_SOURCE_DIR}/game)
