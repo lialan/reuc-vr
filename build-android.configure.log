@@ -182,6 +182,6 @@ Call Stack (most recent call first):
 -- Link libraries   : atomic
 -- Build targets    : static
 -- 
--- Configuring done (1.4s)
+-- Configuring done (1.2s)
 -- Generating done (0.2s)
 -- Build files have been written to: /Users/lialan/workspace/reuc-recomp/.claude/worktrees/agent-abb494a4420196640/build-android

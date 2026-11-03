@@ -708,6 +708,20 @@ homography an eye pixel); the HUD packet is then its glows. Pictures (VR preview
 same place with slightly softer edges (in the headset FXAA no longer runs over it), the glows slightly softer where the game's ghost
 image has sharp edges (peak 8% at single pixels, render scale 3).
 
+### Finding 3: the bloom chain and the attachment traffic
+
+- **Bloom proxy** (704806c): the chain's packets (copy and every draw inside the EFB's top-left 320x180, 2D, no depth) draw into a
+  two-layer proxy at 2 points a guest pixel and copy from it; the corner goes back into the EFB (exactly the pixels the chain's draws
+  covered) at the next other packet that draws, copies or presents. VR preview (render scale 3, proxy off vs on): the bloom differs at
+  two bright spots (peak 19% at a few pixels, not visible side by side). `UC_NO_BLOOM_PROXY=1` off. Not measured on the headset yet.
+- **Depth stores** (164a901): attachment traffic was ~6 G pixels a second in the fight (`[gpu-area]`), close to the memory bandwidth. A
+  pass whose draws test but do not write depth (translucent effects, particles) no longer stores it back (STORE_OP_NONE); scratch depth
+  is DONT_CARE. Pictures identical. `UC_DEPTH_STORE_ALWAYS=1` off.
+- Textures: Wii textures upload with their own mips, but the game samples almost everything with a GX mip filter of none (counter "%
+  Non-Base Level Textures" 0.06%): base levels, as on the console; sampling mips would change the picture. CMPR (DXT1) is decoded to RGBA8
+  (the Quest has no BC formats; ETC2/ASTC re-encoding is lossy). Anisotropy 16 applies only to mip-filtered samplers (off: no gain, S17).
+  EFB RGBA8 + D32 (D24S8 is the same size; D16 would lose the 24-bit GX depth), no MSAA.
+
 ### Checked and not changed
 
 - **fp16 (RelaxedPrecision)**: the folded modules relaxed by `tools/spirv_relaxed_precision.py` keep their instruction count in ir3 (338
@@ -722,7 +736,5 @@ image has sharp edges (peak 8% at single pixels, render scale 3).
 - Particles ~5.9 ms: ~295 translucent sprites with ~6x overdraw, depth-tested against the scene (a low-resolution layer would need a
   low-resolution depth: soft edges where they meet geometry).
 - Present ~4.4 ms: the screen pass over 2 x 2064x2208 with FXAA and the layers' composite.
-- The bloom chain (~2.4 ms: bright pass, blurs, half copies) still draws and copies at the EFB's density although it is blurred: running
-  the packets that draw only into the EFB corner a later copy reads in a low-resolution proxy of that corner is the next structural step.
 - The colour pass and the composite (~2.8 ms) are full-resolution by nature (they carry the scene); the full-size copy between them
   (a 2 x 9 Mpx blit) could become a tile-local read (input attachment) if the copy is read only by the next full-screen pass.
