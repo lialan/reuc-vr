@@ -58,10 +58,11 @@ bool builder_wanted=false;
 // The SDK block span both snapshots read (the highest word is the viewport at +0x55C), copied by the front when a draw is issued and unchanged
 // while the guest does not change it: the builder derives state and material from it instead of from guest memory.
 constexpr size_t kSdkSpan=0x560;
+inline uint32_t sdk_word(const std::byte* bytes,uint32_t offset) { uint32_t raw; std::memcpy(&raw,bytes+offset,4); return uc_bswap32(raw); }
 struct SdkBlock {
     uint32_t address=0;
     std::array<std::byte,kSdkSpan> bytes;
-    uint32_t word(uint32_t offset) const { uint32_t raw; std::memcpy(&raw,bytes.data()+offset,4); return uc_bswap32(raw); }
+    uint32_t word(uint32_t offset) const { return sdk_word(bytes.data(),offset); }
 };
 using SdkRef=std::shared_ptr<const SdkBlock>;
 
@@ -256,7 +257,6 @@ std::map<uint64_t, uint32_t> finishes; // serial -> submitting thread's SDA base
 uint64_t front_serial=0;   // the serial of the last packet the builder was told to seal (Packets numbers them in that order)
 uint32_t front_stamp=0;    // write-watch stamp given to the commands (gx_watch_stamp.h)
 uint64_t prompt_tokens=0;
-SdkRef sdk_last;           // the last SDK block captured
 // What a recorded display list does that the guest can observe when it is called: the channel words GXCallDisplayList writes back, the
 // packets its texture copies seal, the lists it calls.
 struct FrontEffect { enum Kind : uint8_t { child, num_channels, channel_control, texture_copy } kind; uint32_t a=0, b=0; };
@@ -291,8 +291,6 @@ struct FrontPrimitive {
     std::vector<std::byte> bytes;
 };
 FrontPrimitive front_prim;
-gx::State front_derived;   // derive_state of the last block (only descriptors and formats are read: encoded sizes)
-SdkRef front_derived_block;
 
 // --profile only: wall time inside the two native draw entry points, printed once per second as "[gxtime]" (per-call figures compare builds
 // far more precisely than a whole-fight FPS, which varies several percent between runs). With the builder these are the guest thread's share.
@@ -341,27 +339,31 @@ template<class F> void back(F&& f) {
     catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
 }
 void reset_watch();
-// A command whose cache checks compare guest memory (textures, meshes): it records a fresh stamp.
-template<class F> void back_checked(F&& f) {
-    if (queue.threaded()) {
-        if (gx::watch_exhausted()) reset_watch();
-        front_stamp=gx::watch_stamp();
-    }
-    back(std::forward<F>(f));
-}
 void drain() {
     try { queue.drain(); }
     catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
 }
 uint32_t producer() { return scheduler->in_irq() ? UINT32_MAX : uint32_t(scheduler->current()->id); }
-// The SDK block as a draw issued now sees it (the read also checks the whole block's bounds, as the snapshots did).
-SdkRef capture_sdk(uint32_t sdk) {
-    const auto live=memory.read(sdk,0x600);
-    if(sdk_last && sdk_last->address==sdk && std::memcmp(live.data(),sdk_last->bytes.data(),kSdkSpan)==0) return sdk_last;
+// Front: the SDK block as a draw issued now sees it, in guest memory (the read also checks the whole block's bounds, as the snapshots did). The
+// command that needs it carries a copy of its span (back_with_sdk).
+const std::byte* sdk_view(uint32_t sdk) { return memory.read(sdk,0x600).data(); }
+// Builder: the block a command carried, as a shared block: the previous one while the bytes are the same (the snapshot caches key on it).
+SdkRef back_sdk_last;
+SdkRef back_block(uint32_t sdk,std::span<const std::byte> bytes) {
+    if(back_sdk_last && back_sdk_last->address==sdk && std::memcmp(bytes.data(),back_sdk_last->bytes.data(),kSdkSpan)==0) return back_sdk_last;
     auto block=std::allocate_shared<SdkBlock>(gx::PoolAllocator<SdkBlock>{});
-    block->address=sdk; std::memcpy(block->bytes.data(),live.data(),kSdkSpan);
-    sdk_last=std::move(block);
-    return sdk_last;
+    block->address=sdk; std::memcpy(block->bytes.data(),bytes.data(),kSdkSpan);
+    back_sdk_last=std::move(block);
+    return back_sdk_last;
+}
+// A command that needs the SDK block the call sees: its span travels in the command (one copy, no allocation on the guest thread).
+template<class F> void back_with_sdk(uint32_t sdk,const std::byte* bytes,bool checked,F&& f) {
+    if (checked && queue.threaded()) {
+        if (gx::watch_exhausted()) reset_watch();
+        front_stamp=gx::watch_stamp();
+    }
+    try { queue.emit_bytes([sdk,f=std::forward<F>(f)](std::span<const std::byte> span) { f(back_block(sdk,span)); },bytes,uint32_t(kSdkSpan),front_stamp); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
 }
 // Live and recorded primitives open a window over their bytes: the inline FIFO path fills it (gx_fifo.h).
 void list_window() {
@@ -419,7 +421,7 @@ MaterialCache material_cache;
 // UC_GX_CACHE_VERIFY=1 recomputes every cached snapshot and reports results that differ (debugging aid for a missed version bump).
 const bool cache_verify=std::getenv("UC_GX_CACHE_VERIFY")!=nullptr;
 uint32_t cache_mismatches=0;
-// The front hands the same block on while the guest leaves the bytes alone (capture_sdk), so identity is byte equality.
+// The builder hands the same block on while the bytes stay the same (back_block), so identity is byte equality.
 bool same_block(const SdkRef& a,const SdkRef& b) { return a==b; }
 MaterialSnapshot material_snapshot(const SdkRef& sdk_block,uint32_t lr,bool use_cache=true) {
     const SdkBlock& block=*sdk_block;
@@ -560,42 +562,49 @@ void native_bp(uint32_t word) {
 }
 // The part of a snapshot that the SDK block decides: culling, viewport, scissor, vertex descriptors and attribute formats. The vertex arrays (and the
 // rest of the host state) are not part of it; they are applied fresh on every call.
-void derive_state(const SdkBlock& block, gx::State& result) {
-    auto word=[&](uint32_t offset) { return block.word(offset); };
-    uint32_t low = word(0x14), high = word(0x18);
-    result.cull=uint8_t((word(0x254)>>14)&3);
+// derive_state's checks of the viewport and scissor (what it can throw), and the values it takes from them.
+void derive_view(const std::byte* bytes, std::optional<std::array<float,6>>& viewport_out, std::optional<std::array<int32_t,4>>& scissor_out) {
+    auto word=[&](uint32_t offset) { return sdk_word(bytes,offset); };
     std::array<float,6> viewport{};
     for(uint32_t i=0;i<6;++i) viewport[i]=std::bit_cast<float>(word(0x544+i*4));
     if(viewport[2]!=0 || viewport[3]!=0) {
         for(auto value:viewport) if(!std::isfinite(value)) throw std::invalid_argument("nonfinite native viewport");
         if(viewport[2]<=0 || viewport[3]<=0 || viewport[4]<0 || viewport[4]>1 || viewport[5]<0 || viewport[5]>1) throw std::invalid_argument("invalid native viewport extent/depth");
-        result.viewport=viewport;
+        viewport_out=viewport;
     }
     const auto top=word(0x148),bottom=word(0x14C);
     if((top>>24)==0x20 && (bottom>>24)==0x21) {
         const auto left=int32_t((top>>12)&2047)-342,upper=int32_t(top&2047)-342;
         const auto right=int32_t((bottom>>12)&2047)-342,lower=int32_t(bottom&2047)-342;
         if(right<left || lower<upper) throw std::invalid_argument("invalid native scissor bounds");
-        result.scissor=std::array<int32_t,4>{left,upper,right-left+1,lower-upper+1};
+        scissor_out=std::array<int32_t,4>{left,upper,right-left+1,lower-upper+1};
     }
-    for (size_t i = 0; i < 9; ++i) result.descriptors[i] = low & (1u << i) ? gx::Mode::direct : gx::Mode::none;
-    for (size_t i = 0; i < 4; ++i) result.descriptors[9 + i] = gx::Mode((low >> (9 + i * 2)) & 3);
-    for (size_t i = 0; i < 8; ++i) result.descriptors[13 + i] = gx::Mode((high >> (i * 2)) & 3);
-    for (size_t vat = 0; vat < 8; ++vat) {
-        uint32_t a = word(0x1C + uint32_t(vat * 4));
-        uint32_t b = word(0x3C + uint32_t(vat * 4));
-        uint32_t c = word(0x5C + uint32_t(vat * 4));
-        auto& formats = result.formats[vat];
-        formats[9] = {gx::Type((a >> 1) & 7), uint8_t(2 + (a & 1)), uint8_t((a >> 4) & 31)};
-        formats[10] = {gx::Type((a >> 10) & 7), uint8_t((a & 512) ? 9 : 3), 0, gx::Color::rgba8, bool(a >> 31)};
-        formats[11].color = gx::Color((a >> 14) & 7); formats[12].color = gx::Color((a >> 18) & 7);
-        auto texture = [&](size_t attr, uint32_t word, unsigned bit, uint32_t fraction) {
-            formats[attr] = {gx::Type((word >> (bit + 1)) & 7), uint8_t(1 + ((word >> bit) & 1)), uint8_t(fraction & 31)};
-        };
-        texture(13, a, 21, a >> 25); texture(14, b, 0, b >> 4); texture(15, b, 9, b >> 13);
-        texture(16, b, 18, b >> 22); texture(17, b, 27, c); texture(18, c, 5, c >> 9);
-        texture(19, c, 14, c >> 18); texture(20, c, 23, c >> 27);
-    }
+}
+void derive_descriptors(const std::byte* bytes, std::array<gx::Mode,21>& descriptors) {
+    const uint32_t low=sdk_word(bytes,0x14), high=sdk_word(bytes,0x18);
+    for (size_t i = 0; i < 9; ++i) descriptors[i] = low & (1u << i) ? gx::Mode::direct : gx::Mode::none;
+    for (size_t i = 0; i < 4; ++i) descriptors[9 + i] = gx::Mode((low >> (9 + i * 2)) & 3);
+    for (size_t i = 0; i < 8; ++i) descriptors[13 + i] = gx::Mode((high >> (i * 2)) & 3);
+}
+void derive_formats(const std::byte* bytes, size_t vat, std::array<gx::Format,21>& formats) {
+    uint32_t a = sdk_word(bytes,0x1C + uint32_t(vat * 4));
+    uint32_t b = sdk_word(bytes,0x3C + uint32_t(vat * 4));
+    uint32_t c = sdk_word(bytes,0x5C + uint32_t(vat * 4));
+    formats[9] = {gx::Type((a >> 1) & 7), uint8_t(2 + (a & 1)), uint8_t((a >> 4) & 31)};
+    formats[10] = {gx::Type((a >> 10) & 7), uint8_t((a & 512) ? 9 : 3), 0, gx::Color::rgba8, bool(a >> 31)};
+    formats[11].color = gx::Color((a >> 14) & 7); formats[12].color = gx::Color((a >> 18) & 7);
+    auto texture = [&](size_t attr, uint32_t word, unsigned bit, uint32_t fraction) {
+        formats[attr] = {gx::Type((word >> (bit + 1)) & 7), uint8_t(1 + ((word >> bit) & 1)), uint8_t(fraction & 31)};
+    };
+    texture(13, a, 21, a >> 25); texture(14, b, 0, b >> 4); texture(15, b, 9, b >> 13);
+    texture(16, b, 18, b >> 22); texture(17, b, 27, c); texture(18, c, 5, c >> 9);
+    texture(19, c, 14, c >> 18); texture(20, c, 23, c >> 27);
+}
+void derive_state(const std::byte* bytes, gx::State& result) {
+    result.cull=uint8_t((sdk_word(bytes,0x254)>>14)&3);
+    derive_view(bytes, result.viewport, result.scissor);
+    derive_descriptors(bytes, result.descriptors);
+    for (size_t vat = 0; vat < 8; ++vat) derive_formats(bytes, vat, result.formats[vat]);
 }
 // Exactly the fields derive_state sets, written over the host state (the entries it leaves alone keep the host values).
 void apply_derived(gx::State& result, const gx::State& d) {
@@ -609,41 +618,64 @@ void apply_derived(gx::State& result, const gx::State& d) {
         for (size_t attr = 13; attr < 21; ++attr) to[attr] = from[attr];
     }
 }
-// derive_state's inputs in the block: only these invalidate a derived state (dirty flags, textures and matrices share the SDK block).
-bool same_derive_inputs(const SdkBlock& a,const SdkBlock& b) {
-    return a.address==b.address && std::memcmp(a.bytes.data()+0x14,b.bytes.data()+0x14,0x68)==0 && std::memcmp(a.bytes.data()+0x148,b.bytes.data()+0x148,8)==0
-        && std::memcmp(a.bytes.data()+0x254,b.bytes.data()+0x254,4)==0 && std::memcmp(a.bytes.data()+0x544,b.bytes.data()+0x544,24)==0;
-}
-struct StateCache { bool valid=false; SdkRef block; gx::State derived; };
-StateCache state_cache;
-gx::State snapshot(const SdkRef& sdk_block,uint32_t lr) {
-    if (state_cache.valid && (state_cache.block==sdk_block || same_derive_inputs(*state_cache.block,*sdk_block))) ++cache_stat[0];
-    else {
-        ++cache_stat[1]; state_cache.valid = false;
+// derive_state results by their inputs (descriptors, attribute formats, cull mode, scissor, viewport: 140 bytes of the block; dirty flags,
+// textures, matrices and the material share the block and do not count): consecutive draws switch between a few vertex formats.
+class DeriveCache {
+public:
+    explicit DeriveCache(bool counted):counted_(counted) {}
+    const gx::State& get(const std::byte* bytes) {   // throws what derive_state throws (nothing is kept then)
+        Key key;
+        const uint32_t cull=(sdk_word(bytes,0x254)>>14)&3;   // the rest of that word is material state (stage and channel counts): not an input
+        std::memcpy(key.data(),bytes+0x14,0x68); std::memcpy(key.data()+0x68,bytes+0x148,8); std::memcpy(key.data()+0x70,&cull,4); std::memcpy(key.data()+0x74,bytes+0x544,24);
+        for (size_t i=0;i<count_;++i) if (entries_[i].key==key) { if (counted_) ++cache_stat[0]; return entries_[i].derived; }
+        if (counted_) ++cache_stat[1];
         gx::State fresh;
-        derive_state(*sdk_block, fresh);
-        state_cache.derived = fresh; state_cache.block = sdk_block; state_cache.valid = true;
+        derive_state(bytes, fresh);
+        auto& entry=entries_[next_]; next_=(next_+1)%entries_.size(); count_=std::min(count_+1,entries_.size());
+        entry.key=key; entry.derived=fresh;
+        return entry.derived;
     }
+    void clear() { count_=next_=0; }
+private:
+    using Key=std::array<std::byte,0x8C>;
+    struct Entry { Key key; gx::State derived; };
+    std::array<Entry,16> entries_;
+    size_t count_=0, next_=0;
+    bool counted_;   // the --profile counters belong to the builder
+};
+DeriveCache back_derived{true};   // builder
+gx::State snapshot(const SdkRef& sdk_block,uint32_t lr) {
+    const auto& derived=back_derived.get(sdk_block->bytes.data());
     gx::State result = brec ? brec->input_state : state;
-    apply_derived(result, state_cache.derived);
+    apply_derived(result, derived);
     if (cache_verify) {
         gx::State reference = brec ? brec->input_state : state;
-        gx::State check; derive_state(*sdk_block, check); apply_derived(reference, check);
+        gx::State check; derive_state(sdk_block->bytes.data(), check); apply_derived(reference, check);
         if (!(reference.cull == result.cull && reference.descriptors == result.descriptors && reference.formats == result.formats && reference.viewport == result.viewport && reference.scissor == result.scissor && reference.arrays == result.arrays) && cache_mismatches++ < 8)
             std::fprintf(stderr, "[gx-cache] state snapshot differs at callsite %08X\n", lr);
     }
     return result;
 }
-// Front: the descriptors and formats a draw issued now has (what its encoded size depends on), and derive_state's errors at the same call.
-// The host part of a snapshot (vertex arrays, the formats derive_state leaves alone) never changes them: those formats keep their defaults.
-const gx::State& front_state(const SdkRef& block) {
-    if (!front_derived_block || (front_derived_block!=block && !same_derive_inputs(*front_derived_block,*block))) {
-        gx::State fresh;
-        derive_state(*block, fresh);
-        gx::State result; apply_derived(result, fresh);
-        front_derived = result; front_derived_block = block;
-    } else front_derived_block = block;
-    return front_derived;
+// Front: derive_state's errors at the call (only the viewport and scissor checks can throw), kept for the bytes they read.
+std::array<std::byte,32> front_view_checked{};
+bool front_view_valid=false;
+void front_check_view(const std::byte* bytes) {
+    std::array<std::byte,32> key;
+    std::memcpy(key.data(),bytes+0x148,8); std::memcpy(key.data()+8,bytes+0x544,24);
+    if (front_view_valid && key==front_view_checked) return;
+    std::optional<std::array<float,6>> viewport; std::optional<std::array<int32_t,4>> scissor;
+    derive_view(bytes,viewport,scissor);
+    front_view_checked=key; front_view_valid=true;
+}
+// Front: the encoded size of a primitive issued now, as the snapshot's descriptors and formats give it (and derive_state's errors first). Only
+// the descriptors and the primitive's vertex format are read: the host part of a snapshot (vertex arrays, the formats derive_state leaves
+// alone, which keep their defaults) never changes them.
+size_t front_draw_size(const std::byte* bytes,uint8_t primitive,uint8_t vat,uint16_t count,uint32_t callsite) {
+    front_check_view(bytes);
+    static gx::State scratch;   // guest thread only; descriptors and formats[vat] are rewritten for every call
+    derive_descriptors(bytes,scratch.descriptors);
+    if (vat<8) derive_formats(bytes,vat,scratch.formats[vat]);
+    return gx::encoded_draw_size(scratch,primitive,vat,count,callsite);
 }
 // Front: a display list's recorded bytes, compared against guest memory only when a store touched the pages since the last comparison, and
 // anyway every 256th use.
@@ -854,8 +886,8 @@ void import_resource(uint32_t address,uint32_t length,gx::State& bindings,gx::Tr
     }
     path.pop_back();
 }
-// UC_GX_PACKET_HASH=1 (diagnostics): one "[gx-hash]" line per sealed packet, a hash of what the renderer receives (draw geometry, state,
-// transforms, uniforms, material, textures by size, the packet's own fields; =2 adds the decoded texels). A deterministic replay prints the
+// UC_GX_PACKET_HASH=1 (diagnostics): one "[gx-hash]" line per sealed packet, a hash of the draws the builder built (geometry, state,
+// transforms, uniforms, material, textures by size, the packet's own fields; =2 adds the decoded texels), taken before the reticle marking. A deterministic replay prints the
 // same lines with the builder thread and without it (UC_GX_SYNC=1) unless the builder read guest memory the guest had changed meanwhile.
 const int packet_hash=[] { const char* value=std::getenv("UC_GX_PACKET_HASH"); return value ? std::atoi(value) : 0; }();
 struct Fnv {
@@ -866,14 +898,25 @@ struct Fnv {
 void hash_packet(const gx::FramePacket& frame,uint64_t serial) {
     Fnv f;
     f.value(frame.present); f.value(frame.clear_after_copy); f.value(frame.clear_color); f.value(frame.clear_depth); f.value(frame.xfb);
-    f.value(frame.display_source); f.value(frame.black_output); f.value(frame.replay); f.value(frame.prompts.size());
+    f.value(frame.display_source); f.value(frame.black_output); f.value(frame.replay);
     if(frame.texture_copy) { f.value(frame.texture_copy->source); f.value(frame.texture_copy->target->guest_address); }
     auto texture=[&](const std::shared_ptr<const gx::TexturePixels>& pixels) {
         if(!pixels) { f.value(0); return; }
         f.value(pixels->gpu_only); f.value(pixels->guest_address); f.value(pixels->desc_width); f.value(pixels->desc_height);
         if(packet_hash>1 && !pixels->gpu_only) { pixels->wait(); for(const auto& level:pixels->levels) { f.value(level.width); f.value(level.height); f.bytes(level.rgba.data(),level.rgba.size()); } }
     };
+    static const uint64_t detail=[] { const char* value=std::getenv("UC_GX_PACKET_HASH_DETAIL"); return value ? std::strtoull(value,nullptr,10) : 0; }();
+    size_t index=0;
     for(const auto& draw:frame.draws) {
+        if(detail==serial) {   // the packet's draws one by one: which part differs between two runs
+            Fnv v,t,u,m;
+            for(const auto& x:draw.vertex_view()) { v.value(x.position); v.value(x.normal); v.value(x.color); v.value(x.texcoord); v.value(x.position_matrix); v.value(x.texture_matrix); }
+            const auto& tr=*draw.transforms; t.value(tr.projection); t.value(tr.position_rows); t.value(tr.current); t.value(tr.normal_rows);
+            u.value(*draw.uniforms); m.value(draw.material); m.value(draw.blend); m.value(draw.texture_wrap);
+            std::fprintf(stderr,"[gx-hash-draw] %zu callsite %08X vertices %zu %016llX transforms %016llX uniforms %016llX material %016llX texture %08X\n",index,draw.callsite,draw.vertex_view().size(),
+                (unsigned long long)v.h,(unsigned long long)t.h,(unsigned long long)u.h,(unsigned long long)m.h,draw.texture ? draw.texture->desc_width<<16|draw.texture->desc_height : 0);
+        }
+        ++index;
         f.value(draw.callsite); f.value(draw.primitive); f.value(draw.vat);
         const auto& s=*draw.state;
         f.value(s.cull); f.value(s.descriptors); f.value(s.formats);
@@ -887,7 +930,6 @@ void hash_packet(const gx::FramePacket& frame,uint64_t serial) {
         f.value(*draw.uniforms); f.value(draw.material); f.value(draw.blend); f.value(draw.texture_wrap);
         if(draw.texture_bank) f.value(draw.texture_bank->rows);
         texture(draw.texture); for(const auto& map:draw.texture_maps) texture(map);
-        f.value(draw.reticle); f.value(draw.late_aim); f.value(draw.layer); f.value(draw.wake);
     }
     std::fprintf(stderr,"[gx-hash] serial %llu draws %zu hash %016llX\n",(unsigned long long)serial,frame.draws.size(),(unsigned long long)f.h);
 }
@@ -898,6 +940,8 @@ uint64_t submit_batch(const SealInputs& inputs,bool present,bool clear,uint32_t 
     frame.black_output=black;
     frame.replay=replaying;
     frame.aim_consumed=inputs.aim_consumed;
+    // Before the reticle marking: that one looks at decoded textures, which a decode still running leaves for a later frame (host timing).
+    if(packet_hash) hash_packet(frame,back_serial+1);
     gx::mark_reticle_draws(frame.draws,inputs.consumed,inputs.channel,inputs.exact);
     gx::apply_reticle_style(frame.draws,inputs.style,inputs.channel,inputs.consumed[1].has_value());   // the menu's Reticle tab
     for(auto& draw:frame.draws) {
@@ -918,7 +962,6 @@ uint64_t submit_batch(const SealInputs& inputs,bool present,bool clear,uint32_t 
         if(present) {prompt_present+=carried_prompts.size();frame.prompts=std::move(carried_prompts);carried_prompts.clear();}
     }
     ++prompt_batch;
-    if(packet_hash) hash_packet(frame,back_serial+1);
     const uint64_t serial=packets->seal_batch(std::move(frame));
     draws=gx::DrawQueue{};
     if(serial!=++back_serial) {
@@ -1133,8 +1176,8 @@ void gx_restore(const GxSnapshot& saved) {
     capture=std::make_unique<gx::Vertices>(saved.vertices); brec.reset(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={}; draws=saved.draws;
     resources=saved.resources; front_resources=saved.front_resources; finishes=saved.finishes; prompt_batch=saved.prompt_batch; carried_prompts=saved.prompts;
     // State/material snapshots belong to the abandoned timeline.
-    state_cache.valid=material_cache.valid=false; dirty_state(); dirty_material();
-    sdk_last.reset(); front_derived_block.reset();
+    back_derived.clear(); material_cache.valid=false; dirty_state(); dirty_material();
+    back_sdk_last.reset(); front_view_valid=false;
     // Retain immutable decoded meshes; marked epochs force descriptor/source byte validation,
     // including RAM restored by bulk writes that bypass the guest store barrier.
     for(auto& epoch:gx::page_epoch) epoch=gx::write_epoch;
@@ -1183,9 +1226,9 @@ void gx_hle_init(Sched& sched, uint8_t* base, gx::Packets* packet_queue, bool pr
     blend_state={}; live_blend={}; color_uniforms={}; live_uniforms=gx::DrawUniform{}; live_material={}; texture_matrices={}; matrix_indices={}; indirect_stages={};
     bound_textures={}; palettes.clear(); live_texture.reset(); live_texture_maps={};
     draw_count = 0; vertex_count = 0; submitted = 0; completed = 0; outside_bytes = 0;
-    state_cache={}; material_cache={};
+    back_derived.clear(); material_cache={};
     known_sdk=0; front_resources.clear(); front_list.reset(); front_prim.active=false; uc::gx_fifo_window={};
-    sdk_last.reset(); front_derived_block.reset();
+    back_sdk_last.reset(); front_view_valid=false;
     { std::lock_guard lock(det_finish_m); det_finishes.clear(); det_early.clear(); }
     front_serial=back_serial=packets ? packets->next_serial()-1 : 0;
     front_stamp=0; prompt_tokens=0; prompt_marks={};
@@ -1332,15 +1375,15 @@ void hle_GXBegin(ppc::Ctx& c) {
         uc::gx_fifo_store(2,uint16_t(count));
         if (!uint16_t(count)) return;   // the list keeps the header; a primitive without vertices draws nothing
         if (!front_list->overflow) {
-            const auto block=capture_sdk(sdk);
-            const size_t expected=gx::encoded_draw_size(front_state(block),uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
+            const auto* block=sdk_view(sdk);
+            const size_t expected=front_draw_size(block,uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
             known_sdk=sdk;
             auto& list=*front_list;
             const size_t offset=list_used();
             list.prim_open=true; list.prim_end=list.bytes.get()+offset+expected; list.prim_callsite=callsite; list.prim_expected=expected;
             if(offset+expected>list.capacity) list.prim_end=list.bytes.get()+list.capacity+1;   // never reached: the recording overflows first
             list_window();
-            back([block,lr=c.lr,callsite,primitive=uint8_t(primitive),vat=uint8_t(vat),count=uint16_t(count),expected,offset] { record_draw(block,lr,callsite,primitive,vat,count,expected,offset); });
+            back_with_sdk(sdk,block,false,[lr=c.lr,callsite,primitive=uint8_t(primitive),vat=uint8_t(vat),count=uint16_t(count),expected,offset](const SdkRef& snapshot_block) { record_draw(snapshot_block,lr,callsite,primitive,vat,count,expected,offset); });
         }
         return;
     }
@@ -1350,14 +1393,14 @@ void hle_GXBegin(ppc::Ctx& c) {
         ppc::wr32(c,sdk+0x5FC,dirty&~0x04000000u);
     }
     if (!uint16_t(c.r[5])) return;   // a primitive without vertices (an empty quad batch) draws nothing
-    const auto block=capture_sdk(sdk);
+    const auto* block=sdk_view(sdk);
     const uint32_t callsite=c.lr ? c.lr - 4 : 0x80284FD0;
-    const auto& layout=front_state(block);
+    front_check_view(block);   // what deriving the snapshot throws comes before the sequence check, as in capture->begin(snapshot(...))
     if (front_prim.active) throw gx::Error(gx::ErrorCode::sequence,callsite,0,uint16_t(c.r[5]));
-    const size_t expected=gx::encoded_draw_size(layout,uint8_t(c.r[3]),uint8_t(c.r[4]),uint16_t(c.r[5]),callsite);
+    const size_t expected=front_draw_size(block,uint8_t(c.r[3]),uint8_t(c.r[4]),uint16_t(c.r[5]),callsite);
     known_sdk=sdk;
     const uint32_t who=producer();
-    back_checked([block,who,callsite,lr=c.lr,primitive=uint8_t(c.r[3]),vat=uint8_t(c.r[4]),count=uint16_t(c.r[5])] { live_begin(block,primitive,vat,count,who,callsite,lr); });
+    back_with_sdk(sdk,block,true,[who,callsite,lr=c.lr,primitive=uint8_t(c.r[3]),vat=uint8_t(c.r[4]),count=uint16_t(c.r[5])](const SdkRef& snapshot_block) { live_begin(snapshot_block,primitive,vat,count,who,callsite,lr); });
     auto& prim=front_prim;
     prim.active=true; prim.producer=who; prim.callsite=callsite; prim.expected=expected;
     if(prim.bytes.size()<expected+8) prim.bytes.resize(expected+8);
@@ -1553,16 +1596,16 @@ void hle_GXCallDisplayList(ppc::Ctx& c) {
         back([address,length] { brec->native.geometry.push_back(Resource::Child{address,length}); });
         return;
     }
-    const auto block=capture_sdk(sdk); known_sdk=sdk;
+    const auto* block=sdk_view(sdk); known_sdk=sdk;
     // The colour channel count and controls the guest sees afterwards: the SDK block's, changed by the list's own settings.
-    uint32_t channels_count=(block->word(0x254)>>4)&3;
+    uint32_t channels_count=(sdk_word(block,0x254)>>4)&3;
     std::array<uint32_t,4> channels{};
-    for(uint32_t i=0;i<4;++i) channels[i]=block->word(0xB8+i*4);
+    for(uint32_t i=0;i<4;++i) channels[i]=sdk_word(block,0xB8+i*4);
     uint32_t texture_copies=0;
     std::vector<uint32_t> path;
     walk_effects(address,length,channels_count,channels,texture_copies,path);
     for(uint32_t i=0;i<texture_copies;++i) { next_seal(); ++copies; }
-    back_checked([block,lr=c.lr,address,length,inputs=texture_copies ? seal_inputs() : SealInputs{}] { call_list(block,lr,address,length,inputs); });   // the inputs only serve the packets its copies seal
+    back_with_sdk(sdk,block,true,[lr=c.lr,address,length,inputs=texture_copies ? seal_inputs() : SealInputs{}](const SdkRef& snapshot_block) { call_list(snapshot_block,lr,address,length,inputs); });   // the inputs only serve the packets its copies seal
     ppc::wr32(c,sdk+0x254,(read32(sdk+0x254)&~0x70u)|(channels_count<<4));
     for(uint32_t i=0;i<4;++i) ppc::wr32(c,sdk+0xB8+i*4,channels[i]);
 }
@@ -1882,18 +1925,19 @@ void hle_ResColorApply(ppc::Ctx& c) {
     const auto bytes=memory.read(read32(c.r[3]),128);
     const auto sdk=read32(c.r[2]-8968);
     memory.read(sdk,4);
-    gx::ColorMaterial parsed;
-    try { parsed=gx::import_color_material(bytes); }
-    catch(const std::invalid_argument&) {
-        std::fprintf(stderr,"[native-color-invalid] hex");
-        for(auto byte:bytes) std::fprintf(stderr," %02X",std::to_integer<unsigned>(byte));
-        std::fprintf(stderr,"\n"); throw;
-    }
     if(front_list) {
         uc::gx_fifo_store(1,0x40); uc::gx_fifo_store(4,read32(c.r[3])); uc::gx_fifo_store(4,128);
     }
     const bool push=recording_push();
-    back([parsed,push] {
+    // The material is parsed by the builder from a copy (an invalid one stops the game there, the guest thread rethrows at its next GX call).
+    auto apply=[push](std::span<const std::byte> bytes) {
+        gx::ColorMaterial parsed;
+        try { parsed=gx::import_color_material(bytes); }
+        catch(const std::invalid_argument&) {
+            std::fprintf(stderr,"[native-color-invalid] hex");
+            for(auto byte:bytes) std::fprintf(stderr," %02X",std::to_integer<unsigned>(byte));
+            std::fprintf(stderr,"\n"); throw;
+        }
         for(uint32_t i=0;i<3;++i) {
             color_uniforms.registers[i+1]=parsed.registers[i]; dirty_material();
             if(brec && push) brec->native.geometry.push_back(Resource::TevColor{i+1,false,parsed.registers[i]});
@@ -1902,7 +1946,9 @@ void hle_ResColorApply(ppc::Ctx& c) {
             color_uniforms.konst[i]=parsed.konst[i]; dirty_material();
             if(brec && push) brec->native.geometry.push_back(Resource::TevColor{i,true,parsed.konst[i]});
         }
-    });
+    };
+    try { queue.emit_bytes(std::move(apply),bytes.data(),uint32_t(bytes.size()),front_stamp); }
+    catch (const gx::Error& error) { if (error.code==gx::ErrorCode::canceled) throw uc::ThreadExit{}; throw; }
     ppc::wr16(c,sdk+2,0);
 }
 void hle_ResPixelApply(ppc::Ctx& c) {
@@ -2171,10 +2217,10 @@ void hle_ResMeshDraw(ppc::Ctx& c) {
     scheduler->safe_point(); // Service audio/VI between complete native mesh calls.
     const auto bytes=mesh_resource(c,36,0);
     const uint32_t sdk=read32(c.r[2]-8968);
-    const auto block=capture_sdk(sdk);
-    front_state(block);   // derive_state's errors at the call
+    const auto* block=sdk_view(sdk);
+    front_check_view(block);   // derive_state's errors at the call
     known_sdk=sdk;
-    back_checked([block,lr=c.lr,object=c.r[3],address=guest_address(bytes.data()),size=uint32_t(bytes.size())] { mesh_draw(block,lr,object,address,size); });
+    back_with_sdk(sdk,block,true,[lr=c.lr,object=c.r[3],address=guest_address(bytes.data()),size=uint32_t(bytes.size())](const SdkRef& snapshot_block) { mesh_draw(snapshot_block,lr,object,address,size); });
     if(profile_mesh && !mesh_dumps_settled) {   // until the profile's first mesh: whether it dumped decides the clock reads below
         drain();
         for(;mesh_dumps_seen<mesh_dumps.load();++mesh_dumps_seen) uc::now_ticks();
