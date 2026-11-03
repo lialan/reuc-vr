@@ -3408,6 +3408,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         depth.storeOp=VK_ATTACHMENT_STORE_OP_NONE;
         if (load_op_none_) depth.loadOp=VK_ATTACHMENT_LOAD_OP_NONE_EXT;
     }
+    // A pass whose draws test depth but none writes it (the translucent effects and particles after the scene) loads depth and leaves it
+    // as it was: STORE_OP_NONE (Vulkan 1.3) writes nothing back, 2 x 2064x2944 x 4 bytes saved a pass at native. UC_DEPTH_STORE_ALWAYS=1: stored.
+    static const bool store_always=std::getenv("UC_DEPTH_STORE_ALWAYS")!=nullptr;
+    if (!store_always && depth.storeOp==VK_ATTACHMENT_STORE_OP_STORE && initialized && !target.clear_depth && !(scene && scene_clear_.pending) &&
+        std::none_of(gpu_draws.begin()+first,gpu_draws.begin()+last,[](const auto& info) { return info.index_count && ((info.key[68]>>4)&1); }))
+        depth.storeOp=VK_ATTACHMENT_STORE_OP_NONE;
+    if (!store_always && target.clear_depth) depth.storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;   // a scratch depth buffer (the bloom proxy's, the held frame's): cleared by every pass, never read after it
     rendering.pDepthAttachment=&depth;
     {   // UC_GPU_PACKETS: the attachment pixels moved through tile memory (loaded + stored, colour and depth, all eyes) against the whole target
         static const bool area_stats = std::getenv("UC_GPU_PACKETS") != nullptr;
