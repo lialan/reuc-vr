@@ -29,3 +29,9 @@ RegEffect reg_effect(const ppc::OpInfo& op, uint32_t w, bool rc, bool& ok);
 std::string reg_field(int i, const std::string& ctx);
 
 }  // namespace uc
+
+namespace uc {
+// A translated function that cannot reach a safe point or another function (no calls, no loops, no indirect or tail branches): every
+// guest register it can load or store in the real context, and those it can store. A call of one only syncs those (translator/emit.cpp).
+struct LeafRegs { RegSet touched, written; };
+}  // namespace uc

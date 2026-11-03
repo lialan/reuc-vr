@@ -135,6 +135,26 @@ int main() {
         std::snprintf(buf, sizeof buf, "{ c.lr = 0x%08Xu; ctx.lr = c.lr; fn_%08X(ctx); c.r[4] = ctx.r[4];  } else { ctx.lr = c.lr; } }", a.addr(ccall) + 4, g);
         CHECK(has(buf));
     }
+    {   // a call of a leaf function (no calls, no loops) syncs only the registers it touches: r20 stays dirty across it and is stored at the
+        // return (so is the link register: the leaf never reads it); the form for an entry with native probes (UC_PLAIN_ENTRY false) syncs
+        // everything
+        Asm a;
+        a.emit(addi(3, 3, 1)); a.emit(addi(20, 20, 5));
+        size_t call = a.emit(0);
+        a.emit(addi(3, 3, 1)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(addi(3, 3, 2)); a.emit(blr);
+        a.patch_bl(call, g);
+        auto q = make_prog(a.w);
+        auto emitted = uc::emit_program(q, 1000, st);
+        std::string t;
+        for (const auto& [name, source] : emitted.files) if (name == "game_000.cpp") t = source;
+        char buf[400];
+        std::snprintf(buf, sizeof buf, "if constexpr (UC_PLAIN_ENTRY(0x%08Xu)) { c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; fn_%08X(ctx); c.r[3] = ctx.r[3]; } "
+                      "else { c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; ctx.r[20] = c.r[20]; ctx.lr = c.lr; fn_%08X(ctx); c.r[3] = ctx.r[3]; c.r[20] = ctx.r[20]; c.lr = ctx.lr; }",
+                      g, a.addr(call) + 4, g, a.addr(call) + 4, g);
+        CHECK(t.find(buf) != std::string::npos);
+        CHECK(t.find("{ ctx.r[3] = c.r[3]; ctx.r[20] = c.r[20]; ctx.lr = c.lr; return; }") != std::string::npos);
+    }
     {   // a call of a register save/restore helper becomes its stores in place (no call, no sync); without the cache it stays an HLE call
         Asm a;
         size_t call = a.emit(0); a.emit(blr);

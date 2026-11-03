@@ -16,6 +16,8 @@ namespace ppc { void trace_enter(uint32_t addr); }
 #else
 #define UC_ENTER(a) ((void)0)
 #endif
+// True when no native code runs at the entry of translated function `a` (game/entry_probe.h knows the probed ones).
+#define UC_PLAIN_ENTRY(a) true
 
 namespace ppc {
 

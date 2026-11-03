@@ -102,8 +102,11 @@ static std::string cond_expr(uint32_t bo, uint32_t bi, std::string& pre) {
 struct SyncText {
     std::string cx = "c", flush, reload, not_taken;
     const std::map<uint32_t, std::string>* edges = nullptr;
-    explicit SyncText(const CrHints* h) {
-        if (h && h->local) { cx = "ctx"; flush = h->flush; reload = h->reload; not_taken = h->not_taken; edges = &h->edge; }
+    const CrHints* h = nullptr;
+    explicit SyncText(const CrHints* hints) {
+        if (hints && hints->local) {
+            cx = "ctx"; h = hints; flush = h->flush; reload = h->reload + h->after_call; not_taken = h->not_taken; edges = &h->edge;
+        }
     }
     bool local() const { return cx == "ctx"; }
     // the else branch of a conditional call: what the path that skips the call flushes (code after the call would also run after it)
@@ -167,6 +170,11 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
         return s.flush + trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
     }
     std::string fn = tk.kind == Target::Secondary ? sec_name(tk.owner, target) : callee(p, target);
+    if (lk && s.h && s.h->leaf_call) {   // partial sync unless native code runs at the callee's entry
+        const std::string lr = "c.lr = 0x" + hex8(pc + 4) + "u; ";
+        return "if constexpr (UC_PLAIN_ENTRY(0x" + hex8(target) + "u)) { " + lr + s.flush + fn + "(ctx); " + s.reload + "} else { " + lr + s.h->full_flush +
+               fn + "(ctx); " + s.h->full_reload + s.h->after_call + "}";
+    }
     if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + fn + "(" + s.cx + ");" + (s.reload.empty() ? "" : " " + s.reload);
     return s.flush + fn + "(" + s.cx + "); return;";
 }
@@ -472,6 +480,9 @@ struct RegNode {
     int target = -1;           // internal branch target (instruction index; n = past the end)
     bool poll = false;         // the internal branch is a loop back edge (an interrupt poll on its slow path)
     std::vector<int> table;    // jump table targets
+    RegSet pass;               // a call of a leaf function: dirty registers it neither loads nor stores (they stay dirty across it)
+    RegSet call_writes;        // the registers the call can change in the real context (all, unless a leaf)
+    bool tail = false;         // the exit is a jump into another function
 };
 
 RegSet cached_mask() { RegSet m; for (int i = 0; i < res::COUNT; ++i) m.set(size_t(i)); return m; }
@@ -486,7 +497,8 @@ std::string copy_text(const RegSet& set, bool to_ctx) {
 }
 
 // Control flow of one instruction as emit_insn writes it.
-RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment) {
+RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment,
+                 const std::unordered_map<uint32_t, LeafRegs>* leaves) {
     using ppc::Kind;
     RegNode nd;
     auto index = [&](uint32_t t) { return int((t - f.entry) / 4); };
@@ -516,8 +528,14 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
                 return false;
             }
         }
-        if (lk) { def(res::LR, always); nd.call = true; return false; }
-        nd.exit = true;
+        if (lk) {
+            def(res::LR, always); nd.call = true;
+            auto leaf = leaves && tk.kind == Target::Entry ? leaves->find(target) : decltype(leaves->end()){};
+            if (leaves && tk.kind == Target::Entry && leaf != leaves->end()) { nd.pass = cached_mask() & ~leaf->second.touched; nd.call_writes = leaf->second.written; }
+            else nd.call_writes = cached_mask();
+            return false;
+        }
+        nd.exit = true; nd.tail = true;
         return false;
     };
     // the condition of a conditional branch; true when it is always taken
@@ -527,7 +545,7 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
         return (bo & 16) && ((bo & 4) || !ctr_ok);
     };
     switch (op->kind) {
-        case Kind::SC: nd.fall = false; nd.call = true; return nd;
+        case Kind::SC: nd.fall = false; nd.call = true; nd.call_writes = cached_mask(); return nd;
         case Kind::BR: {
             const int32_t li = ppc::li(w);
             nd.fall = action(ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li), ppc::lk(w), true);
@@ -541,7 +559,7 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
         }
         case Kind::BCLR: {
             const bool always = condition(ppc::bo(w), ppc::bi(w), true);
-            if (ppc::lk(w)) { use(res::LR); def(res::LR, always); nd.call = true; }
+            if (ppc::lk(w)) { use(res::LR); def(res::LR, always); nd.call = true; nd.call_writes = cached_mask(); }
             else nd.exit = true;
             nd.fall = !always;
             return nd;
@@ -556,8 +574,8 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
                 return nd;
             }
             const bool always = condition(ppc::bo(w) | 4, ppc::bi(w), false);
-            if (ppc::lk(w)) { def(res::LR, always); nd.call = true; }
-            else nd.exit = true;
+            if (ppc::lk(w)) { def(res::LR, always); nd.call = true; nd.call_writes = cached_mask(); }
+            else { nd.exit = true; nd.tail = true; }
             nd.fall = !always;
             return nd;
         }
@@ -570,8 +588,20 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
 }
 }  // namespace
 
-std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live) {
-    std::set<uint32_t> labels{f.entry};
+// What each instruction of a function becomes (labels, CR liveness decisions). The hints point into the plan: it is filled in place.
+struct FnPlan {
+    std::set<uint32_t> labels;
+    size_t n = 0;
+    std::vector<uint32_t> words;
+    std::vector<CrHints> hints;
+    std::vector<std::string> comment;   // a dead or folded compare: emitted as this comment
+    std::vector<FusedCmp> fused;        // compare operands for the branch at i
+    std::vector<RegSet> fused_use;
+    bool tail_end = false;              // the last instruction falls into the next function
+};
+static void plan_function(const Program& p, const Function& f, const CrLive* live, EmitStats& st, FnPlan& plan) {
+    std::set<uint32_t>& labels = plan.labels;
+    labels = {f.entry};
     for (uint32_t pc = f.entry; pc < f.end; pc += 4) {
         uint32_t w = 0;
         if (!p.img.word(pc, w)) continue;
@@ -586,16 +616,14 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     }
     for (const auto& jt : p.an.jump_tables) if (jt.bctr_addr >= f.entry && jt.bctr_addr < f.end) for (uint32_t t : jt.targets) labels.insert(t);
     auto sit = p.an.secondary.find(f.entry);
-    bool has_sec = sit != p.an.secondary.end();
-    if (has_sec) for (uint32_t t : sit->second) labels.insert(t);
+    if (sit != p.an.secondary.end()) for (uint32_t t : sit->second) labels.insert(t);
 
-    // pass 1: what each instruction becomes (CR liveness decisions)
-    const size_t n = (f.end - f.entry) / 4;
-    std::vector<uint32_t> words(n, 0);
-    std::vector<CrHints> hints(n);
-    std::vector<std::string> comment(n);              // a dead or folded compare: emitted as this comment
-    std::vector<FusedCmp> fused(n);                   // compare operands for the branch at i
-    std::vector<RegSet> fused_use(n);
+    const size_t n = plan.n = (f.end - f.entry) / 4;
+    auto& words = plan.words; words.assign(n, 0);
+    auto& hints = plan.hints; hints.assign(n, CrHints{});
+    auto& comment = plan.comment; comment.assign(n, std::string());
+    auto& fused = plan.fused; fused.assign(n, FusedCmp{});
+    auto& fused_use = plan.fused_use; fused_use.assign(n, RegSet());
     const std::vector<uint8_t>* after = nullptr;   // CR fields still readable after each instruction
     if (live) { auto it = live->out.find(f.entry); if (it != live->out.end()) after = &it->second; }
     for (size_t i = 0; i < n; ++i) {
@@ -636,7 +664,23 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     }
     uint32_t last = 0;
     p.img.word(f.end - 4, last);
-    const bool tail_end = !is_terminator_word(last) && p.an.is_entry(f.end);
+    plan.tail_end = !is_terminator_word(last) && p.an.is_entry(f.end);
+}
+
+
+
+std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live, const std::unordered_map<uint32_t, LeafRegs>* leaves) {
+    FnPlan plan;
+    plan_function(p, f, live, st, plan);
+    const std::set<uint32_t>& labels = plan.labels;
+    const size_t n = plan.n;
+    const auto& words = plan.words;
+    auto& hints = plan.hints;
+    const auto& comment = plan.comment;
+    const auto& fused_use = plan.fused_use;
+    const bool tail_end = plan.tail_end;
+    auto sit = p.an.secondary.find(f.entry);
+    const bool has_sec = sit != p.an.secondary.end();
 
     // pass 2: register cache dataflow
     const bool local = p.reg_cache;
@@ -645,7 +689,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     std::vector<std::string> fall_flush(n);   // flush on the fall-through edge into the next instruction
     if (local) {
         std::vector<RegNode> nodes(n);
-        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty());
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
         // Control-flow edges. Dirty = written since the last sync on *every* path: where paths with different dirty sets meet over a forward
         // edge, the edge itself flushes the difference (a join after a conditional write stores there, once); over a back edge the loop head
         // keeps the union (the loop runs without stores) and the entry path keeps those registers current instead (the liveness below makes
@@ -664,7 +708,9 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             for (int t : nd.table) add(int(i), t, false);
         }
         std::vector<RegSet> dirty_in(n + 1);
-        auto edge_out = [&](const Edge& e) { return e.sync || e.from < 0 ? RegSet() : dirty_after[size_t(e.from)]; };
+        auto edge_out = [&](const Edge& e) {   // a call leaves only what a leaf callee does not touch dirty
+            return e.from < 0 ? RegSet() : e.sync ? (dirty_after[size_t(e.from)] & nodes[size_t(e.from)].pass) : dirty_after[size_t(e.from)];
+        };
         for (bool changed = true; changed;) {
             changed = false;
             for (size_t m = 0; m <= n; ++m) {
@@ -691,8 +737,10 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             for (size_t i = n; i-- > 0;) {
                 const RegNode& nd = nodes[i];
                 RegSet x;
-                if (nd.call || nd.exit || nd.poll) x |= dirty_after[i];
-                for (int k : out[i]) if (!edges[size_t(k)].sync) x |= live_in[size_t(edges[size_t(k)].to)] | edge_flush[size_t(k)];
+                if (nd.exit || nd.poll) x |= dirty_after[i];
+                // a call flushes what the callee may touch; the copies it cannot change must be current before it
+                if (nd.call) x |= (dirty_after[i] & ~nd.pass) | (live_in[i + 1] & ~nd.call_writes);
+                for (int k : out[i]) x |= (edges[size_t(k)].sync ? RegSet() : live_in[size_t(edges[size_t(k)].to)]) | edge_flush[size_t(k)];
                 const RegSet in = nd.eff.use | (nd.eff.may & ~nd.eff.must) | (x & ~nd.eff.must);
                 if (in != live_in[i]) { live_in[i] = in; changed = true; }
             }
@@ -702,16 +750,27 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         for (size_t i = 0; i < n; ++i) {
             const RegNode& nd = nodes[i];
             hints[i].local = true;
-            if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(dirty_after[i], true); st.reg_flushes += dirty_after[i].count(); }
-            if (nd.call) { hints[i].reload = copy_text(live_in[i + 1], false); st.reg_reloads += live_in[i + 1].count(); }
+            const RegSet flush = nd.call ? dirty_after[i] & ~nd.pass : dirty_after[i];
+            if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(flush, true); st.reg_flushes += flush.count(); }
+            if (nd.call) { hints[i].reload = copy_text(live_in[i + 1] & nd.call_writes, false); st.reg_reloads += (live_in[i + 1] & nd.call_writes).count(); }
+            if (nd.call && nd.pass.any()) {
+                ++st.reg_leaf_calls;
+                hints[i].leaf_call = true;
+                hints[i].full_flush = copy_text(dirty_after[i], true);
+                hints[i].full_reload = copy_text(live_in[i + 1] | (dirty_after[i] & nd.pass), false);   // copies the leaf path keeps must stay current
+            }
             else if (nd.poll) { hints[i].reload = copy_text(live_in[size_t(nd.target)], false); st.reg_reloads += live_in[size_t(nd.target)].count(); }
         }
         for (size_t k = 0; k < edges.size(); ++k) {
             const Edge& e = edges[size_t(k)];
-            if (e.from < 0 || e.sync || e.back || edge_flush[k].none()) continue;
+            if (e.from < 0 || e.back || edge_flush[k].none()) continue;
             st.reg_flushes += edge_flush[k].count();
             const std::string text = copy_text(edge_flush[k], true);
-            if (e.fall && nodes[size_t(e.from)].call) hints[size_t(e.from)].not_taken = text;   // a conditional call: in its else branch
+            if (e.sync) {   // after a leaf call: on the call's own path
+                if (nodes[size_t(e.from)].fall) hints[size_t(e.from)].after_call = text;
+                else fall_flush[size_t(e.from)] = text;
+            }
+            else if (e.fall && nodes[size_t(e.from)].call) hints[size_t(e.from)].not_taken = text;   // a conditional call: in its else branch
             else if (e.fall) fall_flush[size_t(e.from)] = text;   // after the instruction, before the next label
             else hints[size_t(e.from)].edge[f.entry + uint32_t(e.to) * 4] = text;   // on the jump (a jump table: in its case)
         }
@@ -756,6 +815,31 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     return o.str();
 }
 
+// The translated functions a call may sync with partially: no call (the save/restore helpers are written in place), no loop (so no
+// interrupt poll: no safe point where the scheduler or an interrupt could look at the context), no jump table, no tail or indirect jump
+// and no fall into the next function. Their loads and stores of the real context are their entry loads and flushes, all within the
+// registers they read or write.
+static std::unordered_map<uint32_t, LeafRegs> analyze_leaves(const Program& p, const CrLive* live) {
+    std::unordered_map<uint32_t, LeafRegs> out;
+    EmitStats scratch;
+    for (const auto& f : p.an.functions) {
+        if (p.cfg.hle.count(f.entry) || f.end <= f.entry) continue;
+        FnPlan plan;
+        plan_function(p, f, live, scratch, plan);
+        if (plan.tail_end) continue;
+        LeafRegs regs;
+        bool leaf = true;
+        for (size_t i = 0; i < plan.n && leaf; ++i) {
+            const RegNode nd = reg_node(p, f, f.entry + uint32_t(i) * 4, plan.words[i], plan.hints[i], plan.fused_use[i], !plan.comment[i].empty(), nullptr);
+            if (nd.call || nd.poll || nd.tail || !nd.table.empty()) leaf = false;
+            regs.touched |= nd.eff.use | nd.eff.may;
+            regs.written |= nd.eff.may;
+        }
+        if (leaf) out[f.entry] = regs;
+    }
+    return out;
+}
+
 Output emit_program(const Program& p, size_t shard, EmitStats& st) {
     Output out;
     std::set<std::string> hle_names;
@@ -780,9 +864,11 @@ Output emit_program(const Program& p, size_t shard, EmitStats& st) {
         cur.clear(); in_cur = 0;
     };
     const CrLive live = p.cr_opt ? analyze_cr(p) : CrLive{};
+    const auto leaves = p.reg_cache ? analyze_leaves(p, p.cr_opt ? &live : nullptr) : std::unordered_map<uint32_t, LeafRegs>{};
+    st.reg_leaves = leaves.size();
     for (const auto& f : p.an.functions) {
         if (p.cfg.hle.count(f.entry)) continue;
-        cur += emit_function(p, f, st, p.cr_opt ? &live : nullptr);
+        cur += emit_function(p, f, st, p.cr_opt ? &live : nullptr, &leaves);
         if (++in_cur >= shard) flush();
     }
     flush();
