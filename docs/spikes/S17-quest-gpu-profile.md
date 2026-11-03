@@ -634,3 +634,95 @@ Guest CPU in the replay is now 1741 Mcycles (ns) per game second, 29 ms per retr
 The translated code is most of it; the host share left on the guest thread is the SDK math HLE (PSVEC/PSMTX, collision, ~3%),
 `hle_ResMeshSetup`'s parse (~1%), the GX front (~4%) and the draw-done wait for the builder and the render thread. The builder has headroom
 (half a core); if it becomes the limit, its per-draw state blocks (the 2 KB `share()` compares, the shared_ptr counts) are next.
+
+## GPU shaders (2026-11-03, branch quest-gpu-shaders)
+
+Question: the GPU is 99% busy in the headset; why does each pass cost what it does, per shader, and what of it is emulation overhead that a
+Quest-native way of doing the same job removes without changing the picture?
+
+Method: the deterministic `fightvr` replay on the headset (`UC_GPU_PACKETS=1`, GPU ms per packet per presented frame over retraces
+8450-9352, `LINDBERGH_XR_SET=foveation=off,render_scale=...`), `ovrgpuprofiler -r` realtime counters over the fight (ALU / texture /
+occupancy, full vs half ALU), and offline compiles of the SPIR-V with Mesa's freedreno ir3 for Adreno 740 (a small tool linking Mesa
+26.2.6's ir3 with turnip-like lowering, `/tmp/qgs/ir3c`, not in the repository: instruction counts by category, registers, waves; the
+Qualcomm compiler differs, the trends hold). Pictures: the VR preview's EFB captures at retraces 8700/9060/9300 compared with
+ImageMagick (`compare -metric AE/PAE`). Scripts (not in the repository): `/tmp/qgs/dbench.sh`, `dsum.py`, `csum.py`, `cmp.sh`.
+
+### Where the time went (base f2abd8d, native 3.07x, 545-640 MHz)
+
+| packet | GPU ms / presented frame |
+|---|---|
+| main scene (`copy 640x360 draws 200+`) | 12.7 |
+| HUD packet (`no copy draws 50-199`: 2 lens glows + 1 fade, full screen per eye; ~61 HUD quads) | 8.7 |
+| particles (`copy 320x180 draws 200+`: ~295 smoke / heat-haze sprites) | 8.0 |
+| present (screen pass, FXAA) | 3.7 |
+| colour pass (4-stage TEV, full screen, + half copy) | 2.5 |
+| composite + full-size copy | 1.4 |
+| rest of the copy / bloom chain | ~2.5 |
+| **frame** | **41.3** |
+
+Counters over the fight: shading fragments 95% of the time, 80 ALU instructions a fragment, 52% ALU capacity, wave occupancy 60%, the
+fragment ALU 84% full precision / 16% half. ir3 on the 324 folded TEV modules: 541 instructions a fragment on average (median 415), 13.9
+vec4 registers (most at 16: 12 waves of 64), **no fp16 arithmetic at all** (the "half" ALU is 16-bit booleans), 13.5 texture
+instructions where the TEV samples one or two textures.
+
+### Finding 1: every textured TEV stage carried the indirect-texturing path
+
+`tev.slang tevStage` read the stage's IND_CMD from the draw's uniform block at run time, so the folded module kept, in every stage that
+samples a texture, the whole GX indirect path: a run-time choice among the eight textures (an 8-way switch of samples) plus eight size
+queries for the fixed-point coordinates, and the offset matrix math. Not taken at run time, but it set the register allocation (16 vec4)
+and with it the occupancy. A one-stage particle shader: 404 instructions, 198 ALU, 9 texture instructions, 16 registers.
+
+Fix (ed2a42f): the headset's keys mark each stage whose IND_CMD is 0 (order word bit 16) and tev.slang compiles the path out there. ir3:
+541 -> 124 instructions a fragment on average, 13.9 -> 6.0 registers, 13 -> 16 waves; the particle shader 404 -> 115. Both key forms are
+folded (old keys read as all-direct; a key whose own form is missing falls back to the all-indirect module: never slower than before);
+the fight's mixed keys (the lens glows' first stage and the heat haze read an indirect coordinate) are recorded in
+`project/pipeline_keys.quest`, now also shipped as warm-up keys. Without them the glows ran driver-specialized modules and the HUD packet
+got slower (8.7 -> 15.2 ms): measure with the keys in place.
+
+Headset (native): main scene 12.7 -> 10.6-10.7, particles 8.0 -> 5.7-5.9, colour pass 2.5 -> 1.4; counters: occupancy 60 -> 70-76%,
+ALU a fragment 80 -> 65. Pictures identical (peak 1/255).
+
+### Finding 2: the HUD and the glows are drawn at eye resolution into the EFB's tiles
+
+The HUD packet's ~61 tiny HUD quads cost a fixed amount per draw in every tile of the 2 x 2064x2208 EFB, and its three full-screen glow /
+fade quads per eye shade and blend 27 Mpx a frame although they carry no detail finer than a guest pixel (a 320x180 copy times 96-128
+pixel masks).
+
+Fix (5aaee8c, `renderer/hud_layer.h`): two small layers composited by the screen pass.
+- **HUD layer**: HOTD4 reprojects every HUD-class draw onto a screen plane, so each eye sees the plane of the first HUD draw as a
+  homography of the game's clip plane. The HUD draws go into a two-layer target (a slice per eye) at the eyes' pixel density over the HUD
+  viewport (640x360 x 2.25 at native), each draw carried into that plane through its own eye transform (HOTD4's 2% depth spread, a little
+  parallax, is kept). Two images: L (what the draws add) and T (what the scene behind keeps, per channel) so that eye = scene * T + L.
+  Each draw blends L with its own factors and T with its destination factor (a DST_COLOR multiply too: T is stored at half scale);
+  exact for every blend that does not read the destination except through such a multiply, a few 1/255 steps of 8-bit rounding
+  (`test_hud_layer`). The game's HUD uses alpha-over, one additive and one DST_COLOR multiply quad.
+- **Glow layer** (same images): full-screen 2D draws each eye sees in its own clip space (HOTD4's identity / fill classes) whose textures
+  are magnified, at 2 points a guest pixel (`UC_GLOW_SCALE`) when the EFB has 2.5 or more (native: 3.2 x 6.1).
+- Order: a packet uses the layers when its draws from the first layer draw on are glows, then HUD draws. Anything else drawn into the
+  EFB after them (the game's crosshair when the panel shows it; hidden by default) keeps the packet in the EFB. A later packet that draws
+  or copies composites the layers into the EFB first (`hud_layer.slang`); a frame whose EFB is read (captures, the reticle layer, the
+  desktop preview) composites them into the EFB before the present copy.
+
+Headset (native, HUD layer, before the glow layer): frame 41.3 -> 36.7 ms; the present 3.7 -> 4.4 (the composite: two more taps and a
+homography an eye pixel); the HUD packet is then its glows. Pictures (VR preview, layers off vs on, crosshair hidden): the HUD at the
+same place with slightly softer edges (in the headset FXAA no longer runs over it), the glows slightly softer where the game's ghost
+image has sharp edges (peak 8% at single pixels, render scale 3).
+
+### Checked and not changed
+
+- **fp16 (RelaxedPrecision)**: the folded modules relaxed by `tools/spirv_relaxed_precision.py` keep their instruction count in ir3 (338
+  vs 334 a fragment; 17 of ~160 ALU become half) and the earlier headset run gave -5% on the main scene. It cannot be picture-checked on
+  the Mac (KosmicKrisp runs mediump at 32 bits); kept opt-in (`UC_RELAXED_TEV=1`) until a headset capture comparison.
+- The present's FXAA: two size queries (CSE'd), 250 instructions with the composite; FXAA alone was 0.8 ms. Not changed.
+- Render targets: EFB RGBA8 + D32 (D24S8 is the same size in tile memory), no MSAA; texture formats RGBA8 / RGB565 (no BC on the Quest).
+
+### What is left (by size, native)
+
+- Main scene ~10.7 ms, fragment-bound (27 M fragments a frame).
+- Particles ~5.9 ms: ~295 translucent sprites with ~6x overdraw, depth-tested against the scene (a low-resolution layer would need a
+  low-resolution depth: soft edges where they meet geometry).
+- Present ~4.4 ms: the screen pass over 2 x 2064x2208 with FXAA and the layers' composite.
+- The bloom chain (~2.4 ms: bright pass, blurs, half copies) still draws and copies at the EFB's density although it is blurred: running
+  the packets that draw only into the EFB corner a later copy reads in a low-resolution proxy of that corner is the next structural step.
+- The colour pass and the composite (~2.8 ms) are full-resolution by nature (they carry the scene); the full-size copy between them
+  (a 2 x 9 Mpx blit) could become a tile-local read (input attachment) if the copy is read only by the next full-screen pass.
