@@ -44,3 +44,4 @@ scripts/uctest/mods/movie_replace/
 /dist-raw-copy/
 /dist-raw.zip
 /build-prof-*.log
+build-android.configure.log
