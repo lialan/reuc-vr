@@ -69,6 +69,9 @@ struct Output {
 #ifdef TEX_TABLE
     [[vk::location(10)]] nointerpolation uint textureBase : TEXCOORD14;   // the draw's first entry in the packet's texture table (tev.slang)
 #endif
+#ifdef UBER_MERGE
+    [[vk::location(11)]] nointerpolation uint mergeDraw : TEXCOORD15;     // the small-draw ubershader: the draw's uniform block index (tev.slang)
+#endif
 #ifdef MOTION
     [[vk::location(10)]] float4 currentClip : TEXCOORD8;    // unjittered
     [[vk::location(11)]] float4 previousClip : TEXCOORD9;
@@ -155,7 +158,10 @@ float3 generateTexcoord(uint id, Input input) {
 // The vertices are read word by word through a uint pointer (gx::GpuMeshVertex, 27 words): the Quest's compiler crashed on a struct
 // load through a physical-storage pointer.
 // table: the draw's first texture-table entry (UC_TEX_MERGE), written as each vertex's last attribute word; 0xFFFFFFFF: none (no such word).
-struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint pad0; uint pad1; uint pad2; };
+// mergeMap (UC_UBER_SMALL): where the packet's vertex map starts in the attribute buffer, two words a position (the vertex's first attribute
+// word; the draw's uniform block index | coordinate mask << 24), which the small-draw ubershader's vertex stage reads instead of the
+// draw's push constants, so draws of different strides and uniform blocks are one run; 0xFFFFFFFF: no map.
+struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint mergeMap; uint pad1; uint pad2; };
 float4 unpackColor(uint c) { return float4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24) / 255.0; }
 uint packColor(float4 c) { const uint4 b = uint4(round(saturate(c) * 255.0)); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
 #ifdef XFORM
@@ -200,6 +206,10 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         xformAttributes[at] = asuint(t.x); xformAttributes[at + 1] = asuint(t.y); xformAttributes[at + 2] = asuint(t.z); at += 3;
     }
     if (job.table != 0xFFFFFFFFu) xformAttributes[at] = job.table;
+    if (job.mergeMap != 0xFFFFFFFFu) {
+        const uint entry = job.mergeMap + 2 * (job.positions + i);
+        xformAttributes[entry] = job.attributes + i * job.stride; xformAttributes[entry + 1] = job.draw | (job.mask << 24);
+    }
 }
 #endif
 #ifdef XFORM_DRAW
@@ -213,8 +223,17 @@ Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   //
     float4 clip = xformPositions[vertex];
     clip.xy += projection.shift * clip.w;
     output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
+#ifdef UBER_MERGE
+    // the small-draw ubershader's runs join draws of different strides and uniform blocks: the pre-pass's vertex map (projection.palette:
+    // its start) gives this vertex's attributes and its draw
+    const uint entry = projection.palette + 2 * vertex;
+    uint at = xformAttributes[entry];
+    const uint drawWord = xformAttributes[entry + 1], mask = drawWord >> 24;
+    output.mergeDraw = drawWord & 0xFFFFFFu;
+#else
     const uint stride = projection.currentRow & 255u, mask = projection.currentRow >> 8;
     uint at = projection.palette + (vertex - projection.indexed) * stride;
+#endif
     output.color = unpackColor(xformAttributes[at]); output.color1 = unpackColor(xformAttributes[at + 1]);
     at += 2;
     [unroll] for (uint id = 0; id < 8; ++id) {
@@ -377,6 +396,9 @@ Targets fragmentMain(Output input, uint view : SV_ViewID) {
 #ifdef TEX_TABLE
     textureBase = input.textureBase;
 #endif
+#ifdef UBER_MERGE
+    mergeDraw = input.mergeDraw;
+#endif
 #else
 Targets fragmentMain(Output input) {
 #endif
@@ -405,8 +427,8 @@ float4 shadeFragment(Output input) {
 #endif
 #ifdef UBER
     loadTevKey();
-#ifdef UC_SPEC
-    destinationAlphaPass = tevWord(66);
+#if defined(UC_SPEC) || defined(UBER_MERGE)
+    destinationAlphaPass = tevWord(66);   // UBER_MERGE: the draw's own (its block's key words), not the run's push constant
 #else
     destinationAlphaPass = projection.alphaPass;
 #endif

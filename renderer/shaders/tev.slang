@@ -30,6 +30,13 @@ struct DrawState {
 [[vk::binding(2,0)]] StructuredBuffer<DrawState> xformDrawStates;
 static uint xformDraw = 0;
 #define drawState xformDrawStates[xformDraw]
+#elif defined(UBER_MERGE)
+// The headset's small-draw ubershader (UC_UBER_SMALL, with the texture table): one run of draws that differ in their TEV setup, uniform
+// block and textures; each fragment reads its own draw's state from the packet's uniform blocks as an array (set 2, the same buffer as
+// binding 2), by the flat draw index the vertex stage passes (smoke.slang XFORM_DRAW).
+[[vk::binding(0,2)]] StructuredBuffer<DrawState> mergeDrawStates;
+static uint mergeDraw = 0;
+#define drawState mergeDrawStates[mergeDraw]
 #else
 [[vk::binding(2,0)]] ConstantBuffer<DrawState> drawState : register(b0);
 #endif
@@ -134,8 +141,10 @@ uint tevWord(uint i) { return drawState.tevWords[i / 4][i % 4]; }
 #define LOAD_STAGE(n) colorEnv##n = tevWord(2 + 4 * n); alphaEnv##n = tevWord(3 + 4 * n); order##n = tevWord(4 + 4 * n); konst##n = tevWord(5 + 4 * n);
 void loadTevKey() {
     stageCount = tevWord(0); swapTables = tevWord(1);
+#ifndef UBER_MERGE   // the small-draw ubershader's evaluateTev reads each stage's words in its loop
     LOAD_STAGE(0) LOAD_STAGE(1) LOAD_STAGE(2) LOAD_STAGE(3) LOAD_STAGE(4) LOAD_STAGE(5) LOAD_STAGE(6) LOAD_STAGE(7)
     LOAD_STAGE(8) LOAD_STAGE(9) LOAD_STAGE(10) LOAD_STAGE(11) LOAD_STAGE(12) LOAD_STAGE(13) LOAD_STAGE(14) LOAD_STAGE(15)
+#endif
 }
 #endif
 
@@ -343,7 +352,11 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
     // order bit 16 (the headset's keys, pipeline_keys.h kTevDirectStage): the stage reads no indirect coordinate, so the indirect path, with its
     // run-time choice among the eight textures (eight samples and eight size queries), leaves the folded module: a typical stage took about
     // 400 instructions and 16 registers a fragment with it, about 120 and 6 without (ir3, Adreno 740).
+#if defined(UBER_MERGE) && defined(UBER)
+    uint command = 0u;   // the small-draw ubershader takes only draws whose stages are all direct (uber_merge.h): no indirect path in it
+#else
     uint command = (order & 0x10000u) != 0 ? 0u : drawState.indCmd[stageIndex / 4][stageIndex % 4];
+#endif
     if ((order & 64) != 0) {
         float2 coord = uvOf(uv[(order >> 3) & 7]);
         if (command != 0) coord = indirectCoord(order & 7, coord, uv, command, previousCoord);
@@ -355,6 +368,15 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
     ras = swapColor(ras, ae & 3);
     float3 kc = konstColor(konst & 31);
     float ka = konstAlpha((konst >> 5) & 31);
+#if defined(UBER_MERGE) && defined(UBER)
+    // the small-draw ubershader: the inputs as arrays indexed by the selectors (one indexed read each instead of a chain of selects)
+    const float alphaInputs[8] = { r[0].a, r[1].a, r[2].a, r[3].a, tex.a, ras.a, ka, 0.0 };
+    float3 a = colorSource((ce >> 12) & 15, r, tex, ras, kc);
+    float3 b = colorSource((ce >> 8) & 15, r, tex, ras, kc);
+    float3 c = colorSource((ce >> 4) & 15, r, tex, ras, kc);
+    float3 d = colorSource(ce & 15, r, tex, ras, kc);
+    float aa = alphaInputs[(ae >> 13) & 7], ab = alphaInputs[(ae >> 10) & 7], ac = alphaInputs[(ae >> 7) & 7], ad = alphaInputs[(ae >> 4) & 7];
+#else
     float3 a = colorSource((ce >> 12) & 15, r, tex, ras, kc);
     float3 b = colorSource((ce >> 8) & 15, r, tex, ras, kc);
     float3 c = colorSource((ce >> 4) & 15, r, tex, ras, kc);
@@ -363,11 +385,30 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
     float ab = alphaSource((ae >> 10) & 7, r, tex, ras, ka);
     float ac = alphaSource((ae >> 7) & 7, r, tex, ras, ka);
     float ad = alphaSource((ae >> 4) & 7, r, tex, ras, ka);
+#endif
     float3 rgb = combineColor(a, b, c, d, ce);
     float alpha = combineAlpha(aa, ab, ac, ad, a, b, ae);
     r[(ce >> 22) & 3].rgb = rgb;
     r[(ae >> 22) & 3].a = alpha;
 }
+#if defined(UBER_MERGE) && defined(UBER)
+// The small-draw ubershader: the stages as a loop that reads each stage's words where it runs. Unrolled with every stage's words loaded up
+// front (the folded form), the words of a run's draws are not constants but loads from the draw's block: 23k instructions and 48 registers
+// a fragment (ir3, Adreno 740), against about a sixteenth of the code and far fewer registers as a loop.
+float4 evaluateTev(float3 uv[8], float4 color, float4 color1) {
+    if (stageCount == 0) return color * UC_SAMPLE(0, uvOf(uv[0]));
+    float4 r[4];
+    [unroll] for (uint i = 0; i < 4; ++i) r[i] = drawState.registers[i];
+    int2 previousCoord = int2(0);
+    float4 result = r[0];
+    [loop] for (uint stage = 0; stage < min(stageCount, 16u); ++stage) {
+        const uint ce = tevWord(2 + 4 * stage), ae = tevWord(3 + 4 * stage);
+        tevStage(r, uv, color, color1, ce, ae, tevWord(4 + 4 * stage), tevWord(5 + 4 * stage), stage, previousCoord);
+        result = float4(r[(ce >> 22) & 3].rgb, r[(ae >> 22) & 3].a);
+    }
+    return result;
+}
+#else
 float4 evaluateTev(float3 uv[8], float4 color, float4 color1) {
     if (stageCount == 0) return color * UC_SAMPLE(0, uvOf(uv[0]));
     float4 r[4];
@@ -440,3 +481,4 @@ float4 evaluateTev(float3 uv[8], float4 color, float4 color1) {
     }
     return result;
 }
+#endif   // UBER_MERGE

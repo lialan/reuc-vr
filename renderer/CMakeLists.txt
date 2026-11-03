@@ -83,6 +83,22 @@ add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.tex.early.frag.spv
   COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
   COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST -DTEX_TABLE -DEARLY_Z -entry fragmentMain -stage fragment -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.tex.early.frag.spv
   DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+# The headset's small-draw ubershader (UC_UBER_SMALL=1, with the texture table): the draw vertex stage reading each vertex's attributes and
+# draw from the pre-pass's vertex map, and the ubershader fragment stages (with and without the alpha test) reading each draw's TEV setup
+# and uniform block by that index, so one run draws small draws of different TEV setups, uniform blocks and textures.
+add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.xform.uber.vert.spv
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+  COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST -DXFORM_DRAW -DTEX_TABLE -DUBER_MERGE -entry vertexMain -stage vertex -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.xform.uber.vert.spv
+  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py ${shader_dir}/smoke.stereo.xform.uber.vert.spv
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/spirv_invariant_position.py shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.uber.merge.frag.spv
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+  COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST -DTEX_TABLE -DUBER -DUBER_MERGE -entry fragmentMain -stage fragment -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.uber.merge.frag.spv
+  DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
+add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.uber.merge.early.frag.spv
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+  COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/smoke.slang -DSTEREO -DTEV_FAST -DTEX_TABLE -DUBER -DUBER_MERGE -DEARLY_Z -entry fragmentMain -stage fragment -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/smoke.stereo.uber.merge.early.frag.spv
+  DEPENDS shaders/smoke.slang shaders/tev.slang shaders/gbuffer.slang VERBATIM)
 # Diagnostics (UC_PROBE_VS / UC_PROBE_NOINV / UC_PROBE_FS): the headset's vertex stage without lighting and texgen, without the Invariant
 # position, and a fragment stage that outputs the vertex colour; they split the scene pass's GPU time on the Quest.
 add_custom_command(OUTPUT ${shader_dir}/smoke.stereo.probe.vert.spv
@@ -319,7 +335,7 @@ if(UC_GLSLANG)
 elseif(UC_OPENXR)
   message(FATAL_ERROR "the headset build needs glslangValidator for HOTD4's overlay shaders (brew install glslang)")
 endif()
-set(UC_SHADER_FILES ${shader_dir}/smoke.stereo.nobank.vert.spv ${shader_dir}/smoke.stereo.xform.comp.spv ${shader_dir}/smoke.stereo.xform.vert.spv ${shader_dir}/smoke.stereo.xform.tex.vert.spv ${shader_dir}/smoke.stereo.tex.frag.spv ${shader_dir}/smoke.stereo.tex.early.frag.spv ${shader_dir}/smoke.stereo.probe.vert.spv ${shader_dir}/smoke.stereo.nobank.noinv.vert.spv ${shader_dir}/smoke.stereo.probe.frag.spv ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motion.early.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hud_layer.vert.spv ${shader_dir}/hud_layer.frag.spv ${shader_dir}/particle_depth.vert.spv ${shader_dir}/particle_depth.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+set(UC_SHADER_FILES ${shader_dir}/smoke.stereo.nobank.vert.spv ${shader_dir}/smoke.stereo.xform.comp.spv ${shader_dir}/smoke.stereo.xform.vert.spv ${shader_dir}/smoke.stereo.xform.tex.vert.spv ${shader_dir}/smoke.stereo.tex.frag.spv ${shader_dir}/smoke.stereo.tex.early.frag.spv ${shader_dir}/smoke.stereo.xform.uber.vert.spv ${shader_dir}/smoke.stereo.uber.merge.frag.spv ${shader_dir}/smoke.stereo.uber.merge.early.frag.spv ${shader_dir}/smoke.stereo.probe.vert.spv ${shader_dir}/smoke.stereo.nobank.noinv.vert.spv ${shader_dir}/smoke.stereo.probe.frag.spv ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motion.early.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hud_layer.vert.spv ${shader_dir}/hud_layer.frag.spv ${shader_dir}/particle_depth.vert.spv ${shader_dir}/particle_depth.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv

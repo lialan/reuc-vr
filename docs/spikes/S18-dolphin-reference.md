@@ -349,3 +349,85 @@ nothing new with all three on (only the existing blend-attachment, DrawParameter
 - Render-stage traces off vs fold: whether LRZ now rejects anything in the main scene (S17: no LRZ-killed pixels so far).
 - Then the defaults: fold and d24 on if they help; the pre-check can go on regardless (exact, no key changes in the fight; elsewhere it
   can add keys, which `pipeline_keys.quest` would then need).
+
+## 7. Built: recommendations 4 and 1 (2026-11-03, branch gpu-ubershader)
+
+Both opt-in, both ahead of time (prebuilt SPIR-V, no code generation at run time), both only on the headset path (stereo, vertex pre-pass).
+Code: `renderer/uber_merge.h` (keys, the fragment-visible uniform compare, the size test; `test_uber_merge`), `vulkan_renderer.cpp` (the
+run join in `record_pass`, the HUD layer's runs in `record_layer`, `uber_merge_pipeline`, set 2), `smoke.slang`/`tev.slang` (`UBER_MERGE`).
+
+**Rec 4, fragment-only uniform identity (`UC_MERGE_FRAG_UNIFORM=1`).** With the pre-pass the draws' vertex stage reads no uniform block (the
+compute pass reads each draw's own), so two draws join when their blocks are equal where a fragment reads them: TEV registers, konst, `pixel`
+(alpha test, destination alpha), fog, indirect matrices, IND_CMD (`gx::fragment_uniforms_equal`). The run's fragments read its first draw's block.
+
+**Rec 1, the small-draw ubershader (`UC_UBER_SMALL=1`, `=scene` or `=hud` for one half; `UC_UBER_PX=<guest pixels>`, default 1024; turns
+the texture table on).**
+- One pipeline per fixed-function state: key bit 21 (`kUberMergeKeyBit`) on `uber_key` (blend, cull, alpha-test discard bit, HUD layer bit,
+  depth word, topology; the bank bit dropped), queued on the loading screen for every known key's state (the fight: `waiting 0`).
+- Per-draw state by index: the pre-pass writes a vertex map after the attributes (two words a position: the vertex's first attribute word;
+  its uniform block index | coordinate mask << 24; `XformJob.mergeMap`). The vertex stage (`smoke.stereo.xform.uber.vert.spv`) reads its
+  attributes and draw index from it instead of push constants and passes the index flat; the fragment stage
+  (`smoke.stereo.uber.merge[.early].frag.spv`) reads that draw's block and TEV words from the packet's uniform buffer bound as a storage
+  array (set 2, `merge_layout_`), its textures from the texture table, its destination-alpha flag from its own key words. So one run holds
+  draws of different TEV setups, uniform blocks, textures and attribute strides; it still needs the same eye block, viewport, scissor,
+  push constants (shift, rate) and consecutive indices.
+- Which draws: direct TEV stages only (no indirect path in the module), no second destination-alpha draw, not the particle layer, and a
+  screen box (`draw_bounds_ndc`'s vertices, a cached mesh's object box) of at most `UC_UBER_PX` guest pixels; a vertex behind the camera or
+  more than 256 vertices without a box counts as big.
+- Only where it joins: a draw first tries the ordinary join; only when that fails and both it and every draw of the pending run may go on
+  the same ubershader pipeline does the run move onto it. Single draws and runs that merge anyway keep their folded modules (moving every small
+  draw onto the ubershader broke existing runs: 243 -> 251 draws a frame in a first try).
+- HUD layer: its draws were issued one by one (no merging at all); small consecutive HUD draws with the same state, eye block, viewport and
+  scissor are now one ubershader draw; a one-draw run keeps its own pipeline.
+- The module: the stages as a loop that reads each stage's words where it runs (`evaluateTev` under `UBER_MERGE`), alpha inputs as an indexed
+  array. Unrolled with the words preloaded (the existing ubershader's form, whose words are constants) it was 18.5k non-nop instructions and
+  48 vec4 registers once the words came from a storage buffer.
+
+**Draws a frame** (Mac VR preview, KosmicKrisp, fightvr replay, retraces 8450-9352, `UC_VR_HIDE_CROSSHAIR=1` so the HUD packet takes the HUD
+layer as on the headset; per presented frame, `UC_GPU_PACKETS=1 UC_MERGE_WHY=1`; counter windows vary the per-frame numbers by ~3%):
+
+| switches | draws issued | run ends: pipeline / uniform / not consecutive | notes |
+|---|---|---|---|
+| none | 453 | 104 / 30 (+ textures 225) / 23 | |
+| `UC_TEX_MERGE=1` (the baseline) | 276-288 | 101-104 / 75-79 / 31-32 | HUD layer: ~56 draws, one each |
+| + `UC_MERGE_FRAG_UNIFORM=1` | 258-260 (**-9%**) | 101-102 / 52 / 34 | ~20 uniform boundaries a frame removed |
+| `UC_UBER_SMALL=hud` | 234 | 105 / 78 / 32 | HUD layer: 58 draws in 4.3 runs |
+| `UC_UBER_SMALL=1`, `UC_UBER_PX=1024` (default) | 170-174 (**-39%**) | 85 / 24-29 / 35 | 193 draws in 17 ubershader runs; 33k guest px a frame on it |
+| `UC_UBER_SMALL=1`, `UC_UBER_PX=4096` | 150-154 (**-46%**) | 77 / 18-23 / 34-36 | 240-260 draws in 19-23 runs; 72-81k guest px |
+| both switches, 4096 | 146 | 77 / 13 / 37 | the uniform test adds little once the ubershader joins |
+
+Threshold sweep (`UC_UBER_SMALL=1`): 256 px 199 draws (9k guest px on the ubershader), 1024 170 (33k), 4096 150 (72k), 16384 138 (187k),
+65536 132, unlimited 127. With the crosshair shown (the HUD packet in the EFB): table 243, + fragment uniforms 214, + ubershader (4096) 154.
+The MERGE_WHY classes now name the test of the join that failed: two table runs no longer count a texture difference (it does not end them),
+so S17's "textures 53-55" of the table run appear here under "uniform block".
+
+**Pictures** (EFB captures at 8700/9060/9300, 5120x1440, against the table alone; `/tmp/uber_tools/cmp0.sh`):
+- table vs table + fragment uniforms: late Z (`UC_NO_EARLY_Z=1` both) identical, 0 px; with early-Z modules 41-127 px, peak 2/255.
+- table vs ubershader (4096 and 1024): late Z identical, 0 px; with early-Z modules 4-65 px, peak 1/255.
+- Both remaining differences are KosmicKrisp's early-depth tie order (S17's tex-merge finding): equal-depth fragments of what is now one draw
+  resolve in another order; the same pair on late Z is bit-identical. For scale, two replays of the same build already differ in 27-64 px
+  at 1/255. A first version that also took draws with indirect stages left one 28 px spot at 4/255 on late Z (float rounding of the
+  ubershader's indirect path against the specialized one); with direct stages only it is gone.
+
+**Ubershader cost** (ir3 for Adreno 740, `/tmp/qgs/ir3c`, static counts; the Qualcomm compiler differs):
+
+| module | non-nop instructions | registers (vec4) | waves |
+|---|---|---|---|
+| `smoke.stereo.uber.merge.frag.spv` (alpha test) / `.early` | 1106 / 1048 | 32 | 6 |
+| folded TEV modules (S17, after ed2a42f) | 124 on average | 6 | 16 |
+| `smoke.stereo.xform.uber.vert.spv` / the table's vertex stage | 145 / 134 | 12 / 12 | 16 |
+
+The loop body is ~960 instructions of which a plain stage executes roughly 450-500 (the selector selects, konst, swap, the float combiner;
+the compare modes are branches): about 4x a folded one-stage module, more per extra stage. Rough break-even at native 3.07x: a guest pixel
+is ~19 fragments for both eyes, so 33k guest px a frame (the default) is ~0.6 M fragments x ~400 extra instructions = ~0.25 G
+instructions, ~0.5-1 ms at the fight's measured ALU rate, against ~105 fewer draws x 20-40 us = 2-4 ms. At 4096 px the extra ALU is about
+twice that for 20 more joins: the default is the conservative end until the headset's sweep says otherwise. Screen boxes overestimate the
+fragments (sprites and HUD quads are mostly transparent), so the real ALU cost is lower.
+
+**Checks.** Mac build and 204/204 tests (`test_netplay`/`test_netplay_stream` fail only when ctest runs them in parallel with each other
+-- port use -- and pass alone, as on the base); Quest APK builds (59 MB). Windows: no compiler here; the C++ uses nothing beyond what the file
+already did, the new shader variants are stereo-only.
+
+**What needs the headset** (`/tmp/qgs/plan_uber.sh`, not run): captures (table vs + fragment uniforms vs + ubershader; a late-Z pair if they
+differ), GPU ms of the main scene and HUD packet with the five switch combinations at native and 1.0x in alternating order, the threshold
+sweep (256-65536) and the HUD packet with the ubershader unlimited against S17's 1.3 ms bound. Both stay off until then.
