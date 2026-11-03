@@ -40,7 +40,17 @@ inline bool has_texture_matrix_index(const State& state) {
 }
 struct Memory {
     std::span<const std::byte> mem1, mem2, locked_cache;
-    std::span<const std::byte> read(uint32_t address, size_t size) const;
+    // A bounds-checked view of guest memory (MEM1, MEM2 or the locked cache through their aliases). Called for nearly every SDK-state and
+    // array access of the GX recording: the MEM1/MEM2 case is inline, the rest (and every error) is read_slow().
+    std::span<const std::byte> read(uint32_t address, size_t size) const {
+        const uint32_t alias = address >> 28, physical = address & 0x3FFFFFFF;
+        if ((0x7303u >> alias) & 1) {   // aliases 0, 1, 8, 9, 12, 13, 14
+            if (physical < 0x10000000) { if (physical <= mem1.size() && size <= mem1.size() - physical) return mem1.subspan(physical, size); }
+            else if (physical < 0x20000000) { const size_t offset = physical - 0x10000000; if (offset <= mem2.size() && size <= mem2.size() - offset) return mem2.subspan(offset, size); }
+        }
+        return read_slow(address, size);
+    }
+    std::span<const std::byte> read_slow(uint32_t address, size_t size) const;
 };
 size_t encoded_draw_size(const State& state, uint8_t primitive, uint8_t vat, uint16_t count, uint32_t callsite);
 struct Vertex {

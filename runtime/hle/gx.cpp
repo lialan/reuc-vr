@@ -14,6 +14,7 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <set>
 
 #include <variant>
@@ -126,7 +127,9 @@ struct RecordedDraw {
     TextureSelectors texture_selectors;
     std::optional<uc::PromptDescription> prompt;
     bool compact=false;
+    size_t filled=0;   // payload bytes written so far (the payload is sized to expected when the primitive starts)
 };
+uint64_t list_stat[2]={};   // --profile: display-list draws imported and their vertices (the game records its lists again every frame: each is called about once)
 struct Resource {
     std::vector<std::byte> bytes;
     mutable uint32_t stamp=0,skips=0;   // write-barrier stamp of the last byte comparison (gx_write_watch.h); uses since then
@@ -157,6 +160,26 @@ struct Resource {
 RecordedDraw* recorded_draw(Resource::Item& item) { auto* held=std::get_if<std::unique_ptr<RecordedDraw>>(&item); return held ? held->get() : nullptr; }
 const RecordedDraw* recorded_draw(const Resource::Item& item) { auto* held=std::get_if<std::unique_ptr<RecordedDraw>>(&item); return held ? held->get() : nullptr; }
 std::map<uint32_t,std::shared_ptr<const Resource>> resources; // Immutable recordings shared with rollback checkpoints.
+// The game records its display lists again every frame, and a replaced recording (its draws hold ~5 KB of state each) is freed on a helper
+// thread: pure host work the guest thread would otherwise do. The helper empties the pile every few milliseconds (no wake-up per list).
+class Graveyard {
+public:
+    static Graveyard& instance() { static Graveyard* pile=new Graveyard; return *pile; }   // never destroyed: the helper may run at exit
+    void bury(std::shared_ptr<const Resource> resource) { std::lock_guard lock(mutex_); dead_.push_back(std::move(resource)); }
+private:
+    Graveyard() {
+        std::thread([this] {
+            std::vector<std::shared_ptr<const Resource>> batch;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                { std::lock_guard lock(mutex_); batch.swap(dead_); }
+                batch.clear();
+            }
+        }).detach();
+    }
+    std::mutex mutex_;
+    std::vector<std::shared_ptr<const Resource>> dead_;
+};
 struct ListRecording {
     uint32_t address, capacity, sdk, owner;
     bool restore, overflow = false;
@@ -167,7 +190,8 @@ struct ListRecording {
     uint32_t texture_copy_format_shadow=6;
     TextureMatrices texture_shadow;
     MatrixIndices indices_shadow;
-    std::vector<std::byte> bytes;
+    std::unique_ptr<std::byte[]> bytes;   // capacity bytes, the first used of them written (gx_fifo_write appends 1-4 bytes at a time)
+    size_t used=0;
     Resource native;
     gx::State input_state;
 };
@@ -197,7 +221,9 @@ struct CallTimer {
                 for(int w=0;w<2;++w) { for(int k=0;k<4;++k) { size_t best=0; for(size_t o=0;o<0x560/4;++o) if(cache_diff[w][o]>cache_diff[w][best]) best=o; if(cache_diff[w][best]) { std::fprintf(stderr," +%zX:%llu",best*4,(unsigned long long)cache_diff[w][best]); cache_diff[w][best]=0; } } std::fprintf(stderr,w?" (material)":" |"); }
                 std::fprintf(stderr,"\n"); std::memset(cache_diff,0,sizeof cache_diff); }
             for(auto& v:cache_stat) v=0;
-            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0);
+            if(last) std::fprintf(stderr,"[gxtime] list %.1f ms %llu calls %.2f us/call mesh %.1f ms %llu calls %.3f us/call; list draws %llu, %llu vertices\n",ns[0]/1e6,(unsigned long long)calls[0],calls[0]?ns[0]/1e3/calls[0]:0.0,ns[1]/1e6,(unsigned long long)calls[1],calls[1]?ns[1]/1e3/calls[1]:0.0,
+                (unsigned long long)list_stat[0],(unsigned long long)list_stat[1]);
+            for(auto& v:list_stat) v=0;
             last=t; ns[0]=ns[1]=calls[0]=calls[1]=0;
         }
     }
@@ -391,7 +417,7 @@ void native_bp(uint32_t word) {
 bool recording_primitive() {
     if (!recording || recording->native.geometry.empty()) return false;
     auto* draw=recorded_draw(recording->native.geometry.back());
-    return draw && draw->payload.size()<draw->expected;
+    return draw && draw->filled<draw->expected;
 }
 // The part of a snapshot that the SDK block decides: culling, viewport, scissor, vertex descriptors and attribute formats. The vertex arrays (and the
 // rest of the host state) are not part of it; they are applied fresh on every call.
@@ -536,8 +562,10 @@ void import_resource(uint32_t address,uint32_t length,gx::State& bindings,gx::Tr
             // shortcut: decode attributes per call; cache native mesh revisions after profiling (TD-032).
             auto layout=source->state;
             layout.arrays=bindings.arrays;
+            const auto& shared_layout=gx::share(import_state,layout);
+            ++list_stat[0]; list_stat[1]+=source->count;
             gx::Vertices vertices(memory);
-            vertices.begin(gx::share(import_state,layout),source->primitive,source->vat,source->count,producer(),source->callsite,replaying);
+            vertices.begin(shared_layout,source->primitive,source->vat,source->count,producer(),source->callsite,replaying);
             vertices.write_attribute(producer(),source->payload);
             auto draw=vertices.take_draw();
             // Replay retains geometry validation and GX state commands, but publishes no graphics.
@@ -823,15 +851,14 @@ void gx_fifo_write(int size, uint32_t value) {
     if (recording) {
         if (producer() != recording->owner) throw gx::Error(gx::ErrorCode::producer,recording->address,recording->owner,producer());
         if (recording->overflow) return; // GXEndDisplayList reports this failed recording with length zero
-        if (size_t(size) > recording->capacity - recording->bytes.size()) { recording->overflow=true; return; }
-        std::byte bytes[4];
-        for (int i=0;i<size;++i) bytes[i]=std::byte(uint8_t(value>>((size-1-i)*8)));
+        if (size_t(size) > recording->capacity - recording->used) { recording->overflow=true; return; }
+        const uint32_t big=uc_bswap32(value<<(32-8*size));   // the size low bytes of value, most significant first
         if (recording_primitive()) {
             auto& draw=*recorded_draw(recording->native.geometry.back());
-            if (size_t(size)>draw.expected-draw.payload.size()) throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected-draw.payload.size(),size);
-            for (int i=0;i<size;++i) draw.payload.push_back(bytes[i]);   // reserved up front (GXBegin, GXBeginDisplayList): a 1-4 byte insert(range) costs more than the copy
+            if (size_t(size)>draw.expected-draw.filled) throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected-draw.filled,size);
+            std::memcpy(draw.payload.data()+draw.filled,&big,size_t(size)); draw.filled+=size_t(size);
         }
-        for (int i=0;i<size;++i) recording->bytes.push_back(bytes[i]);
+        std::memcpy(recording->bytes.get()+recording->used,&big,size_t(size)); recording->used+=size_t(size);
         return;
     }
     if (!capture || !capture->active()) {
@@ -907,11 +934,14 @@ void hle_GXBegin(ppc::Ctx& c) {
         uc::gx_fifo_write(2,uint16_t(count));
         if (!uint16_t(count)) return;   // the list keeps the header; a primitive without vertices draws nothing
         if (!recording->overflow) {
-            auto layout=snapshot(c);
-            const size_t expected=gx::encoded_draw_size(layout,uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
-            const auto [material,uniforms]=material_snapshot(c);
-            auto recorded=std::make_unique<RecordedDraw>(RecordedDraw{layout,callsite,uint8_t(primitive),uint8_t(vat),uint16_t(count),expected,{},material,uniforms,texture_selectors(sdk)});
-            recorded->payload.reserve(expected);   // filled one write at a time by gx_fifo_write
+            auto recorded=std::make_unique<RecordedDraw>();   // filled in place: the ~5 KB of state are copied once
+            auto& draw=*recorded;
+            draw.state=snapshot(c);
+            draw.expected=gx::encoded_draw_size(draw.state,uint8_t(primitive),uint8_t(vat),uint16_t(count),callsite);
+            const auto snapped=material_snapshot(c);
+            draw.callsite=callsite; draw.primitive=uint8_t(primitive); draw.vat=uint8_t(vat); draw.count=uint16_t(count);
+            draw.material=snapped.material; draw.uniforms=snapped.uniforms; draw.texture_selectors=texture_selectors(sdk);
+            recorded->payload.resize(draw.expected);   // filled one write at a time by gx_fifo_write
             recording->native.geometry.push_back(std::move(recorded));
         }
         return;
@@ -991,7 +1021,7 @@ void hle_GXBeginDisplayList(ppc::Ctx& c) {
         list->texture_copy_width_shadow=texture_copy_width; list->texture_copy_height_shadow=texture_copy_height;
         list->texture_copy_format_shadow=texture_copy_format;
     }
-    list->bytes.reserve(capacity);   // the SDK passes the exact buffer size; gx_fifo_write appends byte by byte
+    list->bytes=std::make_unique_for_overwrite<std::byte[]>(capacity);   // the SDK passes the exact buffer size; gx_fifo_write appends byte by byte
     ppc::wr8(c,sdk+0x5F8,1);
     recording=std::move(list); dirty_state();
 }
@@ -1001,23 +1031,26 @@ void hle_GXEndDisplayList(ppc::Ctx& c) {
     if (recording->owner!=producer()) throw gx::Error(gx::ErrorCode::producer,recording->address,recording->owner,producer());
     if (!recording->overflow && recording_primitive()) {
         const auto& draw=*recorded_draw(recording->native.geometry.back());
-        throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected,draw.payload.size());
+        throw gx::Error(gx::ErrorCode::truncated,draw.callsite,draw.expected,draw.filled);
     }
     uc::call_guest(c,0x80284504,{}); // verified GXFlush: dirty state followed by 32 NOP bytes
     auto list=std::move(recording); dirty_state();
-    const uint32_t length=list->overflow ? 0 : uint32_t(list->bytes.size()) & ~31u;
-    if (length) { std::memcpy(c.mem+(list->address & 0x3FFFFFFF),list->bytes.data(),length); gx::note_write_range(list->address,length); }
+    const uint32_t length=list->overflow ? 0 : uint32_t(list->used) & ~31u;
+    if (length) { std::memcpy(c.mem+(list->address & 0x3FFFFFFF),list->bytes.get(),length); gx::note_write_range(list->address,length); }
     if (length) {
         const uint32_t address=list->address & 0x3FFFFFFF;
-        for (auto it=resources.begin();it!=resources.end();) {
-            if (uint64_t(it->first)<uint64_t(address)+length && uint64_t(address)<uint64_t(it->first)+it->second->bytes.size()) it=resources.erase(it);
+        // The recordings never overlap (each one replaced those it overlaps): only the one before address and those starting inside the new one can.
+        auto it=resources.lower_bound(address);
+        if (it!=resources.begin() && uint64_t(std::prev(it)->first)+std::prev(it)->second->bytes.size()>address) --it;
+        while (it!=resources.end() && uint64_t(it->first)<uint64_t(address)+length) {
+            if (uint64_t(address)<uint64_t(it->first)+it->second->bytes.size()) { Graveyard::instance().bury(std::move(it->second)); it=resources.erase(it); }
             else ++it;
         }
-        list->native.bytes.assign(list->bytes.begin(),list->bytes.begin()+length);
+        list->native.bytes.assign(list->bytes.get(),list->bytes.get()+length);
         list->native.stamp=gx::watch_stamp();
         resources.emplace(address,std::make_shared<const Resource>(std::move(list->native)));
     }
-    uc::gx_audit_recorded_resource(list->address,std::span<const std::byte>(list->bytes).first(length));
+    uc::gx_audit_recorded_resource(list->address,std::span<const std::byte>(list->bytes.get(),length));
     if (list->restore) {
         const uint32_t kept=read32(list->sdk+8);
         std::memcpy(c.mem+(list->sdk & 0x3FFFFFFF),list->shadow.data(),list->shadow.size()); gx::note_write_range(list->sdk,list->shadow.size());

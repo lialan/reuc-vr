@@ -1,15 +1,50 @@
 #pragma once
+#include <cstddef>
 #include <limits>
+#include <map>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
 #include <new>
 #include <type_traits>
+#include <vector>
 
 namespace gx {
+// Upstream of the frame arenas: the chunks of a retired packet are kept for the next packets. A frame's ~25 packets ask for the same chunk sizes
+// every frame; from the heap they were large allocations (jemalloc extents, purged and faulted in again) made on the guest thread. Any thread:
+// the guest allocates, the render thread retires. At most 64 MB stay held.
+class ChunkPool final : public std::pmr::memory_resource {
+public:
+    static ChunkPool& instance() { static ChunkPool* pool = new ChunkPool; return *pool; }   // never destroyed: arenas may retire during exit
+private:
+    static constexpr size_t kMaxHeld = size_t(64) << 20;
+    static bool plain(size_t align) { return align <= __STDCPP_DEFAULT_NEW_ALIGNMENT__; }
+    void* do_allocate(size_t bytes, size_t align) override {
+        if (!plain(align)) return ::operator new(bytes, std::align_val_t(align));
+        {
+            std::lock_guard lock(mutex_);
+            if (auto found = free_.find(bytes); found != free_.end() && !found->second.empty()) {
+                void* chunk = found->second.back(); found->second.pop_back(); held_ -= bytes; return chunk;
+            }
+        }
+        return ::operator new(bytes);
+    }
+    void do_deallocate(void* chunk, size_t bytes, size_t align) override {
+        if (!plain(align)) { ::operator delete(chunk, std::align_val_t(align)); return; }
+        {
+            std::lock_guard lock(mutex_);
+            if (held_ + bytes <= kMaxHeld) { free_[bytes].push_back(chunk); held_ += bytes; return; }
+        }
+        ::operator delete(chunk);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+    std::mutex mutex_;
+    std::map<size_t, std::vector<void*>> free_;   // by chunk size
+    size_t held_ = 0;
+};
 struct FrameArena {
     std::mutex mutex;
-    std::pmr::monotonic_buffer_resource memory;
+    std::pmr::monotonic_buffer_resource memory{&ChunkPool::instance()};
 };
 
 // Nodes retire together with their frame; individual deque frees need no shared pool lock.

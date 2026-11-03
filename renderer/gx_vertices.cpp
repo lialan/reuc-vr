@@ -88,7 +88,7 @@ void indices(DrawPacket& draw) {
 Error::Error(ErrorCode code, uint32_t address, size_t expected, size_t received)
     : std::runtime_error(describe(code, address, expected, received)), code(code), address(address), expected(expected), received(received) {}
 
-std::span<const std::byte> Memory::read(uint32_t address, size_t size) const {
+std::span<const std::byte> Memory::read_slow(uint32_t address, size_t size) const {
     uint32_t alias = address >> 28;
     if (alias != 0 && alias != 1 && alias != 8 && alias != 9 && alias != 12 && alias != 13 && alias != 14)
         throw Error(ErrorCode::array_bounds, address, size, 0);
