@@ -200,6 +200,7 @@ private:
         VkExtent2D extent{};
         uint32_t mip_levels=1;
         bool auto_mips=false;   // the headset: levels 1.. generated on the GPU from a one-level GX texture (sampled with auto_samplers_)
+        bool mips_pending=false;   // an EFB copy whose levels 1.. are not made yet: record_copy_mips, when a draw first samples it with a mip filter
         gx::TextureChannels channels=gx::TextureChannels::rgba;
         bool bc7=false;   // a texture replacement: BC7 blocks, not RGBA8
         VkDeviceSize allocation_size=0;
@@ -251,6 +252,7 @@ private:
     Texture make_texture(const gx::TexturePixels* pixels, VkExtent2D physical_extent = {});
     Texture make_copy_texture(const std::shared_ptr<const gx::TexturePixels>& source);
     void record_texture_copy(VkCommandBuffer command, VkImage source, VkExtent2D extent, const std::array<uint32_t,4>& region, Texture& target, VkImageLayout before);
+    void record_copy_mips(VkCommandBuffer command, Texture& target);   // levels 1.. of an EFB copy from level 0 (SHADER_READ before and after)
     void recycle_copy_texture(Texture& texture);
     void destroy_texture(Texture& texture);
     void retire_textures(Slot& slot);
@@ -381,6 +383,7 @@ private:
     static constexpr uint32_t kFragQueries=16384; VkQueryPool frag_pool_=VK_NULL_HANDLE; bool frag_dump_=false; std::vector<uint32_t> frag_queries_;   // UC_FRAG_DUMP
     size_t stereo_stride_=128;   // bytes between the headset's eye blocks (minUniformBufferOffsetAlignment)
     bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
+    PFN_vkCmdSetFragmentShadingRateKHR set_shading_rate_=nullptr;   // VK_KHR_fragment_shading_rate (pipeline rate) enabled: the bloom chain's draws shade coarsely
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes
     HdrPass hdr_pass_;
