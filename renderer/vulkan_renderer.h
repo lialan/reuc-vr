@@ -190,6 +190,7 @@ private:
     std::function<std::array<float,2>(double)> aim_history_;
     std::atomic<double> wake_seconds_{0};
     std::atomic<uint64_t> late_aim_draws_{0};
+    uint64_t merged_draws_=0, issued_draws_=0, set_binds_=0, pipeline_binds_=0, alpha_passes_=0, grouped_changes_=0, opaque_draws_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
     struct Buffer { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; VkDeviceSize size = 0; };
     struct Texture {
         VkImage image=VK_NULL_HANDLE;
@@ -215,6 +216,8 @@ private:
         VkImageView view = VK_NULL_HANDLE;
         VkImage ui_image = VK_NULL_HANDLE; VkDeviceMemory ui_memory = VK_NULL_HANDLE; VkImageView ui_view = VK_NULL_HANDLE;   // HDR: the menu and prompts, composited at UI brightness
         Buffer vertices, indices, pixels, uniforms, palettes, banks, motions;   // vertices/indices: this frame's non-mesh draws; motions: MotionBlock per scene draw
+        Buffer xform_jobs, xform_chunks, xform_positions, xform_attributes, xform_indices;   // the vertex pre-pass (xform_): its input table, outputs and the rebased indices
+        VkDescriptorPool xform_pool = VK_NULL_HANDLE; VkDescriptorSet xform_set = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<const gx::MeshBuffers>> mesh_refs;   // keeps the meshes this submission draws alive until its fence completed
         std::vector<std::shared_ptr<Texture>> textures;   // shared through texture_pool_: one GPU image per texture, not one per slot
         std::vector<std::shared_ptr<const gx::TexturePixels>> copy_sources;
@@ -228,7 +231,7 @@ private:
     // A mesh uploaded once and drawn from every frame; freed once the guest dropped it (owner expired) and no submission still holds it.
     // Meshes live in a few large buffers (one vkAllocateMemory per slab, not per mesh): vertices then indices at the given offsets.
     struct MeshSlab { Buffer buffer; VkDeviceSize used=0; uint32_t live=0; };
-    struct GpuMesh { MeshSlab* slab=nullptr; VkDeviceSize vertex_offset=0, index_offset=0; uint32_t index_count=0; uint64_t rows=0; std::weak_ptr<const gx::MeshBuffers> owner; uint64_t id=0; };   // id: never reused; the ray tracing cache keys its BLAS by it
+    struct GpuMesh { MeshSlab* slab=nullptr; VkDeviceSize vertex_offset=0, index_offset=0; uint32_t index_count=0; uint64_t rows=0; std::weak_ptr<const gx::MeshBuffers> owner; uint64_t id=0; std::array<float,6> box{}; };   // box: object-space bounds (min xyz, max xyz), the headset's culling   // id: never reused; the ray tracing cache keys its BLAS by it
     struct PresentImage {
         VkImage image = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;   // HDR only: the encode pass renders into it
@@ -258,6 +261,7 @@ private:
     // A pipeline for a draw: the specialized one when compiled, else the ubershader variant of the same fixed state (see queue_pipeline).
     struct PipelineChoice { VkPipeline pipeline=VK_NULL_HANDLE; bool uber=false; };
     PipelineKey pipeline_key(const gx::DrawPacket& draw,bool alpha_pass=false) const;
+    bool fused_destination_alpha(const gx::DrawPacket& draw) const;   // the headset: colour and destination alpha in one draw
     PipelineChoice pipeline_for(const PipelineKey& key);
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early);   // tools/fold_tev_shaders.py's module for these constants, or null
@@ -453,6 +457,17 @@ private:
     bool uber_only_ = false;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     size_t pipeline_cache_loaded_ = 0;
+    bool probe_fragment_ = false;   // UC_PROBE_FS (diagnostics): no folded TEV modules
+    // The headset's vertex pre-pass (smoke.slang xformMain): each packet's vertices are shaded once by a compute dispatch, the draws read
+    // the results (smoke.stereo.xform.vert.spv). Needs bufferDeviceAddress (the jobs point at the mesh slabs); UC_NO_XFORM=1 turns it off.
+    bool xform_ = false;
+    bool static_depth_ = false;   // UC_STATIC_DEPTH=1 (headset): cull and depth state in the pipelines instead of dynamic
+    std::vector<std::array<float,4>> cull_points_;   // the headset's culling: one draw's clip-space points (scratch)
+    VkShaderModule xform_vertex_module_ = VK_NULL_HANDLE, xform_compute_module_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout xform_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout xform_layout_ = VK_NULL_HANDLE;
+    VkPipeline xform_pipeline_ = VK_NULL_HANDLE;
+    VkBufferUsageFlags vertex_usage() const { return rt_input_usage() | (xform_ ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0); }   // buffers the pre-pass reads by address
     VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE, nobank_vertex_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
     std::filesystem::path cache_dir_;
     std::set<PipelineKey> known_keys_;        // keys already in the seed or recorded file

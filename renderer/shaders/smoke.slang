@@ -43,7 +43,11 @@ uint4 loadedRows(uint palette) { return palettes[palette].loaded; }
 // effects: bit 0 = per-pixel lighting (uc::kEffectPerPixelLighting), bit 1 = albedo and material targets (kEffectRtMaterial), bit 2 = the draw's record is
 // model-valid (kEffectRtModelValid); the MOTION variant only. record: the draw's material record index (rt_material.h), ~0u = none.
 struct Projection { float4 rows[4]; uint palette; uint currentRow; uint indexed; uint alphaPass; uint bank; uint motion; float2 jitter; float4 viewport; uint effects; uint record; float2 shift; };
+#ifdef XFORM
+static Projection projection;   // the pre-pass: the job's copy of the draw's push constants
+#else
 [[vk::push_constant]] ConstantBuffer<Projection> projection : register(b1);
+#endif
 // Last frame's matrices of this draw (gx::MotionTracker): kind 1 = previous palette + previous projection, kind 2 = camera only
 // (prevRows = clip_to_prev_clip applied to the current clip position).
 struct MotionBlock { float4 prevRows[4]; uint prevPalette; uint kind; uint2 unused; };
@@ -139,6 +143,82 @@ float3 generateTexcoord(uint id, Input input) {
     float4 post = float4(stq, 1.0);
     return float3(dot(drawState.postRows[3 * id], post), dot(drawState.postRows[3 * id + 1], post), dot(drawState.postRows[3 * id + 2], post));
 }
+// The headset's vertex pre-pass. On the Quest's tiler the vertex stage runs again in every bin a primitive touches (and in the binning
+// pass), so the GX lighting and texgen above cost the scene pass most of its time (train fight at 1x: 32 ms, 13.5 ms without them).
+// xformMain shades every vertex of a packet once, in a compute dispatch, into two buffers: the clip position (before the late-aim shift
+// and the eye transform) and the attributes (both colours, rgba8, exact: GX colours are whole multiples of 1/255; then the texture
+// coordinates the draw's stages read, three floats each, in id order). The draws then use the XFORM_DRAW vertex stage, which only reads
+// them back and applies the eye transform: every pipeline reads the same bits, so layered surfaces keep identical depths.
+// The vertices are read word by word through a uint pointer (gx::GpuMeshVertex, 27 words): the Quest's compiler crashed on a struct
+// load through a physical-storage pointer.
+struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; };
+float4 unpackColor(uint c) { return float4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24) / 255.0; }
+uint packColor(float4 c) { const uint4 b = uint4(round(saturate(c) * 255.0)); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
+#ifdef XFORM
+[[vk::binding(8, 0)]] StructuredBuffer<XformJob> xformJobs;
+[[vk::binding(9, 0)]] StructuredBuffer<uint2> xformChunks;   // per 64-thread group: job, first vertex
+[[vk::binding(6, 0)]] RWStructuredBuffer<float4> xformPositions;
+[[vk::binding(7, 0)]] RWStructuredBuffer<uint> xformAttributes;
+[numthreads(64, 1, 1)]
+void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    const uint2 chunk = xformChunks[group.x];
+    const XformJob job = xformJobs[chunk.x];
+    const uint i = chunk.y + local.x;
+    if (i >= job.count) return;
+    xformDraw = job.draw;
+    projection.rows = job.rows; projection.palette = job.palette; projection.currentRow = job.current; projection.indexed = job.indexed; projection.bank = job.bank;
+    uint* v = job.vertices + i * 27;   // position 0..2, colour 3, texcoords 4..19, normal 20..22, colour1 23, row 24, texture matrices 25..26
+    Input input;
+    input.position = asfloat(uint3(v[0], v[1], v[2])); input.color = unpackColor(v[3]);
+    [unroll] for (uint t = 0; t < 8; ++t) input.texcoords[t] = asfloat(uint2(v[4 + 2 * t], v[5 + 2 * t]));
+    input.objectNormal = asfloat(uint3(v[20], v[21], v[22])); input.color1 = unpackColor(v[23]); input.matrixRow = v[24]; input.texMatrixIds = uint2(v[25], v[26]);
+    // vertexMain's GX transform and lighting, unchanged
+    float4 objectPosition = float4(input.position, 1.0);
+    uint row = projection.indexed != 0 ? input.matrixRow : projection.currentRow;
+    float4 row0 = positionRow(projection.palette, row);
+    float4 row1 = positionRow(projection.palette, row + 1);
+    float4 row2 = positionRow(projection.palette, row + 2);
+    float4 viewPosition = float4(dot(row0, objectPosition), dot(row1, objectPosition), dot(row2, objectPosition), 1.0);
+    xformPositions[job.positions + i] = float4(dot(projection.rows[0], viewPosition), dot(projection.rows[1], viewPosition), dot(projection.rows[2], viewPosition), dot(projection.rows[3], viewPosition));
+    uint normalRow = row & 31;
+    uint4 loaded = loadedRows(projection.palette);
+    bool allLoaded = true;
+    [unroll] for (uint k = 0; k < 3; ++k) { uint r = normalRow + k; uint word = r < 32 ? loaded.x : loaded.y; allLoaded = allLoaded && (((word >> (r & 31)) & 1u) != 0); }
+    float3 viewNormal = input.objectNormal;
+    if (allLoaded) viewNormal = float3(dot(normalRowAt(projection.palette, normalRow).xyz, input.objectNormal), dot(normalRowAt(projection.palette, normalRow + 1).xyz, input.objectNormal), dot(normalRowAt(projection.palette, normalRow + 2).xyz, input.objectNormal));
+    float3 normal = dot(viewNormal,viewNormal)>0.0 ? normalize(viewNormal) : float3(0.0);
+    uint at = job.attributes + i * job.stride;
+    xformAttributes[at] = packColor(shadeChannel(input.color,0,viewPosition.xyz,normal));
+    xformAttributes[at + 1] = packColor(shadeChannel(input.color1,1,viewPosition.xyz,normal));
+    at += 2;
+    for (uint id = 0; id < 8; ++id) if ((job.mask & (1u << id)) != 0) {
+        const float3 t = generateTexcoord(id, input);
+        xformAttributes[at] = asuint(t.x); xformAttributes[at + 1] = asuint(t.y); xformAttributes[at + 2] = asuint(t.z); at += 3;
+    }
+}
+#endif
+#ifdef XFORM_DRAW
+// The draws' vertex stage with the pre-pass: projection.palette = the draw's first attribute word, currentRow = stride | mask << 8,
+// indexed = the draw's first position. The renderer rebases the draws' indices onto the positions (one index buffer for the packet), so
+// the vertex index is the position's, and consecutive draws that share everything else can be one draw.
+[[vk::binding(6, 0)]] StructuredBuffer<float4> xformPositions;
+[[vk::binding(7, 0)]] StructuredBuffer<uint> xformAttributes;
+Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   // gl_VertexIndex: the rebased index (vertexOffset 0)
+    Output output;
+    float4 clip = xformPositions[vertex];
+    clip.xy += projection.shift * clip.w;
+    output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
+    const uint stride = projection.currentRow & 255u, mask = projection.currentRow >> 8;
+    uint at = projection.palette + (vertex - projection.indexed) * stride;
+    output.color = unpackColor(xformAttributes[at]); output.color1 = unpackColor(xformAttributes[at + 1]);
+    at += 2;
+    [unroll] for (uint id = 0; id < 8; ++id) {
+        output.texcoords[id] = float3(0.0, 0.0, 1.0);
+        if ((mask & (1u << id)) != 0) { output.texcoords[id] = asfloat(uint3(xformAttributes[at], xformAttributes[at + 1], xformAttributes[at + 2])); at += 3; }
+    }
+    return output;
+}
+#else
 #ifdef STEREO
 Output vertexMain(Input input, uint view : SV_ViewID) {
 #else
@@ -179,7 +259,10 @@ Output vertexMain(Input input) {
     [unroll] for (uint i = 0; i < 3; ++i) { uint r = normalRow + i; uint word = r < 32 ? loaded.x : loaded.y; allLoaded = allLoaded && (((word >> (r & 31)) & 1u) != 0); }
     float3 viewNormal = input.objectNormal;
     if (allLoaded) viewNormal = float3(dot(normalRowAt(projection.palette, normalRow).xyz, input.objectNormal), dot(normalRowAt(projection.palette, normalRow + 1).xyz, input.objectNormal), dot(normalRowAt(projection.palette, normalRow + 2).xyz, input.objectNormal));
-#ifndef SHADOW   // the shadow map's vertex stage (smoke.shadow.vert.spv) stops here: position only, no lighting, no texture coordinates
+#ifdef PROBE_VS   // diagnostics (UC_PROBE_VS): no lighting, no texgen, the vertex's own colours and first coordinate
+    output.color = input.color; output.color1 = input.color1;
+    [unroll] for (uint id = 0; id < 8; ++id) output.texcoords[id] = float3(input.texcoords[0], 1.0);
+#elif !defined(SHADOW)   // the shadow map's vertex stage (smoke.shadow.vert.spv) stops here: position only, no lighting, no texture coordinates
     float3 normal = dot(viewNormal,viewNormal)>0.0 ? normalize(viewNormal) : float3(0.0);
     output.color = shadeChannel(input.color,0,viewPosition.xyz,normal);
     output.color1 = shadeChannel(input.color1,1,viewPosition.xyz,normal);
@@ -195,6 +278,7 @@ Output vertexMain(Input input) {
 #endif
     return output;
 }
+#endif   // XFORM_DRAW
 bool alphaCompare(uint value, uint reference, uint operation) {
     switch(operation) {
     case 0: return false;
@@ -297,6 +381,9 @@ Targets fragmentMain(Output input) {
     return targets;
 }
 float4 shadeFragment(Output input) {
+#ifdef PROBE_FS   // diagnostics (UC_PROBE_FS): the vertex colour, no TEV, no texture
+    return input.color;
+#endif
 #ifdef UBER
     loadTevKey();
 #ifdef UC_SPEC
@@ -305,8 +392,6 @@ float4 shadeFragment(Output input) {
     destinationAlphaPass = projection.alphaPass;
 #endif
 #endif
-    float2 uv[8];
-    [unroll] for(uint i=0;i<8;++i) uv[i]=input.texcoords[i].xy / (input.texcoords[i].z != 0.0 ? input.texcoords[i].z : 1.0);
     float4 rasterColor0=input.color, rasterColor1=input.color1;
 #if defined(MOTION) || defined(UC_DIRECTX)
     if((projection.effects&1u)!=0) {   // the lighting channels again, at the pixel: the same GX equations on the interpolated normal and position
@@ -315,7 +400,7 @@ float4 shadeFragment(Output input) {
         if(((drawState.channels[1]|drawState.channels[3])&2u)!=0) rasterColor1 = shadeChannel(input.rawColor1,1,input.viewPosition,normal);
     }
 #endif
-    float4 result=evaluateTev(uv,rasterColor0,rasterColor1);
+    float4 result=evaluateTev(input.texcoords,rasterColor0,rasterColor1);   // each coordinate divided by its q where a stage reads it (uvOf)
 #ifndef EARLY_Z
     if(alphaTestActive!=0) {
         uint alpha=uint(round(saturate(result.a)*255.0)), word=drawState.pixel.x;
