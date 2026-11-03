@@ -344,7 +344,18 @@ PPC_FP_FMA(fmadd, std::fma(x, z, y), PPC_ID)    PPC_FP_FMA(fmsub, std::fma(x, z,
 PPC_FP_FMA(fnmadd, -std::fma(x, z, y), PPC_ID)  PPC_FP_FMA(fnmsub, -std::fma(x, z, -y), PPC_ID)
 PPC_FP_FMA(fmadds, std::fma(x, z, y), rnd_s)    PPC_FP_FMA(fmsubs, std::fma(x, z, -y), rnd_s)
 PPC_FP_FMA(fnmadds, -std::fma(x, z, y), rnd_s)  PPC_FP_FMA(fnmsubs, -std::fma(x, z, -y), rnd_s)
-PPC_INLINE void op_fsel(Ctx& c, int t, int a, int b, int cc, bool rc) { c.f[t] = c.f[a] >= 0.0 ? c.f[cc] : c.f[b]; fp_rc(c, rc); }
+// A value the optimizer may not trace back to its load. fsel picks one of two registers; written as a plain ?: of two loads, InstCombine
+// turned it into one load from a selected index (c.f[cond ? cc : b]), and that variable index kept the whole local register copy of a
+// translated function in memory (body_800A4434: a 4.8 KB stack frame, every register access a stack load or store).
+PPC_INLINE double ppc_opaque(double v) {
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+    __asm__("" : "+w"(v));
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    __asm__("" : "+x"(v));
+#endif
+    return v;
+}
+PPC_INLINE void op_fsel(Ctx& c, int t, int a, int b, int cc, bool rc) { const double on = ppc_opaque(c.f[cc]); c.f[t] = c.f[a] >= 0.0 ? on : c.f[b]; fp_rc(c, rc); }
 PPC_INLINE void op_fres(Ctx& c, int t, int b, bool rc) { c.f[t] = rnd_s(1.0 / c.f[b]); c.ps1[t] = c.f[t]; fp_rc(c, rc); }
 PPC_INLINE void op_frsqrte(Ctx& c, int t, int b, bool rc) { c.f[t] = 1.0 / std::sqrt(c.f[b]); fp_rc(c, rc); }
 PPC_INLINE void op_fsqrts(Ctx& c, int t, int b, bool rc) { c.f[t] = rnd_s(std::sqrt(c.f[b])); c.ps1[t] = c.f[t]; fp_rc(c, rc); }
