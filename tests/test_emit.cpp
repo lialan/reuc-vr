@@ -114,6 +114,23 @@ int main() {
         t = uc::emit_function(q, q.an.functions[0], st);
         CHECK(!has("ctx"));
     }
+    {   // a call of a register save/restore helper becomes its stores in place (no call, no sync); without the cache it stays an HLE call
+        Asm a;
+        size_t call = a.emit(0); a.emit(blr);
+        uint32_t g = a.here(); a.emit(0x93ABFFF4u); a.emit(0x93CBFFF8u); a.emit(0x93EBFFFCu); a.emit(blr);   // stw r29..r31,-12..-4(r11)
+        a.patch_bl(call, g);
+        uc::Config cfg; cfg.hle[g] = "SaveGpr29";
+        auto q = make_prog(a.w, cfg);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ppc::op_stw(c, 29, 11, -12); ppc::op_stw(c, 30, 11, -8); ppc::op_stw(c, 31, 11, -4); ", a.addr(call) + 4);
+        CHECK(t.find(buf) != std::string::npos);
+        CHECK(t.find("invoke_hle") == std::string::npos);
+        CHECK(t.find("c.r[29] = ctx.r[29]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31];") != std::string::npos);   // read on entry
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        CHECK(t.find("uc::invoke_hle<hle_SaveGpr29>(c);") != std::string::npos);
+    }
     {   // every translated function starts with the trace hook (a no-op macro unless UC_TRACE is defined)
         std::string t = uc::emit_function(p, f, st);
         CHECK(t.find("UC_ENTER(0x80003100u);") != std::string::npos);

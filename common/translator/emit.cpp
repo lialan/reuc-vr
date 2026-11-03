@@ -105,8 +105,47 @@ struct SyncText {
     bool local() const { return cx == "ctx"; }
 };
 
+// The SDK's register save/restore helpers (_savegpr_N, _restgpr_N, _savefpr_N, _restfpr_N; HLE entries SaveGprN ... RestFprN, see
+// runtime/hle/sdk_regs.cpp): a call of one is the same loads or stores at r11 in the same order, so in register-cache mode the translator
+// writes them in place of the call; no sync of the register copy around every prologue and epilogue.
+struct RegHelper { char kind = 0; uint32_t first = 0; };   // 'S' SaveGpr, 'R' RestGpr, 's' SaveFpr, 'r' RestFpr
+static RegHelper reg_helper(const Program& p, uint32_t target) {
+    auto it = p.cfg.hle.find(target);
+    if (it == p.cfg.hle.end() || it->second.size() < 8) return {};
+    const std::string& n = it->second;
+    const std::string head = n.substr(0, 7);
+    const char kind = head == "SaveGpr" ? 'S' : head == "RestGpr" ? 'R' : head == "SaveFpr" ? 's' : head == "RestFpr" ? 'r' : 0;
+    if (!kind || n.find_first_not_of("0123456789", 7) != std::string::npos) return {};
+    const uint32_t first = uint32_t(std::stoul(n.substr(7)));
+    return first >= 14 && first <= 31 ? RegHelper{kind, first} : RegHelper{};
+}
+static std::string reg_helper_text(const RegHelper& h) {
+    std::string o;
+    for (uint32_t i = h.first; i < 32; ++i) {
+        const bool gpr = h.kind == 'S' || h.kind == 'R';
+        const std::string op = h.kind == 'S' ? "stw" : h.kind == 'R' ? "lwz" : h.kind == 's' ? "stfd" : "lfd";
+        o += "ppc::op_" + op + "(c, " + num(i) + ", 11, " + num(-(gpr ? 4 : 8) * int(32 - i)) + "); ";
+    }
+    return o;
+}
+static RegEffect reg_helper_effect(const RegHelper& h) {
+    RegEffect e;
+    e.use.set(size_t(res::R + 11));
+    for (uint32_t i = h.first; i < 32; ++i) {
+        const size_t r = size_t((h.kind == 'S' || h.kind == 'R' ? res::R : res::F) + int(i));
+        if (h.kind == 'S' || h.kind == 's') e.use.set(r); else { e.may.set(r); e.must.set(r); }
+    }
+    return e;
+}
+
 static std::string branch_action(const Program& p, const Function& f, uint32_t pc, uint32_t target, bool lk, EmitStats& st, const SyncText& s) {
     Target tk = classify(p, f, target);
+    if (s.local() && tk.kind == Target::Entry) {
+        if (const RegHelper h = reg_helper(p, target); h.kind) {
+            if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + reg_helper_text(h);
+            return reg_helper_text(h) + s.flush + "return;";
+        }
+    }
     if (tk.kind == Target::Internal && !lk) {
         if (target > pc) return "goto L_" + hex8(target) + ";";
         // a loop is a safe point; the interrupts that may run there see the registers in the real context
@@ -447,17 +486,29 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
         op->kind == Kind::UNSUP) { nd.fall = false; nd.exit = true; return nd; }
     auto use = [&](int i) { nd.eff.use.set(size_t(i)); };
     auto def = [&](int i, bool always) { nd.eff.may.set(size_t(i)); if (always) nd.eff.must.set(size_t(i)); };
-    // a taken branch to `target` (lk: a call): the same classification as branch_action
+    // a taken branch to `target` (lk: a call): the same classification as branch_action; true when the taken path goes on at the next
+    // instruction without a sync (a save/restore helper written in place)
     auto action = [&](uint32_t target, bool lk, bool always) {
         const Target tk = classify(p, f, target);
         if (tk.kind == Target::Internal && !lk) {
             nd.target = index(target); nd.poll = target <= pc;
             if (nd.poll) { use(res::POLL); def(res::POLL, false); }   // the back edge counts in the local copy of poll_count
-            return;
+            return false;
         }
-        if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) { nd.exit = true; return; }
-        if (lk) { def(res::LR, always); nd.call = true; return; }
+        if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) { nd.exit = true; return false; }
+        if (tk.kind == Target::Entry) {
+            if (const RegHelper rh = reg_helper(p, target); rh.kind) {
+                const RegEffect he = reg_helper_effect(rh);
+                nd.eff.use |= he.use; nd.eff.may |= he.may;
+                if (always) nd.eff.must |= he.must;
+                if (lk) { def(res::LR, always); return true; }
+                nd.exit = true;
+                return false;
+            }
+        }
+        if (lk) { def(res::LR, always); nd.call = true; return false; }
         nd.exit = true;
+        return false;
     };
     // the condition of a conditional branch; true when it is always taken
     auto condition = [&](uint32_t bo, uint32_t bi, bool ctr_ok) {
@@ -469,14 +520,13 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
         case Kind::SC: nd.fall = false; nd.call = true; return nd;
         case Kind::BR: {
             const int32_t li = ppc::li(w);
-            action(ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li), ppc::lk(w), true);
-            nd.fall = false;
+            nd.fall = action(ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li), ppc::lk(w), true);
             return nd;
         }
         case Kind::BC: {
             const bool always = condition(ppc::bo(w), ppc::bi(w), true);
-            action(ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w)), ppc::lk(w), always);
-            nd.fall = !always;
+            const bool goes_on = action(ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w)), ppc::lk(w), always);
+            nd.fall = !always || goes_on;
             return nd;
         }
         case Kind::BCLR: {
