@@ -28,6 +28,13 @@
 #include <vector>
 
 namespace uc {
+// The renderer's HUD layer (hud_layer.h) for the screen pass: L and T (2D-array views of one layer) and, per eye, the rows of the homography
+// from the picture's texture coordinate to the layer's. The eyes then show picture * T + L.
+// glow: the glow layer under it (null views: none), its affine map u' = glow[0] u + glow[1], v' = glow[2] v + glow[3] in both eyes.
+struct XrHudLayer {
+    VkImageView light = VK_NULL_HANDLE, transmit = VK_NULL_HANDLE; std::array<std::array<std::array<float, 4>, 3>, 2> rows{};
+    VkImageView glow_light = VK_NULL_HANDLE, glow_transmit = VK_NULL_HANDLE; std::array<float, 4> glow{};
+};
 struct XrPlatform { void* java_vm = nullptr; void* activity = nullptr; };   // Android: the JavaVM and the Activity (global ref), kept alive by the caller
 struct XrConfig {
     uint32_t width = 0, height = 0;   // per eye; 0: the runtime's recommendation (HOTD4: native 2064x2208 on Quest 3)
@@ -59,8 +66,9 @@ public:
     // The finished game picture (layout `layout`, left in it again) on the screen plane in both eyes. Call only after begin_frame() true.
     // rect: the part of the picture the eyes show, in texture coordinates (the whole picture, or the EFB's displayed region read in place)
     // fovea: the renderer's foveation map of the eye image (null: none), texel its texel size; the screen pass shades by it, the overlay not.
+    // hud: the HUD layer laid over both eyes (its images in SHADER_READ_ONLY_OPTIMAL), or none.
     void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect = {0, 0, 1, 1},
-                VkImageView fovea = VK_NULL_HANDLE, VkExtent2D texel = {});
+                VkImageView fovea = VK_NULL_HANDLE, VkExtent2D texel = {}, const XrHudLayer* hud = nullptr);
     // Before attach(): the device can shade by a foveation map (the screen and overlay pipelines are made to accept one).
     void set_fovea_support(bool on) { fovea_support_ = on; }
     void end_frame(bool rendered);
@@ -133,7 +141,7 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
-    struct Bound { VkImageView view; VkDescriptorSet set; };
+    struct Bound { VkImageView view, light, transmit, glow_light, glow_transmit; VkDescriptorSet set; };
     std::vector<Bound> bound_;
     xr::StereoScene scene_;
     bool lens_seen_ = false;

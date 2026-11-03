@@ -85,6 +85,17 @@ void barrier(VkCommandBuffer command, VkImage image, VkImageLayout before, VkIma
     VkDependencyInfo info{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; info.imageMemoryBarrierCount = 1; info.pImageMemoryBarriers = &image_barrier;
     vkCmdPipelineBarrier2(command, &info);
 }
+// The headset's eye block of a draw: both eyes' transforms (StereoScene, GL clip) as Vulkan clip to Vulkan clip, C * M * inverse(C),
+// C = (x, -y, (z+w)/2, w); rows for the shader (smoke.slang StereoBlock).
+void stereo_eye_block(const uc::xr::Matrices& matrices, float* block) {
+    for(int eye=0;eye<2;++eye) {
+        const float* m=matrices.view_projection[eye];
+        const auto gl=[&](int r,int c){return double(m[c*4+r]);};
+        double g[4][4];   // M * inverse(C): inverse(C) maps Vulkan clip back to GL (y'=-y, z'=2z-w)
+        for(int r=0;r<4;++r) { g[r][0]=gl(r,0); g[r][1]=-gl(r,1); g[r][2]=2*gl(r,2); g[r][3]=gl(r,3)-gl(r,2); }
+        for(int c=0;c<4;++c) { block[eye*16+0*4+c]=float(g[0][c]); block[eye*16+1*4+c]=float(-g[1][c]); block[eye*16+2*4+c]=float(.5*(g[2][c]+g[3][c])); block[eye*16+3*4+c]=float(g[3][c]); }
+    }
+}
 VkShaderModule shader(VkDevice device, const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     auto size = file.tellg();
@@ -1097,7 +1108,16 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         const bool rt_writes=rt_material_write(key);
         blends[3].colorWriteMask=rt_writes ? VK_COLOR_COMPONENT_R_BIT : 0;   // material record index
         blends[4].colorWriteMask=rt_writes ? gbuffer_write_mask(key) : 0;    // albedo
-        VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blending.attachmentCount = scene_color_attachments(); blending.pAttachments = blends;
+        const bool hud_layer=(key[0]&kHudLayerKeyBit)!=0;   // the HUD layer (hud_layer.h): L takes the draw's blend, T the factor the scene behind keeps
+        if (hud_layer) {
+            blends[0].colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT;
+            blends[1]=VkPipelineColorBlendAttachmentState{};
+            blends[1].blendEnable=VK_TRUE; blends[1].colorWriteMask=blends[0].colorWriteMask;
+            blends[1].srcColorBlendFactor=blends[1].srcAlphaBlendFactor=mode.mode==1 && mode.source==kGxSrcDstColor ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_ZERO;
+            blends[1].dstColorBlendFactor=blends[1].dstAlphaBlendFactor=mode.mode==1 ? destinations[mode.destination] : VK_BLEND_FACTOR_ZERO;
+            blends[1].colorBlendOp=blends[1].alphaBlendOp=VK_BLEND_OP_ADD;
+        }
+        VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blending.attachmentCount = hud_layer ? 2 : scene_color_attachments(); blending.pAttachments = blends;
         blending.logicOpEnable=mode.mode==2; blending.logicOp=VkLogicOp(mode.logic);
         VkDynamicState dynamic_states[7]; uint32_t dynamic_count=0;
         dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_VIEWPORT; dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_SCISSOR;
@@ -1105,10 +1125,12 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         if (set_shading_rate_) dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;   // the rate: record_pass sets it per draw
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount = dynamic_count; dynamic.pDynamicStates = dynamic_states;
         const VkFormat formats[5] = {VK_FORMAT_R8G8B8A8_UNORM, kMotionFormat, kGBufferFormat, kMaterialFormat, kAlbedoFormat};
+        const VkFormat hud_formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.colorAttachmentCount = scene_color_attachments(); rendering.pColorAttachmentFormats = formats; rendering.viewMask = layers_>1 ? 0b11u : 0u;
         rendering.depthAttachmentFormat=VK_FORMAT_D32_SFLOAT;
+        if (hud_layer) { rendering.colorAttachmentCount=2; rendering.pColorAttachmentFormats=hud_formats; rendering.depthAttachmentFormat=VK_FORMAT_UNDEFINED; }
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        depth.depthTestEnable=bool(key[68]&1); depth.depthWriteEnable=bool(key[68]&16);
+        depth.depthTestEnable=bool(key[68]&1) && !hud_layer; depth.depthWriteEnable=bool(key[68]&16) && !hud_layer;
         depth.depthCompareOp=VkCompareOp((key[68]>>1)&7);
         VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; create.pNext = &rendering; create.stageCount = 2; create.pStages = stages; create.pVertexInputState = &input;
         create.pInputAssemblyState = &assembly; create.pViewportState = &viewport; create.pRasterizationState = &raster; create.pMultisampleState = &samples;
@@ -1961,6 +1983,127 @@ void VulkanRenderer::destroy_fovea_map(FoveaMap& map) {
     map=FoveaMap{};
 }
 void VulkanRenderer::destroy_fovea() { destroy_fovea_map(fovea_efb_); destroy_fovea_map(fovea_eye_); fovea_level_=0; }
+// The headset's "Game crosshair: Hidden" (the laser aims): no reticle quad or wake. UC_VR_HIDE_CROSSHAIR=1: the same in the desktop preview.
+bool VulkanRenderer::crosshair_hidden() const {
+    static const bool preview_hidden=std::getenv("UC_VR_HIDE_CROSSHAIR")!=nullptr;
+#ifdef UC_OPENXR
+    if (xr_) return !xr_->game_crosshair();
+#endif
+    return preview_hidden && preview_;
+}
+// The headset's HUD layer (hud_layer.h). Only over a world (the scan below): menus keep their 2D screens in the EFB.
+bool VulkanRenderer::hud_layer_wanted() const {
+    static const bool off=std::getenv("UC_NO_HUD_LAYER")!=nullptr;
+    return !off && layers_>1 && stereo_ && xform_;
+}
+void VulkanRenderer::ensure_hud_layer(HudLayer& layer, VkExtent2D extent) {
+    if (layer.light && layer.extent.width==extent.width && layer.extent.height==extent.height) return;
+    if (layer.light) {   // a new size (render scale): no frame in flight may still read the old images
+        vk_check(present_.wait_idle(device),"HUD layer resize");
+        for (VkImageView* view:{&layer.light_view,&layer.transmit_view}) { if (*view) vkDestroyImageView(device,*view,nullptr); *view=VK_NULL_HANDLE; }
+        for (VkImage* image:{&layer.light,&layer.transmit}) { if (*image) vkDestroyImage(device,*image,nullptr); *image=VK_NULL_HANDLE; }
+        for (VkDeviceMemory* memory:{&layer.light_memory,&layer.transmit_memory}) { if (*memory) vkFreeMemory(device,*memory,nullptr); *memory=VK_NULL_HANDLE; }
+    }
+    for (int i=0;i<2;++i) {   // a layer per eye
+        VkImage& image=i ? layer.transmit : layer.light; VkDeviceMemory& memory=i ? layer.transmit_memory : layer.light_memory; VkImageView& view=i ? layer.transmit_view : layer.light_view;
+        VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; create.imageType=VK_IMAGE_TYPE_2D; create.format=VK_FORMAT_R8G8B8A8_UNORM;
+        create.extent={extent.width,extent.height,1}; create.mipLevels=1; create.arrayLayers=2; create.samples=VK_SAMPLE_COUNT_1_BIT; create.tiling=VK_IMAGE_TILING_OPTIMAL;
+        create.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        vk_check(vkCreateImage(device,&create,nullptr,&image),"HUD layer image");
+        VkMemoryRequirements requirements; vkGetImageMemoryRequirements(device,image,&requirements);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; allocate.allocationSize=requirements.size; allocate.memoryTypeIndex=memory_type(requirements.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vk_check(vkAllocateMemory(device,&allocate,nullptr,&memory),"HUD layer memory"); vk_check(vkBindImageMemory(device,image,memory,0),"bind HUD layer");
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; info.image=image; info.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY; info.format=create.format; info.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,2};
+        vk_check(vkCreateImageView(device,&info,nullptr,&view),"HUD layer view");
+    }
+    layer.extent=extent; layer.used=false;
+    std::fprintf(stderr,"[vr] %s layer %ux%u a layer (EFB %ux%u)\n",&layer==&glow_ ? "glow" : "HUD",extent.width,extent.height,efb_extent_.width,efb_extent_.height);
+    if (!hud_.layout) {   // the composite into the EFB: two pipelines over one triangle
+        VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; sampler.magFilter=sampler.minFilter=VK_FILTER_LINEAR; sampler.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler.addressModeU=sampler.addressModeV=sampler.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        vk_check(vkCreateSampler(device,&sampler,nullptr,&hud_.sampler),"HUD layer sampler");
+        const VkDescriptorSetLayoutBinding bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+                                                       {2,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,&hud_.sampler}};
+        VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set.bindingCount=3; set.pBindings=bindings;
+        vk_check(vkCreateDescriptorSetLayout(device,&set,nullptr,&hud_.set_layout),"HUD layer set layout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT,0,112};   // hud_layer.slang Composite
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount=1; layout.pSetLayouts=&hud_.set_layout; layout.pushConstantRangeCount=1; layout.pPushConstantRanges=&push;
+        vk_check(vkCreatePipelineLayout(device,&layout,nullptr,&hud_.layout),"HUD layer pipeline layout");
+        const VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,4},{VK_DESCRIPTOR_TYPE_SAMPLER,2}};
+        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=2; pool.poolSizeCount=2; pool.pPoolSizes=sizes;
+        vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&hud_.pool),"HUD layer pool");
+        for (HudLayer* each:{&hud_,&glow_}) {   // a set per layer, both from hud_'s pool
+            VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=hud_.pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&hud_.set_layout;
+            vk_check(vkAllocateDescriptorSets(device,&allocate,&each->set),"HUD layer set");
+        }
+        hud_.vertex=shader(device,shaders_/"hud_layer.vert.spv"); hud_.fragment=shader(device,shaders_/"hud_layer.frag.spv");
+        for (uint32_t add=0;add<2;++add) {
+            const VkSpecializationMapEntry entry{0,0,sizeof(uint32_t)}; const VkSpecializationInfo specialization{1,&entry,sizeof add,&add};
+            const VkPipelineShaderStageCreateInfo stages[]={{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,hud_.vertex,"vertexMain",nullptr},
+                                                            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_FRAGMENT_BIT,hud_.fragment,"fragmentMain",&specialization}};
+            VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount=viewport.scissorCount=1;
+            VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.cullMode=VK_CULL_MODE_NONE; raster.lineWidth=1;
+            VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; multisample.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineColorBlendAttachmentState attachment{}; attachment.blendEnable=VK_TRUE; attachment.colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT;
+            attachment.srcColorBlendFactor=attachment.srcAlphaBlendFactor=add ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_DST_COLOR;
+            attachment.dstColorBlendFactor=attachment.dstAlphaBlendFactor=add ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_COLOR;
+            attachment.colorBlendOp=attachment.alphaBlendOp=VK_BLEND_OP_ADD;
+            VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blend.attachmentCount=1; blend.pAttachments=&attachment;
+            const VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount=2; dynamic.pDynamicStates=dynamic_states;
+            const VkFormat format=VK_FORMAT_R8G8B8A8_UNORM;
+            VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; rendering.viewMask=0b11; rendering.colorAttachmentCount=1; rendering.pColorAttachmentFormats=&format;
+            VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext=&rendering; pipeline.stageCount=2; pipeline.pStages=stages;
+            pipeline.pVertexInputState=&vertices; pipeline.pInputAssemblyState=&assembly; pipeline.pViewportState=&viewport; pipeline.pRasterizationState=&raster;
+            pipeline.pMultisampleState=&multisample; pipeline.pColorBlendState=&blend; pipeline.pDynamicState=&dynamic; pipeline.layout=hud_.layout;
+            vk_check(vkCreateGraphicsPipelines(device,pipeline_cache_,1,&pipeline,nullptr,&hud_.flush[add]),"HUD layer composite pipeline");
+        }
+    }
+    const VkDescriptorImageInfo images[2]{{VK_NULL_HANDLE,layer.light_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,layer.transmit_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[2]{};
+    for (uint32_t i=0;i<2;++i) { writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet=layer.set; writes[i].dstBinding=i; writes[i].descriptorCount=1; writes[i].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[i].pImageInfo=&images[i]; }
+    vkUpdateDescriptorSets(device,2,writes,0,nullptr);
+}
+void VulkanRenderer::destroy_hud_layer() {
+    for (HudLayer* layer:{&hud_,&glow_}) {
+        for (VkImageView view:{layer->light_view,layer->transmit_view}) if (view) vkDestroyImageView(device,view,nullptr);
+        for (VkImage image:{layer->light,layer->transmit}) if (image) vkDestroyImage(device,image,nullptr);
+        for (VkDeviceMemory memory:{layer->light_memory,layer->transmit_memory}) if (memory) vkFreeMemory(device,memory,nullptr);
+    }
+    for (VkPipeline pipeline:hud_.flush) if (pipeline) vkDestroyPipeline(device,pipeline,nullptr);
+    if (hud_.pool) vkDestroyDescriptorPool(device,hud_.pool,nullptr);
+    if (hud_.layout) vkDestroyPipelineLayout(device,hud_.layout,nullptr);
+    if (hud_.set_layout) vkDestroyDescriptorSetLayout(device,hud_.set_layout,nullptr);
+    if (hud_.sampler) vkDestroySampler(device,hud_.sampler,nullptr);
+    for (VkShaderModule module:{hud_.vertex,hud_.fragment}) if (module) vkDestroyShaderModule(device,module,nullptr);
+    hud_=HudLayer{}; glow_=HudLayer{};
+}
+void VulkanRenderer::flush_hud_layer(VkCommandBuffer command) { flush_layer(command,glow_); flush_layer(command,hud_); }
+// A layer into the EFB (both eyes): EFB * T, then + L. The EFB is between passes (TRANSFER_SRC_OPTIMAL) and is left so.
+void VulkanRenderer::flush_layer(VkCommandBuffer command, HudLayer& layer) {
+    if (!layer.used) return;
+    const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
+    for (VkImage image:{layer.light,layer.transmit}) barrier(command,image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,all,any,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; color.imageView=efb_view_; color.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD; color.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea={{0,0},efb_extent_}; rendering.layerCount=1; rendering.viewMask=0b11; rendering.colorAttachmentCount=1; rendering.pColorAttachments=&color;
+    vkCmdBeginRendering(command,&rendering);
+    const VkViewport viewport{0,0,float(efb_extent_.width),float(efb_extent_.height),0,1}; const VkRect2D scissor{{0,0},efb_extent_};
+    vkCmdSetViewport(command,0,1,&viewport); vkCmdSetScissor(command,0,1,&scissor);
+    struct { float rows[2][3][4]; float size[2]; float unused[2]; } push{};
+    static_assert(sizeof push==112);
+    for (int eye=0;eye<2;++eye) for (int row=0;row<3;++row) for (int c=0;c<4;++c) push.rows[eye][row][c]=layer.map.rows[eye][row][c];
+    push.size[0]=float(efb_extent_.width); push.size[1]=float(efb_extent_.height);
+    vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,hud_.layout,0,1,&layer.set,0,nullptr);
+    vkCmdPushConstants(command,hud_.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof push,&push);
+    for (VkPipeline pipeline:hud_.flush) { vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); vkCmdDraw(command,3,1,0,0); }
+    vkCmdEndRendering(command);
+    barrier(command,efb_,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,all,any);
+    layer.used=false; ++hud_.flushes;
+}
 // The foveation level asked for: UC_VR_FOVEATION=0..3 (tests, the preview), else the headset's vr.cfg / settings panel.
 int VulkanRenderer::wanted_fovea_level() const {
     static const int forced=std::getenv("UC_VR_FOVEATION") ? std::atoi(std::getenv("UC_VR_FOVEATION")) : -1;
@@ -3009,6 +3152,104 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                      int(packet.clear_after_copy), int(scene_phase_), int(upscale_here));
         if (packet.present) ++post_dumps;
     }
+    // The stereo facts of a draw (HOTD4's classification input, lg_stereo_classify_draw).
+    const auto stereo_facts=[&](size_t d) {
+        const auto& draw=packet.draws[d];
+        bool texture_view=false;
+        for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
+        LgStereoDrawFacts facts{};
+        facts.perspective=draw.transforms->projection[3][3]==0; facts.texture_view=texture_view;   // as ultrawide.h tells perspective from ortho
+        // HOTD4 (vulkan_guest.cpp): a 2D draw covers / fills the screen by its geometry's clip-space box (+-0.95 / +-0.98 of its
+        // viewport), not by its viewport, which here is the whole scene for every draw, HUD text included.
+        facts.covers_viewport=1;
+        if (!facts.perspective) if (const auto box=gx::draw_bounds_ndc(draw)) {
+            const auto& b=*box;
+            facts.covers_viewport=b[0]<=-.95f && b[1]<=-.95f && b[2]>=.95f && b[3]>=.95f;
+            facts.fills_screen=b[0]<=-.98f && b[1]<=-.98f && b[2]>=.98f && b[3]>=.98f;
+            // This game draws its full-screen effects (the damage flash and blood) as four corner quads, none of which covers the screen:
+            // a big 2D draw (a fifth of the screen or more) that reaches a horizontal and a vertical edge is part of such an overlay and
+            // fills its part of each eye. A strip from edge to edge on one axis only (a sliding banner) stays on the HUD's screen.
+            const float area=(std::clamp(b[2],-1.f,1.f)-std::clamp(b[0],-1.f,1.f))*(std::clamp(b[3],-1.f,1.f)-std::clamp(b[1],-1.f,1.f))/4;
+            if (area>=.2f && (b[0]<=-.98f || b[2]>=.98f) && (b[1]<=-.98f || b[3]>=.98f)) facts.fills_screen=1;
+        }
+        // HOTD4's "offscreen" is a target that is not eye-sized. Here every pass draws into the EFB, which holds both eyes, and its
+        // copies are per eye: the scene's packets (copied whole, 640x360, or at half size, 320x180) are eye renders. Only a small
+        // perspective copy (a render-to-texture picture) keeps the game's camera; 2D passes over copies (the game's own post chain)
+        // keep identity in each eye.
+        const bool small_copy=copy_target && packet.texture_copy->source[2]<300;
+        facts.offscreen=copy_target && !packet.present && (!facts.perspective || small_copy);
+        facts.multiview=1;
+        return facts;
+    };
+    // The headset's HUD and glow layers (hud_layer.h): over a world, this packet's full-screen glows (2D draws each eye sees in its own clip
+    // space, without detail finer than a guest pixel) go to the glow layer and its HUD draws to the HUD layer instead of the EFB, when the
+    // packet's draws from the first of them on are glows, then HUD draws (with the game's crosshair shown, its quads after them keep the
+    // packet in the EFB: the layers are composited last). Draws before stay in the EFB. A later
+    // packet that draws or copies composites the layers into the EFB first (flush_hud_layer); the present lays them over the eyes.
+    // hud_draw: 1 = the HUD layer, 2 = the glow layer.
+    std::vector<uint8_t> hud_draw;
+    if (hud_layer_wanted() && !overlay_frame && !copy_target && !(scene_phase_ && !upscale_here) && packet.draws.size()>scene_draws) {
+        hud_draw.assign(packet.draws.size(),0);
+        bool world_drawn=world_drawn_, any=false, mixed=false;
+        std::optional<size_t> first_hud, first_glow; std::array<float,4> hud_viewport{}, glow_viewport{};
+        static const bool no_glow=std::getenv("UC_NO_GLOW_LAYER")!=nullptr;
+        const bool glow_wanted=!no_glow && std::min(efb_extent_.width/640.f,efb_extent_.height/480.f)>=2.5f;   // the layer's 2 points a guest pixel save only above that
+        for (size_t d=scene_draws; d<packet.draws.size() && !mixed; ++d) {
+            const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
+            if (!info.index_count || std::find(skipped_callsites.begin(),skipped_callsites.end(),draw.callsite)!=skipped_callsites.end() ||
+                (gx::bloom_composite(draw) && (motion_outputs_ || !bloom_active())) || (layer_on && draw.layer) || (draw.reticle && crosshair_scale_<=0)) continue;   // drawn nowhere
+            if (draw.layer && crosshair_hidden()) continue;   // the headset's hidden game crosshair (the laser aims)
+            const auto facts=stereo_facts(d);
+            int kind=lg_stereo_classify_draw(&facts);
+            if (kind==LG_STEREO_FILL && !world_drawn) kind=LG_STEREO_HUD;
+            if (kind==LG_STEREO_WORLD && facts.perspective) world_drawn=true;
+            const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
+            const uint32_t depth=info.key[68];
+            const bool aim=draw.reticle || draw.late_aim || draw.wake || draw.layer;
+            const bool layer=kind==LG_STEREO_HUD && !aim && !facts.perspective && !facts.texture_view && draw.blend.color_write &&
+                hud_blend_separable(draw.blend.mode,draw.blend.source,draw.blend.destination) && !(depth&16) && (!(depth&1) || ((depth>>1)&7)==7) &&
+                v[2]>0 && v[3]>0 && (!first_hud || (v[0]==hud_viewport[0] && v[1]==hud_viewport[1] && v[2]==hud_viewport[2] && v[3]==hud_viewport[3]));   // one viewport: the layer's
+            const bool glow=glow_wanted && !first_hud && !aim && ((kind==LG_STEREO_WORLD && !facts.perspective) || kind==LG_STEREO_FILL) && draw.blend.color_write &&
+                hud_blend_separable(draw.blend.mode,draw.blend.source,draw.blend.destination) && !(depth&16) && (!(depth&1) || ((depth>>1)&7)==7) &&
+                v[2]>0 && v[3]>0 && (!first_glow || (v[0]==glow_viewport[0] && v[1]==glow_viewport[1] && v[2]==glow_viewport[2] && v[3]==glow_viewport[3])) &&
+                bloom_shading_rate(draw,{2560,1920},true,false,false).width>=2;   // only magnified textures (bloom_shading_rate's test at 4 EFB pixels a guest pixel)
+            if (layer && world_drawn) { hud_draw[d]=1; any=true; if (!first_hud) { first_hud=d; hud_viewport={v[0],v[1],v[2],v[3]}; } }
+            else if (glow && world_drawn) { hud_draw[d]=2; any=true; if (!first_glow) { first_glow=d; glow_viewport={v[0],v[1],v[2],v[3]}; } }
+            else if (first_hud || first_glow) mixed=true;   // drawn into the EFB after a layer draw: under the layers' composite, not over (an aim reticle under a glow)
+        }
+        if (post_dump) std::fprintf(stderr,"[post-dump] layer scan: %d HUD draws from %d, %d glow draws from %d, mixed %d, world drawn %d\n",int(std::count(hud_draw.begin(),hud_draw.end(),1)),first_hud ? int(*first_hud) : -1,
+                                    int(std::count(hud_draw.begin(),hud_draw.end(),2)),first_glow ? int(*first_glow) : -1,int(mixed),int(world_drawn_));
+        if (!any || mixed) hud_draw.clear();
+        else if (first_glow) {   // the glow layer: the viewport at UC_GLOW_SCALE (default 2) points a guest pixel
+            static const float glow_scale=std::getenv("UC_GLOW_SCALE") ? std::clamp(float(std::atof(std::getenv("UC_GLOW_SCALE"))),1.f,4.f) : 2.f;
+            ensure_hud_layer(glow_,{uint32_t(std::lround(glow_viewport[2]*glow_scale)),uint32_t(std::lround(glow_viewport[3]*glow_scale))});
+            glow_.map=hud_overlay_map(glow_viewport);
+        }
+        if (!hud_draw.empty() && first_hud) {   // the layer's place in each eye: the HUD class's eye transform (the same for every HUD draw) at the HUD's depth
+            const auto& draw=packet.draws[*first_hud]; const auto& info=gpu_draws[*first_hud];
+            const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),LG_STEREO_HUD);
+            float block[32];
+            stereo_eye_block(matrices,block);
+            float z=.5f;   // the clip depth of the draw's first vertex (a 2D draw: w = 1)
+            if (const auto vertices=draw.vertex_view(); !vertices.empty()) {
+                const auto& t=*draw.transforms; const auto& vertex=vertices[0];
+                const uint32_t row=info.indexed ? vertex.position_matrix : info.current;
+                if (row<=61) {
+                    float view[3]; for (int i=0;i<3;++i) { const auto& m=t.position_rows[row+i]; view[i]=m[0]*vertex.position[0]+m[1]*vertex.position[1]+m[2]*vertex.position[2]+m[3]; }
+                    const auto& m=t.projection[2]; const auto& w=t.projection[3];
+                    const float cw=w[0]*view[0]+w[1]*view[1]+w[2]*view[2]+w[3];
+                    if (cw!=0) z=(m[0]*view[0]+m[1]*view[1]+m[2]*view[2]+m[3])/cw;
+                }
+            }
+            HudLayerMap map;
+            if (!hud_layer_map(block,z,hud_viewport,map)) hud_draw.clear();
+            else {
+                const float k=hud_layer_scale(map,efb_extent_.width,efb_extent_.height,4.f);
+                ensure_hud_layer(hud_,{uint32_t(std::lround(hud_viewport[2]*k)),uint32_t(std::lround(hud_viewport[3]*k))});
+                hud_.map=map;
+            }
+        }
+    }
     auto record_pass=[&](const PassTarget& target, size_t first, size_t last, bool scene) {
     const bool initialized=*target.initialized;
     barrier(slot.command, target.color, initialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3068,7 +3309,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (size_t d = first; d < last; ++d) {
             if (x0 == 0 && y0 == 0 && x1 == int64_t(target.extent.width) && y1 == int64_t(target.extent.height)) break;   // already everything
             const auto& draw = packet.draws[d];
-            if (!gpu_draws[d].index_count) continue;
+            if (!gpu_draws[d].index_count || (!hud_draw.empty() && hud_draw[d])) continue;
             if (draw.reticle || draw.late_aim) { add(0, 0, target.extent.width, target.extent.height); continue; }   // scaled or moved after the fact
             const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
             const auto a = uc::efb_viewport(v, target.extent.width, target.extent.height);
@@ -3274,7 +3515,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (size_t d=first; d<last; ++d) {
             const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
             const size_t set_index=d;
-            if (!info.index_count) continue;
+            if (!info.index_count || (!hud_draw.empty() && hud_draw[d])) continue;   // drawn into the HUD layer (record_hud_layer)
             if (layer_on && !overlay_frame && draw.layer) continue;   // drawn later, over the held frame
             if (overlay_frame && !draw.layer) continue;
             if (gx::bloom_composite(draw) && (motion_outputs_ || !bloom_active())) continue;   // the game's own bloom is replaced by bloom_pass_ (off means none); a device without the scene-target path cannot run it and keeps the game's
@@ -3296,9 +3537,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 const auto bottom=std::clamp<int64_t>((int64_t(s[1])+s[3])*target.extent.height/480,y,target.extent.height);
                 draw_scissor={{int32_t(x),int32_t(y)},{uint32_t(right-x),uint32_t(bottom-y)}};
             }
-#ifdef UC_OPENXR
-            if (draw.layer && xr_ && !xr_->game_crosshair()) continue;   // the headset's "Game crosshair: Hidden": no reticle quad or wake (the laser aims)
-#endif
+            if (draw.layer && crosshair_hidden()) continue;   // the headset's "Game crosshair: Hidden": no reticle quad or wake (the laser aims)
             if (draw.reticle && crosshair_scale_!=1) {
                 if (crosshair_scale_<=0) continue;   // 0%: no crosshair (a Vulkan viewport needs a positive size)
                 if (const auto center=gx::draw_center_ndc(draw)) gx::scale_viewport_about(*center,crosshair_scale_,draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height);
@@ -3344,31 +3583,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             int stereo_kind=-1;   // the draw's stereo class (headset), for the shading rate below
             bool draw_offscreen=false;   // the class's offscreen fact: a perspective picture for a small copy or a 2D pass over copies
             if (layers_>1 && stereo_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
-                bool texture_view=false;
-                for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
+                LgStereoDrawFacts facts=stereo_facts(d);
+                const bool texture_view=facts.texture_view;
                 const auto& source=packet.display_source;   // diagnostics only
-                LgStereoDrawFacts facts{};
-                facts.perspective=draw.transforms->projection[3][3]==0; facts.texture_view=texture_view;   // as ultrawide.h tells perspective from ortho
-                // HOTD4 (vulkan_guest.cpp): a 2D draw covers / fills the screen by its geometry's clip-space box (+-0.95 / +-0.98 of its
-                // viewport), not by its viewport, which here is the whole scene for every draw, HUD text included.
-                facts.covers_viewport=1;
-                if (!facts.perspective) if (const auto box=gx::draw_bounds_ndc(draw)) {
-                    const auto& b=*box;
-                    facts.covers_viewport=b[0]<=-.95f && b[1]<=-.95f && b[2]>=.95f && b[3]>=.95f;
-                    facts.fills_screen=b[0]<=-.98f && b[1]<=-.98f && b[2]>=.98f && b[3]>=.98f;
-                    // This game draws its full-screen effects (the damage flash and blood) as four corner quads, none of which covers the screen:
-                    // a big 2D draw (a fifth of the screen or more) that reaches a horizontal and a vertical edge is part of such an overlay and
-                    // fills its part of each eye. A strip from edge to edge on one axis only (a sliding banner) stays on the HUD's screen.
-                    const float area=(std::clamp(b[2],-1.f,1.f)-std::clamp(b[0],-1.f,1.f))*(std::clamp(b[3],-1.f,1.f)-std::clamp(b[1],-1.f,1.f))/4;
-                    if (area>=.2f && (b[0]<=-.98f || b[2]>=.98f) && (b[1]<=-.98f || b[3]>=.98f)) facts.fills_screen=1;
-                }
-                // HOTD4's "offscreen" is a target that is not eye-sized. Here every pass draws into the EFB, which holds both eyes, and its
-                // copies are per eye: the scene's packets (copied whole, 640x360, or at half size, 320x180) are eye renders. Only a small
-                // perspective copy (a render-to-texture picture) keeps the game's camera; 2D passes over copies (the game's own post chain)
-                // keep identity in each eye.
-                const bool small_copy=copy_target && packet.texture_copy->source[2]<300;
-                facts.offscreen=copy_target && !packet.present && (!facts.perspective || small_copy);
-                facts.multiview=1;
                 int kind=lg_stereo_classify_draw(&facts);
                 if (kind==LG_STEREO_FILL && !world_drawn_) kind=LG_STEREO_HUD;   // HOTD4: full-screen 2D with no world yet is a 2D screen (menus); over a world, a fade
                 if (kind==LG_STEREO_WORLD && facts.perspective) world_drawn_=true;
@@ -3413,15 +3630,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // The aim reticle (and its wake) marks a place in the world: it stays on HOTD4's world-locked screen when the HUD follows the head.
                 if (kind==LG_STEREO_HUD && (draw.reticle || draw.late_aim || draw.wake)) kind=xr::LG_STEREO_HUD_AIM;
                 stereo_kind=kind; draw_offscreen=facts.offscreen;
+                if (post_dump) {   // UC_POST_DUMP: every draw's stereo class and blend (the HUD layer's question: which draws are separable)
+                    const auto b=gx::draw_bounds_ndc(draw);
+                    std::fprintf(stderr,"[post-class] draw %zu kind %d persp %d blend %u src %u dst %u logic %u cw %d aw %d depth %02X box %.2f,%.2f..%.2f,%.2f callsite %08X reticle %d layer %d idx %u\n",d,kind,int(facts.perspective),
+                                 unsigned(draw.blend.mode),unsigned(draw.blend.source),unsigned(draw.blend.destination),unsigned(draw.blend.logic),int(draw.blend.color_write),int(draw.blend.alpha_write),unsigned(info.key[68]&31),
+                                 b?(*b)[0]:9.f,b?(*b)[1]:9.f,b?(*b)[2]:9.f,b?(*b)[3]:9.f,draw.callsite,int(draw.reticle),int(draw.layer),info.index_count);
+                }
                 const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),kind);
                 float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*stereo_stride_);
-                for(int eye=0;eye<2;++eye) {   // Vulkan clip to Vulkan clip: C * M * inverse(C), C = (x, -y, (z+w)/2, w); rows for the shader
-                    const float* m=matrices.view_projection[eye];
-                    const auto gl=[&](int r,int c){return double(m[c*4+r]);};
-                    double g[4][4];   // M * inverse(C): inverse(C) maps Vulkan clip back to GL (y'=-y, z'=2z-w)
-                    for(int r=0;r<4;++r) { g[r][0]=gl(r,0); g[r][1]=-gl(r,1); g[r][2]=2*gl(r,2); g[r][3]=gl(r,3)-gl(r,2); }
-                    for(int c=0;c<4;++c) { block[eye*16+0*4+c]=float(g[0][c]); block[eye*16+1*4+c]=float(-g[1][c]); block[eye*16+2*4+c]=float(.5*(g[2][c]+g[3][c])); block[eye*16+3*4+c]=float(g[3][c]); }
-                }
+                stereo_eye_block(matrices,block);
                 static const bool probe_mono=std::getenv("UC_PROBE_MONO")!=nullptr;   // diagnostics: both eyes see the game's own clip space (no reprojection)
                 if (probe_mono) for(int eye=0;eye<2;++eye) for(int r=0;r<4;++r) for(int c=0;c<4;++c) block[eye*16+r*4+c]=r==c ? 1.f : 0.f;
                 push.motion=uint32_t(d);
@@ -3528,6 +3745,78 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     barrier(slot.command, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     *target.initialized=true;
     };
+    // A layer's pass (hud_layer.h): this packet's draws of that layer (which: 1 HUD, 2 glow) into its L and T, a slice per eye, at the
+    // layer's size; the first pass of a frame clears them (L = 0, T = 1). A HUD draw's eye transforms are carried into the layer's plane
+    // (hud_layer_block), a glow's are its own; their pipelines are the layer variant of their key (the two attachments, no depth).
+    auto record_layer=[&](HudLayer& layer, uint8_t which) {
+        if (std::find(hud_draw.begin(),hud_draw.end(),which)==hud_draw.end()) return;
+        const auto all=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; const auto any=VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT;
+        for (VkImage image:{layer.light,layer.transmit})
+            barrier(slot.command,image,layer.used ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,all,any,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo colors[2]{{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO},{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}};
+        for (int i=0;i<2;++i) {
+            colors[i].imageView=i ? layer.transmit_view : layer.light_view; colors[i].imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colors[i].loadOp=layer.used ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR; colors[i].storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+            for (int c=0;c<4;++c) colors[i].clearValue.color.float32[c]=i ? kHudTransmitClear : 0.f;
+        }
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea={{0,0},layer.extent}; rendering.layerCount=1; rendering.viewMask=0b11;
+        rendering.colorAttachmentCount=2; rendering.pColorAttachments=colors;
+        vkCmdBeginRendering(slot.command,&rendering);
+        if (set_shading_rate_) { const VkExtent2D one{1,1}; const VkFragmentShadingRateCombinerOpKHR keep[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR}; set_shading_rate_(slot.command,&one,keep); }
+        if (!static_depth_) { vkCmdSetDepthTestEnable(slot.command,VK_FALSE); vkCmdSetDepthWriteEnable(slot.command,VK_FALSE); vkCmdSetDepthCompareOp(slot.command,VK_COMPARE_OP_ALWAYS); }
+        vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32);
+        VkPipeline bound=VK_NULL_HANDLE; int bound_cull=-1;
+        for (size_t d=scene_draws; d<packet.draws.size(); ++d) {
+            if (hud_draw[d]!=which) continue;
+            const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d]; const auto& x=xform_draws[d];
+            auto key=info.key; key[0]|=kHudLayerKeyBit;
+            const auto choice=pipeline_for(key);
+            if (choice.pipeline!=bound) { vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,choice.pipeline); bound=choice.pipeline; ++pipeline_binds_; }
+            if (!static_depth_ && int(cull_mode(info.key))!=bound_cull) { vkCmdSetCullMode(slot.command,cull_mode(info.key)); bound_cull=int(cull_mode(info.key)); }
+            {   // the draw's own eye transforms (a HUD draw's carried into the layer's plane, hud_layer_block)
+                float* target=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+d*stereo_stride_);
+                if (which==1) {
+                    float block[32];
+                    stereo_eye_block(stereo_->transforms(gl_from_vulkan(draw.transforms->projection),LG_STEREO_HUD),block);
+                    hud_layer_block(layer.map,block,target);
+                } else {
+                    const auto facts=stereo_facts(d);
+                    stereo_eye_block(stereo_->transforms(gl_from_vulkan(draw.transforms->projection),lg_stereo_classify_draw(&facts)),target);
+                }
+            }
+            const uint32_t offsets[2]={draw_uniform_offset[d],uint32_t(d*stereo_stride_)};
+            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[draw_set[d]],2,offsets);
+            // the layer holds the HUD's viewport (layer.map.viewport) at its own size, its origin -1/12 guest pixel as efb_viewport's
+            const auto v=draw.state->viewport.value_or(std::array<float,6>{0,0,640,480,0,1});
+            const auto& hv=layer.map.viewport;
+            const float kx=layer.extent.width/hv[2], ky=layer.extent.height/hv[3];
+            const VkViewport viewport{(v[0]-1.f/12-hv[0])*kx,(v[1]-1.f/12-hv[1])*ky,v[2]*kx,v[3]*ky,v[4],v[5]};
+            VkRect2D scissor{{0,0},layer.extent};
+            if (draw.state->scissor) {   // in guest pixels, as the EFB's (record_pass)
+                const auto& sc=*draw.state->scissor;
+                const auto sx=std::clamp<int64_t>(std::llround((int64_t(sc[0])-hv[0])*kx),0,layer.extent.width), sy=std::clamp<int64_t>(std::llround((int64_t(sc[1])-hv[1])*ky),0,layer.extent.height);
+                const auto right=std::clamp<int64_t>(std::llround((int64_t(sc[0])+sc[2]-hv[0])*kx),sx,layer.extent.width), bottom=std::clamp<int64_t>(std::llround((int64_t(sc[1])+sc[3]-hv[1])*ky),sy,layer.extent.height);
+                scissor={{int32_t(sx),int32_t(sy)},{uint32_t(right-sx),uint32_t(bottom-sy)}};
+            }
+            vkCmdSetViewport(slot.command,0,1,&viewport); vkCmdSetScissor(slot.command,0,1,&scissor);
+            DrawPush push{draw.transforms->projection,x.attributes,x.word,x.positions,info.key[67],info.bank};
+            push.motion=0; push.viewport[0]=viewport.x; push.viewport[1]=viewport.y; push.viewport[2]=viewport.width; push.viewport[3]=viewport.height;
+            vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
+            vkCmdDrawIndexed(slot.command,info.index_count,1,x.first,0,0);
+            ++issued_draws_; ++hud_.draws;
+        }
+        vkCmdEndRendering(slot.command);
+        if (!layer.used && which==1) ++hud_.frames;
+        layer.used=true;
+        static const bool stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
+        static auto since=std::chrono::steady_clock::now();
+        if (stats && which==1 && std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
+            std::fprintf(stderr,"[hud-layer] 2 s: %llu frames, %llu draws into the layers (HUD %ux%u, glow %ux%u), %llu composited into the EFB\n",(unsigned long long)hud_.frames,(unsigned long long)hud_.draws,
+                         hud_.extent.width,hud_.extent.height,glow_.extent.width,glow_.extent.height,(unsigned long long)hud_.flushes);
+            hud_.frames=hud_.draws=hud_.flushes=0; since=std::chrono::steady_clock::now();
+        }
+    };
     // The shadow map: this packet's casters (mesh draws that write depth, in the scene, without an alpha cut-out) drawn from the light, in the packet's own command buffer.
     auto record_shadow=[&](size_t first, size_t last) {
         if (!shadow_fit_ || effects_.shadows==EffectLevel::off || !shadow_vertex_module_) return;
@@ -3600,6 +3889,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     };
     const bool scene_only=scene_phase_ && !upscale_here && !overlay_frame;   // the whole packet belongs to the scene: copy and clear act on the scene targets
     const bool writes_scene=scene_phase_ && !overlay_frame && (scene_draws || !scene_initialized_);   // overwrites the depth and vectors frame generation may still read
+    if ((hud_.used || glow_.used) && !overlay_frame && (!packet.draws.empty() || copy_target)) flush_hud_layer(slot.command);   // the HUD layer goes under what this packet draws or into its copy
     if (writes_scene) { record_pass(scene_target,0,scene_draws,true); record_shadow(0,scene_draws); record_rt(0,scene_draws); }
     if (upscale_here) {
         if (scene_draws || packet.present) scene_restore_copy_.reset();   // another draw changed the scene since the saved copy
@@ -3635,7 +3925,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     };
     const bool hudless_wanted=(dlss_generation_enabled() || (fsr_generation_enabled() && fsr_g_->active())) && hudless_[0] && scene_mode_ && !scene_phase_ && !hudless_taken_ && !overlay_frame;
     if (hudless_wanted && efb_initialized_ && hud_packet) take_hudless();
-    if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) record_pass(efb_target,scene_draws,packet.draws.size(),false);
+    if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
     if (hudless_wanted && !hudless_taken_ && packet.present) take_hudless();
     const PassTarget& active=scene_only ? scene_target : efb_target;
     if(copy_target) record_texture_copy(slot.command,active.color,active.extent,packet.texture_copy->source,*copy_target,VK_IMAGE_LAYOUT_UNDEFINED);
@@ -3652,6 +3942,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
 #else
     const bool xr_direct=false; (void)xr_via_slot;
 #endif
+    if ((hud_.used || glow_.used) && packet.present) {   // the layers: laid over the eyes by the screen pass (xr_direct), else into the EFB the present reads
+        if (!display || overlay_frame || packet.black_output) hud_.used=glow_.used=false;
+        else if (!xr_direct) flush_hud_layer(slot.command);
+    }
     if (packet.present && display && !overlay_frame) {
         const bool prompts=layers_==1 && !packet.prompts.empty() && !packet.black_output, menu=layers_==1 && bool(menu_build_);   // the headset has HOTD4's panel instead
         ui_layer=hdr_active_ && (prompts || menu);
@@ -3702,7 +3996,16 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const float u1=float(std::max<uint64_t>(uint64_t(u0)+1,uint64_t(display_source[0]+display_source[2])*efb_extent_.width/640));
         const float v1=float(std::max<uint64_t>(uint64_t(v0)+1,uint64_t(display_source[1]+display_source[3])*efb_extent_.height/480));
         const float w=float(efb_extent_.width), h=float(efb_extent_.height);
-        xr_->record(slot.command, efb_, efb_view_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {u0/w, v0/h, (u1-u0)/w, (v1-v0)/h}, fovea_level_ ? fovea_eye_.view : VK_NULL_HANDLE, fovea_texel_);
+        XrHudLayer hud;
+        for (HudLayer* layer:{&hud_,&glow_}) if (layer->used)
+            for (VkImage image:{layer->light,layer->transmit}) barrier(slot.command,image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if (hud_.used) { hud.light=hud_.light_view; hud.transmit=hud_.transmit_view; hud.rows=hud_.map.rows; }
+        if (glow_.used) {   // the glow layer's map is affine and the same in both eyes
+            hud.glow_light=glow_.light_view; hud.glow_transmit=glow_.transmit_view;
+            hud.glow={glow_.map.rows[0][0][0],glow_.map.rows[0][0][2],glow_.map.rows[0][1][1],glow_.map.rows[0][1][2]};
+        }
+        xr_->record(slot.command, efb_, efb_view_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {u0/w, v0/h, (u1-u0)/w, (v1-v0)/h}, fovea_level_ ? fovea_eye_.view : VK_NULL_HANDLE, fovea_texel_, (hud_.used || glow_.used) ? &hud : nullptr);
+        hud_.used=glow_.used=false;
     }
 #endif
     if (hold) {   // keep the finished picture (without the reticle) and the reticle draws that belong on it: the overlay frame after this one presents them
@@ -3934,6 +4237,7 @@ void VulkanRenderer::shutdown() {
         if (efb_memory_) vkFreeMemory(device,efb_memory_,nullptr);
         efb_view_=VK_NULL_HANDLE; efb_=VK_NULL_HANDLE; efb_memory_=VK_NULL_HANDLE; efb_initialized_=false; efb_extent_={};
         destroy_fovea();
+        destroy_hud_layer();
         dlss_g_.reset();
         fsr_g_.reset();   // its swapchain context was emptied by retire_images; the contexts go before the device
         for (int i=0;i<2;++i) {

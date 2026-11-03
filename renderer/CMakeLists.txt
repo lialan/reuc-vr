@@ -255,6 +255,18 @@ foreach(stage vert frag)
     COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/xr_screen.slang ${xr_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/xr_screen.${stage}.spv
     DEPENDS shaders/xr_screen.slang VERBATIM)
 endforeach()
+# The headset's HUD layer composited into the EFB (hud_layer.h): multiview, both eyes.
+foreach(stage vert frag)
+  if(stage STREQUAL "vert")
+    set(hud_args -entry vertexMain -stage vertex)
+  else()
+    set(hud_args -entry fragmentMain -stage fragment)
+  endif()
+  add_custom_command(OUTPUT ${shader_dir}/hud_layer.${stage}.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${shader_dir}
+    COMMAND ${UC_SLANGC} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/hud_layer.slang ${hud_args} -target spirv -profile spirv_1_5 -fvk-use-entrypoint-name -o ${shader_dir}/hud_layer.${stage}.spv
+    DEPENDS shaders/hud_layer.slang VERBATIM)
+endforeach()
 # HOTD4 VR's overlay shaders (GLSL, unchanged): glslangValidator, as lindberghrecomp builds them.
 find_program(UC_GLSLANG glslangValidator)
 # The headset's TEV fragment modules specialized at build time for the known pipeline keys (tools/fold_tev_shaders.py): the Quest's driver
@@ -280,7 +292,7 @@ if(UC_GLSLANG)
 elseif(UC_OPENXR)
   message(FATAL_ERROR "the headset build needs glslangValidator for HOTD4's overlay shaders (brew install glslang)")
 endif()
-set(UC_SHADER_FILES ${shader_dir}/smoke.stereo.nobank.vert.spv ${shader_dir}/smoke.stereo.xform.comp.spv ${shader_dir}/smoke.stereo.xform.vert.spv ${shader_dir}/smoke.stereo.probe.vert.spv ${shader_dir}/smoke.stereo.nobank.noinv.vert.spv ${shader_dir}/smoke.stereo.probe.frag.spv ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motion.early.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
+set(UC_SHADER_FILES ${shader_dir}/smoke.stereo.nobank.vert.spv ${shader_dir}/smoke.stereo.xform.comp.spv ${shader_dir}/smoke.stereo.xform.vert.spv ${shader_dir}/smoke.stereo.probe.vert.spv ${shader_dir}/smoke.stereo.nobank.noinv.vert.spv ${shader_dir}/smoke.stereo.probe.frag.spv ${shader_dir}/smoke.early.frag.spv ${shader_dir}/smoke.motion.early.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv ${UC_XR_OVERLAY_SPV} ${shader_dir}/smoke.stereo.vert.spv ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.uber.spv ${shader_dir}/xr_screen.vert.spv ${shader_dir}/xr_screen.frag.spv ${shader_dir}/hud_layer.vert.spv ${shader_dir}/hud_layer.frag.spv ${shader_dir}/hdr.vert.spv ${shader_dir}/hdr.frag.spv ${shader_dir}/smoke.vert.spv ${shader_dir}/smoke.frag.spv ${shader_dir}/smoke.uber.spv
   ${shader_dir}/smoke.motion.vert.spv ${shader_dir}/smoke.motion.frag.spv ${shader_dir}/smoke.motion.uber.spv ${shader_dir}/rcas.comp.spv
   ${shader_dir}/smaa.edges.spv ${shader_dir}/smaa.weights.spv ${shader_dir}/smaa.blend.spv
   ${shader_dir}/smoke.shadow.vert.spv ${shader_dir}/gtao.ao.spv ${shader_dir}/gtao.denoise.spv ${shader_dir}/gtao.contact.spv ${shader_dir}/gtao.composite.spv

@@ -26,8 +26,10 @@ void vk(VkResult result, const char* what) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("XR: ") + what + " failed: VkResult " + std::to_string(result));
 }
 // The screen pass's push constants: per eye the four columns of the Vulkan clip transform of the quad -1..1.
-struct EyeConstants { float columns[2][16]; float rect[4]; };   // rect: the picture's part the eyes show (u, v, width, height in texture coordinates)
-static_assert(sizeof(EyeConstants) == 144);
+// hud: the HUD layer's homography rows per eye (xr_screen.slang), hud[0][2][3] = 1 when there is one; the glow layer's affine map in
+// hud[0][0][3], hud[0][1][3], hud[1][0][3], hud[1][1][3], hud[1][2][3] = 1 when there is one.
+struct EyeConstants { float columns[2][16]; float rect[4]; float hud[2][3][4]; };   // rect: the picture's part the eyes show (u, v, width, height in texture coordinates)
+static_assert(sizeof(EyeConstants) == 240);
 // UC_XR_TIMING=1: where the render thread waits on the runtime, every 300 frames (LINDBERGH_XR_TIMING in HOTD4).
 void xr_time(int what, std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     static const bool on = [] { const auto* v = std::getenv("UC_XR_TIMING"); return v && *v == '1'; }();
@@ -264,8 +266,12 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vk(vkCreateSampler(device_, &sampler, nullptr, &sampler_), "sampler");
     const VkDescriptorSetLayoutBinding bindings[] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-                                                     {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &sampler_}};
-    VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set.bindingCount = 2; set.pBindings = bindings;
+                                                     {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &sampler_},
+                                                     {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},    // the HUD layer's L
+                                                     {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},    // and T
+                                                     {4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},    // the glow layer's L
+                                                     {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};   // and T
+    VkDescriptorSetLayoutCreateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set.bindingCount = 6; set.pBindings = bindings;
     vk(vkCreateDescriptorSetLayout(device_, &set, nullptr, &set_layout_), "descriptor layout");
     const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EyeConstants)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout_; layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
@@ -296,7 +302,7 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     rate.fragmentSize = {1, 1}; rate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
     if (fovea_support_) { rate.pNext = rendering.pNext; rendering.pNext = &rate; pipeline.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR; }
     vk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_), "screen pipeline");
-    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32}, {VK_DESCRIPTOR_TYPE_SAMPLER, 32}};
+    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 160}, {VK_DESCRIPTOR_TYPE_SAMPLER, 32}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets = 32; pool.poolSizeCount = 2; pool.pPoolSizes = sizes;
     vk(vkCreateDescriptorPool(device_, &pool, nullptr, &pool_), "descriptor pool");
 }
@@ -440,19 +446,29 @@ void XrCompositor::observe(const gx::Projection& projection) {
     lens_seen_ = true;
 }
 
-void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect, VkImageView fovea, VkExtent2D texel) {
+void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect, VkImageView fovea, VkExtent2D texel,
+                          const XrHudLayer* hud) {
     if (!acquired_) throw std::logic_error("XR: record without an acquired eye array");
     VkDescriptorSet set = VK_NULL_HANDLE;
-    for (const auto& bound : bound_) if (bound.view == picture_view) set = bound.set;
+    // Without a HUD layer, bindings 2 and 3 hold the picture (any image of the declared kind: the shader does not read them then).
+    const VkImageView light = hud && hud->light ? hud->light : picture_view, transmit = hud && hud->transmit ? hud->transmit : picture_view;
+    const VkImageView glow_light = hud && hud->glow_light ? hud->glow_light : picture_view, glow_transmit = hud && hud->glow_transmit ? hud->glow_transmit : picture_view;
+    for (const auto& bound : bound_)
+        if (bound.view == picture_view && bound.light == light && bound.transmit == transmit && bound.glow_light == glow_light && bound.glow_transmit == glow_transmit) set = bound.set;
     if (!set) {
         if (bound_.size() >= 32) { vk(vkResetDescriptorPool(device_, pool_, 0), "descriptor pool reset"); bound_.clear(); }
         VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool = pool_; allocate.descriptorSetCount = 1; allocate.pSetLayouts = &set_layout_;
         vk(vkAllocateDescriptorSets(device_, &allocate, &set), "descriptor set");
-        const VkDescriptorImageInfo image{VK_NULL_HANDLE, picture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; write.dstSet = set; write.dstBinding = 0; write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; write.pImageInfo = &image;
-        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
-        bound_.push_back({picture_view, set});
+        const VkDescriptorImageInfo images[5]{{VK_NULL_HANDLE, picture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {VK_NULL_HANDLE, light, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                              {VK_NULL_HANDLE, transmit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {VK_NULL_HANDLE, glow_light, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                              {VK_NULL_HANDLE, glow_transmit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet writes[5]{};
+        for (uint32_t i = 0; i < 5; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = set; writes[i].dstBinding = i == 0 ? 0 : i + 1; writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[i].pImageInfo = &images[i];
+        }
+        vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+        bound_.push_back({picture_view, light, transmit, glow_light, glow_transmit, set});
     }
     auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access) {
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -498,6 +514,14 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     EyeConstants constants{};
     for (int eye = 0; eye < 2; ++eye) { const auto unit = xr::identity(); std::memcpy(constants.columns[eye], unit.data(), sizeof constants.columns[eye]); }
     std::copy(rect.begin(), rect.end(), constants.rect);
+    if (hud && hud->light) {
+        for (int eye = 0; eye < 2; ++eye) for (int row = 0; row < 3; ++row) for (int c = 0; c < 3; ++c) constants.hud[eye][row][c] = hud->rows[eye][row][c];
+        constants.hud[0][2][3] = 1;
+    }
+    if (hud && hud->glow_light) {
+        constants.hud[0][0][3] = hud->glow[0]; constants.hud[0][1][3] = hud->glow[1]; constants.hud[1][0][3] = hud->glow[2]; constants.hud[1][1][3] = hud->glow[3];
+        constants.hud[1][2][3] = 1;
+    }
     vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof constants, &constants);
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());

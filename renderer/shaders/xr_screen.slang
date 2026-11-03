@@ -2,10 +2,16 @@
 // already drawn in its eye's space (the renderer's per-draw reprojection: world per eye, HUD on HOTD4's screen plane); the quad covers the
 // eye through the transform pushed for it (GL clip convention, column-major), converted to Vulkan clip space afterwards as HOTD4's shader
 // wrapper does: Y flipped, depth -w..w to 0..w.
-struct Eyes { float4 columns[2][4]; float4 rect; };   // rect: the part of the picture shown (u, v, width, height): the whole slot image, or the EFB's displayed region
+// hud: the renderer's HUD layer (hud_layer.h) per eye, the rows of the homography from the picture's texture coordinate to the layer's;
+// hud[0][2].w = 1 when this frame has one (eye = picture * T + L), 0 otherwise (bindings 2 and 3 then hold any image and are not read).
+struct Eyes { float4 columns[2][4]; float4 rect; float4 hud[2][3]; };   // rect: the part of the picture shown (u, v, width, height): the whole slot image, or the EFB's displayed region
 [[vk::push_constant]] ConstantBuffer<Eyes> eyes;
 [[vk::binding(0, 0)]] Texture2DArray picture;
 [[vk::binding(1, 0)]] SamplerState linear;
+[[vk::binding(2, 0)]] Texture2DArray hudLight;      // L: what the HUD adds (a layer per eye)
+[[vk::binding(3, 0)]] Texture2DArray hudTransmit;   // T: what the picture behind it keeps, stored at half scale (128/255 = 1)
+[[vk::binding(4, 0)]] Texture2DArray glowLight;     // the glow layer under the HUD: the same pair, an affine map (hud[*][*].w, hud[1][2].w = 1 when there)
+[[vk::binding(5, 0)]] Texture2DArray glowTransmit;
 
 struct VOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 
@@ -49,8 +55,23 @@ float3 fxaa(float2 uv, float layer) {
     return (lb < lmin || lb > lmax) ? a : b;
 }
 
+float3 hud(float3 color, float2 uv, uint view) {
+    if (eyes.hud[1][2].w != 0.0) {
+        const float2 g = float2(eyes.hud[0][0].w * uv.x + eyes.hud[0][1].w, eyes.hud[1][0].w * uv.y + eyes.hud[1][1].w);
+        if (all(g >= 0.0) && all(g <= 1.0))
+            color = saturate(color * glowTransmit.SampleLevel(linear, float3(g, view), 0).rgb * (255.0 / 128.0) + glowLight.SampleLevel(linear, float3(g, view), 0).rgb);
+    }
+    if (eyes.hud[0][2].w == 0.0) return color;
+    const float3 p = float3(uv, 1.0);
+    const float3 q = float3(dot(eyes.hud[view][0].xyz, p), dot(eyes.hud[view][1].xyz, p), dot(eyes.hud[view][2].xyz, p));
+    const float2 h = q.xy / q.z;
+    if (q.z <= 0.0 || any(h < 0.0) || any(h > 1.0)) return color;
+    const float3 light = hudLight.SampleLevel(linear, float3(h, view), 0).rgb, transmit = hudTransmit.SampleLevel(linear, float3(h, view), 0).rgb * (255.0 / 128.0);
+    return saturate(color * transmit + light);
+}
+
 [shader("fragment")]
 float4 fragmentMain(VOut i, uint view : SV_ViewID) : SV_Target0 {
-    if (fxaaOn != 0) return float4(fxaa(i.uv, float(view)), 1);
-    return float4(picture.Sample(linear, float3(i.uv, float(view))).rgb, 1);
+    if (fxaaOn != 0) return float4(hud(fxaa(i.uv, float(view)), i.uv, view), 1);
+    return float4(hud(picture.Sample(linear, float3(i.uv, float(view))).rgb, i.uv, view), 1);
 }

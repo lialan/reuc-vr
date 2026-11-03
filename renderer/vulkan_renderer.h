@@ -4,6 +4,7 @@
 #include "gx_packets.h"
 #include "render_pixels.h"
 #include "hdr_pass.h"
+#include "hud_layer.h"
 #include "pipeline_keys.h"
 #include "prompt_overlay.h"
 #include "menu_overlay.h"
@@ -403,6 +404,26 @@ private:
     bool update_fovea_map(FoveaMap& map, VkExtent2D extent, const std::array<float,4>& shown, const std::array<std::array<float,4>,2>& tangents, int level, uint32_t largest);
     void destroy_fovea();
     void destroy_fovea_map(FoveaMap& map);
+    // The headset's HUD layer (hud_layer.h): the frame's 2D HUD draws in a two-layer target of the HUD viewport * k (L: what they add,
+    // T: what the scene behind keeps), laid over the eyes by the screen pass, or composited into the EFB (flush_hud_layer) before anything
+    // else reads or draws into it. UC_NO_HUD_LAYER=1: the HUD is drawn into the EFB as before.
+    struct HudLayer {
+        VkImage light=VK_NULL_HANDLE, transmit=VK_NULL_HANDLE; VkDeviceMemory light_memory=VK_NULL_HANDLE, transmit_memory=VK_NULL_HANDLE;
+        VkImageView light_view=VK_NULL_HANDLE, transmit_view=VK_NULL_HANDLE; VkExtent2D extent{};
+        bool used=false;            // this frame drew into it (cleared at its first pass of the frame), not yet laid over the eyes
+        HudLayerMap map{};          // where it lies in each eye (valid while used)
+        VkPipeline flush[2]{};      // the composite into the EFB: multiply by T, then add L
+        VkPipelineLayout layout=VK_NULL_HANDLE; VkDescriptorSetLayout set_layout=VK_NULL_HANDLE; VkDescriptorPool pool=VK_NULL_HANDLE; VkDescriptorSet set=VK_NULL_HANDLE;
+        VkSampler sampler=VK_NULL_HANDLE; VkShaderModule vertex=VK_NULL_HANDLE, fragment=VK_NULL_HANDLE;
+        uint64_t frames=0, draws=0, flushes=0;   // UC_GPU_PACKETS statistics
+    };
+    HudLayer hud_, glow_;   // glow_: the glow layer (hud_layer.h hud_overlay_map), under the HUD; the composite pipelines live in hud_
+    bool hud_layer_wanted() const;
+    bool crosshair_hidden() const;
+    void ensure_hud_layer(HudLayer& layer, VkExtent2D extent);
+    void destroy_hud_layer();
+    void flush_hud_layer(VkCommandBuffer command);   // both layers, the glow first
+    void flush_layer(VkCommandBuffer command, HudLayer& layer);
     int wanted_fovea_level() const;
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
     const char* hdr_status_=nullptr;   // the last logged mode (a string literal), printed when it changes

@@ -325,6 +325,11 @@ struct Targets {
 #else
     float4 color : SV_Target0;
 #endif
+#ifdef STEREO
+    // The headset's HUD layer (hud_layer.h): the same colour for its second attachment, T, whose blend factors keep what the scene behind
+    // the draw keeps. Pipelines of the EFB have no attachment there: the write is discarded.
+    float4 transmit : SV_Target1;
+#endif
 #if defined(MOTION) && !defined(UC_LOGIC_COLOR_ONLY)
     float4 motion : SV_Target1;   // rg: previous minus current position in target pixels (unjittered); written only by depth-writing draws
     float4 gbuffer : SV_Target2;  // normal, fog and flags (gbuffer.slang); written only by depth-writing draws, and bound only while an effect reads it
@@ -372,6 +377,9 @@ Targets fragmentMain(Output input) {
     targets.color = uint4(round(saturate(shadeFragment(input))*255.0));
 #else
     targets.color = shadeFragment(input);
+#endif
+#ifdef STEREO
+    targets.transmit = targets.color;
 #endif
 #if defined(MOTION) && !defined(UC_LOGIC_COLOR_ONLY)
     targets.gbuffer = gbufferTexel(input);
