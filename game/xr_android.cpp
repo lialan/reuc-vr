@@ -27,6 +27,9 @@ std::unique_ptr<XrCompositor> make_android_xr() {
     config.width = uint32_t(settings.width); config.height = uint32_t(settings.resolution);   // HOTD4: resolution is the eye height
     config.refresh = float(settings.refresh);
     config.foveation_level = settings.foveation;
+    // UC_CPU_BOOST=1: the runtime's boost CPU level (2.36 GHz on the Quest 3's fast cores) instead of sustained high (2.21 GHz); the
+    // runtime may throttle it when the headset heats up. For measurements.
+    if (const char* boost = std::getenv("UC_CPU_BOOST")) config.cpu_boost = *boost == '1';
     config.stereo.scale = settings.scale; config.stereo.screen = settings.screen; config.stereo.hud_pitch = float(settings.hud_pitch);
     config.stereo.hud_fit = true;   // gameplay HUD at the display's edges, following the head (StereoScene); menus keep HOTD4's screen
     auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
