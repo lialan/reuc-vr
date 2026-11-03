@@ -122,6 +122,7 @@ private:
     std::vector<EventRecord> ext_q_;
     std::mutex baton_m_, ext_m_, done_m_, join_m_;
     std::condition_variable ext_cv_, done_cv_;
+    int ext_waiters_ = 0;   // threads waiting on ext_cv_ (under ext_m_): post_external notifies only then (a notify is a system call on Android)
     std::condition_variable rewind_cv_;
     std::vector<void*> handles_;
     Thread* running_ = nullptr;

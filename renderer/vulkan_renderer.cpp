@@ -804,6 +804,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     return key;
 }
 VulkanRenderer::PipelineChoice VulkanRenderer::pipeline_for(const PipelineKey& requested) {
+    if (last_pipeline_ && requested==last_key_) return {last_pipeline_,false};
     const auto key=static_depth_ ? requested : static_key(requested);   // static_depth_: cull and depth state baked into the pipeline
     const auto fixed=uber_key(key);
     PipelineChoice choice;
@@ -811,7 +812,7 @@ VulkanRenderer::PipelineChoice VulkanRenderer::pipeline_for(const PipelineKey& r
     {
         std::lock_guard lock(pipelines_mutex_);
         if (!uber_only_) {
-            if (auto found=pipelines_.find(key); found!=pipelines_.end()) return {found->second,false};
+            if (auto found=pipelines_.find(key); found!=pipelines_.end()) { last_key_=requested; last_pipeline_=found->second; return {found->second,false}; }
             fresh=known_keys_.insert(key).second;
         }
         if (auto found=uber_pipelines_.find(fixed); found!=uber_pipelines_.end()) {
@@ -2194,8 +2195,12 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     std::vector<uint32_t> draw_record(rt_records ? scene_draws : 0,kRtNoRecord);   // empty with RT off: read only when rt_records
     std::vector<RtMaterialRecord> records;
     std::vector<const gx::DrawUniform*> record_uniforms;
-    std::unordered_set<const gx::TexturePixels*> used_textures;
-    for(const auto& draw:packet.draws) for(size_t map=0;map<8;++map) used_textures.insert(draw_texture(draw,map).get());
+    std::unordered_set<const gx::TexturePixels*> used_textures;   // only non-null textures are ever looked up; neighbouring draws mostly repeat theirs
+    used_textures.reserve(64);
+    {
+        const gx::TexturePixels* last=nullptr;
+        for(const auto& draw:packet.draws) for(size_t map=0;map<8;++map) if(const auto* used=draw_texture(draw,map).get(); used && used!=last) { used_textures.insert(used); last=used; }
+    }
     // This slot's fence is retired. A texture's GPU image is shared by all slots; the renderer holds one reference to its pixels, so more
     // belong to the CPU cache or queued packets, which retain it across passes.
     for (auto it=slot.textures.begin();it!=slot.textures.end();) {
@@ -3746,7 +3751,7 @@ void VulkanRenderer::shutdown() {
         stop_workers();
         for (auto [key,pipeline]:pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
         for (auto [key,pipeline]:uber_pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
-        pipelines_.clear(); uber_pipelines_.clear();
+        pipelines_.clear(); uber_pipelines_.clear(); last_pipeline_=VK_NULL_HANDLE;
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();

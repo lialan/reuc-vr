@@ -65,6 +65,9 @@ private:
     std::mutex mutex_;
     std::condition_variable space_;
     std::condition_variable ready_;
+    // Threads blocked on each condition (under mutex_): a notify is a system call on Android even with nobody waiting, and the guest seals
+    // ~25 packets a frame while the renderer completes as many.
+    int space_waiters_ = 0, ready_waiters_ = 0;
     std::deque<std::unique_ptr<const FramePacket>> queued_;
     std::map<uint64_t, bool> outstanding_;
     std::map<uint64_t, std::chrono::steady_clock::time_point> frames_in_flight_;   // unfinished presenting packets and when they were sealed

@@ -23,8 +23,12 @@ inline uint32_t watch_stamp() { return write_epoch++; }
 inline bool written_since(uint32_t address, size_t size, uint32_t stamp) {
     if (!size) return false;
     const uint64_t first = (address & 0x3FFFFFFFu) >> 12, last = ((address & 0x3FFFFFFFu) + uint64_t(size) - 1) >> 12;
-    for (uint64_t page = first; page <= last; ++page) if (page >= kWatchPages || page_epoch[page] > stamp) return true;
-    return false;
+    if (last >= kWatchPages) return true;
+    // The newest epoch of the range's pages, without an early exit: a texture or vertex array spans dozens of pages, and a plain maximum is
+    // vector code; every caller is checking a range nothing wrote to.
+    uint32_t newest = 0;
+    for (uint64_t page = first; page <= last; ++page) newest = newest > page_epoch[page] ? newest : page_epoch[page];
+    return newest > stamp;
 }
 // The epoch counter is 32 bit; callers drop their stamps and call this long before it wraps.
 inline bool watch_exhausted() { return write_epoch > 0xF0000000u; }

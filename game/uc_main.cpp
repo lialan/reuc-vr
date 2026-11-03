@@ -818,7 +818,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             progressed = true;
             // GPU slots retain immutable inputs until their fences complete; detached GX already completed logically.
             // Offline real-time play releases GX at submission; deterministic playback retains fence completion.
-            static const bool finish_at_submit=(!deterministic || network) && !std::getenv("UC_FINISH_AT_GPU");
+            // UC_FINISH_AT_SUBMIT=1 (diagnostics): a deterministic replay releases at submission too, as live play and network play do (the guest
+            // sees the same events either way); the replay then measures guest and render-thread time without the wait for the GPU's completion.
+            static const bool finish_at_submit=((!deterministic || network) && !std::getenv("UC_FINISH_AT_GPU")) || std::getenv("UC_FINISH_AT_SUBMIT");
             if (finish_at_submit && !packets.detached()) uc::gx_completed(pending_serial);
             uint64_t shown_serial=pending_serial;   // what a debug capture reads: with the reticle layer, the overlay frame that presents this packet's picture
             if (network && renderer.reticle_layer_ready() && !renderer.held_presented() && renderer.render_overlay(render_serial+1)) {
@@ -1091,6 +1093,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         }
         if(test_server) {
             const auto state=uc::test_state_latest();
+            const auto make_frame_json=[&]{   // built only when the server sends it (a new frame or a state request), not on every loop iteration
             auto frame_json=uc::test_frame_json(state,uc::clock_speed(),last_render_ms,renderer.presentation_count(),uc::vi_stats().retraces,test_pipes->dropped());
             frame_json.pop_back(); frame_json+=std::string(",\"menu_open\":")+(host_keys.menu_open ? "true" : "false")+",\"paused\":"+(host_keys.paused ? "true" : "false")
                 +",\"upscaler\":\""+std::string(uc::upscaler_name(renderer.active_upscaler()))+"\",\"frame_generation\":"+(renderer.frame_generation_active() ? "true" : "false")
@@ -1100,7 +1103,8 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 +",\"network_waiting\":"+(network_wait_screen ? "true" : "false")
                 +",\"sample_time_ns\":"+std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())
                 +",\"fps_limit\":"+std::to_string((live_settings ? live_settings->options().fps_limit : options.fps_limit).value_or(240))+"}";
-            const auto pumped=test_server->pump(state.frame,frame_json);
+            return frame_json; };
+            const auto pumped=test_server->pump(state.frame,uc::TestServer::FrameJson(make_frame_json));
             debug_capture_requested|=pumped.capture; draws_wanted|=pumped.draws;
             if (!menu_click_events.empty() && host_keys.menu_open && renderer.presentation_count()!=menu_click_presents) {   // one event per presented frame: the menu needs the hover of a frame before the press
                 menu_click_presents=renderer.presentation_count(); renderer.menu_event(menu_click_events.front()); menu_click_events.pop_front();
