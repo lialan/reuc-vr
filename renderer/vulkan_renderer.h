@@ -190,7 +190,7 @@ private:
     std::function<std::array<float,2>(double)> aim_history_;
     std::atomic<double> wake_seconds_{0};
     std::atomic<uint64_t> late_aim_draws_{0};
-    uint64_t merged_draws_=0, issued_draws_=0, set_binds_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
+    uint64_t merged_draws_=0, issued_draws_=0, set_binds_=0, pipeline_binds_=0, grouped_changes_=0, opaque_draws_=0;   // the pre-pass's draw merging (UC_GPU_PACKETS prints them)
     struct Buffer { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; VkDeviceSize size = 0; };
     struct Texture {
         VkImage image=VK_NULL_HANDLE;
@@ -261,6 +261,7 @@ private:
     // A pipeline for a draw: the specialized one when compiled, else the ubershader variant of the same fixed state (see queue_pipeline).
     struct PipelineChoice { VkPipeline pipeline=VK_NULL_HANDLE; bool uber=false; };
     PipelineKey pipeline_key(const gx::DrawPacket& draw,bool alpha_pass=false) const;
+    bool fused_destination_alpha(const gx::DrawPacket& draw) const;   // the headset: colour and destination alpha in one draw
     PipelineChoice pipeline_for(const PipelineKey& key);
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early);   // tools/fold_tev_shaders.py's module for these constants, or null

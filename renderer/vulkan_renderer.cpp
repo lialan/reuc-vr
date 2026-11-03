@@ -682,10 +682,23 @@ void VulkanRenderer::retire_textures(Slot& slot) {
     slot.textures.clear();   // the last slot to drop a texture destroys it
     slot.copy_sources.clear();
 }
+// GX destination alpha (pixel[2] bit 8): the EFB's alpha gets a constant instead of the computed alpha. The renderer draws such a draw
+// twice: colour with the computed alpha (blending may read it), then the constant alpha alone. Without blending the computed alpha is
+// read by nothing but the alpha test (which runs before the replacement in the shader), so the headset draws it once: colour and
+// the constant alpha together (key word 67 = destination alpha pass). Half the draws and program switches of the main scene, whose
+// draws almost all have destination alpha; the same picture (alpha is also written where a LESS-tested second pass failed before).
+bool VulkanRenderer::fused_destination_alpha(const gx::DrawPacket& draw) const {
+    if (layers_<2 || !(draw.uniforms->pixel[2]&256) || !draw.blend.alpha_write) return false;
+    const auto depth=draw.uniforms->pixel[1]&31;
+    if (depth&1 && ((depth>>1)&7)==0) return false;   // depth test NEVER: nothing is drawn
+    return draw.blend.mode==0 || (draw.blend.mode==2 && draw.blend.logic==3);   // no blending (logic COPY is a plain write)
+}
+static bool fuse_off() { static const bool off=std::getenv("UC_NO_FUSED_ALPHA")!=nullptr; return off; }
 PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_pass) const {
     auto blend=draw.blend;
+    const bool fused=!alpha_pass && !fuse_off() && fused_destination_alpha(draw);
     if(alpha_pass) blend={0,1,0,3,false,true};
-    else if(draw.uniforms->pixel[2]&256) blend.alpha_write=false;
+    else if((draw.uniforms->pixel[2]&256) && !fused) blend.alpha_write=false;
     if (blend.mode>3 || blend.source>7 || blend.destination>7 || blend.logic>15) throw std::invalid_argument("invalid native blend state");
     if (blend.mode==2 && !logic_ops_) {
         // No logicOp on this GPU (MoltenVK: Metal has none). The ops with a blend equivalent are drawn exactly: CLEAR (the only one RBUE08
@@ -719,7 +732,7 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
     const auto& material=draw.material;
     if (material.stages>16) throw std::invalid_argument("native TEV stage count exceeds16");
     key[1]=material.stages;
-    key[67]=alpha_pass;
+    key[67]=alpha_pass || fused;
     key[68]=draw.uniforms->pixel[1]&31;
     if(alpha_pass) {
         if((key[68]&17)==17) key[68]=5; // compare equal to the first pass's depth
@@ -2560,9 +2573,33 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 last_drawn = d;
             }
             distinct += pipelines.size();
+            {   // how many pipeline changes would remain if the runs of order-free draws (opaque: no blending, no alpha test, depth tested
+                // LESS/LEQUAL and written) were grouped by pipeline: per run, its distinct pipelines
+                static uint64_t opaque = 0;
+                std::set<VkPipeline> segment; VkPipeline previous = VK_NULL_HANDLE; uint64_t changes = 0;
+                for (size_t d = 0; d < gpu_draws.size(); ++d) {
+                    const auto& info = gpu_draws[d];
+                    if (!info.index_count) continue;
+                    const auto& k = info.key; const uint32_t compare = (k[68] >> 1) & 7;
+                    const bool free = (k[0] & 3) == 0 && !((k[0] >> 16) & 1) && (k[68] & 1) && ((k[68] >> 4) & 1) && (compare == VK_COMPARE_OP_LESS || compare == VK_COMPARE_OP_LESS_OR_EQUAL) && !(packet.draws[d].uniforms->pixel[2] & 256);
+                    static uint64_t why[6]{}; static auto why_since = std::chrono::steady_clock::now();
+                    why[0] += (k[0] & 3) != 0; why[1] += (k[0] >> 16) & 1; why[2] += !(k[68] & 1); why[3] += !((k[68] >> 4) & 1); why[4] += !(compare == VK_COMPARE_OP_LESS || compare == VK_COMPARE_OP_LESS_OR_EQUAL); why[5] += (packet.draws[d].uniforms->pixel[2] & 256) != 0;
+                    if (std::chrono::steady_clock::now() - why_since > std::chrono::seconds(2)) {
+                        std::fprintf(stderr, "[gpu-packets] scene draws not order-free: blending %llu, alpha test %llu, no depth test %llu, no depth write %llu, compare %llu, destination alpha %llu\n",
+                                     (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3], (unsigned long long)why[4], (unsigned long long)why[5]);
+                        std::memset(why, 0, sizeof why); why_since = std::chrono::steady_clock::now();
+                    }
+                    if (free) { opaque++; if (!segment.count(info.choice.pipeline)) { segment.insert(info.choice.pipeline); ++changes; } previous = VK_NULL_HANDLE; continue; }
+                    segment.clear();
+                    changes += info.choice.pipeline != previous; previous = info.choice.pipeline;
+                }
+                grouped_changes_ += changes; opaque_draws_ += opaque; opaque = 0;
+            }
             ++packets;
             if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
                 const double p = double(packets);
+                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f order-free (opaque) draws; grouped by pipeline in their runs %.0f pipeline changes would remain\n", opaque_draws_ / p, grouped_changes_ / p);
+                opaque_draws_ = grouped_changes_ = 0;
                 std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets), %.0f draws (%.0f meshes), %.0f vertices, %.0f pipelines, %.0f pipeline changes, %.0f uniform changes, %.0f texture changes, %.0f projection changes, %.0f runs of mergeable draws\n", double(indices) / p, (unsigned long long)packets,
                              drawn / p, meshes / p, vertices / p, distinct / p, switches / p, uniform_changes / p, texture_changes / p, projection_changes / p, (runs + packets) / p);
                 indices = packets = drawn = vertices = switches = distinct = meshes = uniform_changes = texture_changes = projection_changes = runs = 0; since = std::chrono::steady_clock::now();
@@ -2842,7 +2879,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         VkPipeline bound_pipeline=VK_NULL_HANDLE; VkViewport bound_viewport=viewport; VkRect2D bound_scissor=scissor;
         const auto bind_pipeline=[&](VkPipeline pipeline) {
             if (pipeline==bound_pipeline && !no_dedup) return;
-            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); bound_pipeline=pipeline;
+            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); bound_pipeline=pipeline; ++pipeline_binds_;
         };
         const auto set_draw_state=[&](const PipelineKey& key) {
             if (static_depth_) return;   // in the pipeline
@@ -2889,7 +2926,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdDrawIndexed(slot.command,run.count,1,run.first,0,0);
             ++issued_draws_;
             const auto depth=draw.uniforms->pixel[1]&31;
-            if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0)) {   // as below: destination alpha after RGB blending
+            if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0) && (fuse_off() || !fused_destination_alpha(draw))) {   // as below: destination alpha after RGB blending
                 const auto alpha_key=pipeline_key(draw,true);
                 const auto alpha=pipeline_for(alpha_key);
                 bind_pipeline(alpha.pipeline);
@@ -2952,7 +2989,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[set_index],0,nullptr);
             probe_bound=true;
             }
-            DrawPush push{draw.transforms->projection,info.palette,info.current,info.indexed,0,info.bank};
+            DrawPush push{draw.transforms->projection,info.palette,info.current,info.indexed,info.key[67],info.bank};   // alpha_pass: the ubershader's destination alpha (a fused draw's too)
             if (xform_) { const auto& x=xform_draws[d]; push.palette=x.attributes; push.current_row=x.word; push.indexed=x.positions; }   // XFORM_DRAW: where the pre-pass put this draw's vertices
             push.viewport[0]=draw_viewport.x; push.viewport[1]=draw_viewport.y; push.viewport[2]=draw_viewport.width; push.viewport[3]=draw_viewport.height;
             push.shift[0]=late_shift[0]; push.shift[1]=late_shift[1];
@@ -3077,8 +3114,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     }
                 }
                 if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
-                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_);
-                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
+                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx); %llu draws issued, %llu more merged into them, %llu descriptor set binds, %llu pipeline binds\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load(),(unsigned long long)issued_draws_,(unsigned long long)merged_draws_,(unsigned long long)set_binds_,(unsigned long long)pipeline_binds_);
+                    cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
             }
             if (culled) continue;
@@ -3114,7 +3151,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
             vkCmdDrawIndexed(slot.command, info.index_count, 1, info.first_index, xform_ ? 0 : info.first_vertex, 0);
             const auto depth=draw.uniforms->pixel[1]&31;
-            if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0)) {
+            if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0) && (fuse_off() || !fused_destination_alpha(draw))) {
                 // GX destination alpha replaces stored alpha after RGB blending.
                 const auto alpha_key=pipeline_key(draw,true);
                 const auto alpha=pipeline_for(alpha_key);
