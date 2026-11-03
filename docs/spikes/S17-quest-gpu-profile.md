@@ -722,6 +722,60 @@ image has sharp edges (peak 8% at single pixels, render scale 3).
   (the Quest has no BC formats; ETC2/ASTC re-encoding is lossy). Anisotropy 16 applies only to mip-filtered samplers (off: no gain, S17).
   EFB RGBA8 + D32 (D24S8 is the same size; D16 would lose the 24-bit GX depth), no MSAA.
 
+### Cost model (one fight frame, VR preview at render scale 3.07)
+
+`UC_FRAG_DUMP=3800 UC_FRAG_COST=1` (occlusion-query fragments per draw, all eyes, from the scene packet to the present; the HUD and glow
+layers and the proxy's draws are not counted) joined with ir3's non-nop instruction count of each draw's folded module
+(`/tmp/qgs/fx/costmodel.py`). Per packet: main scene 777 draws, 8.4 M fragments (0.8 scene screens: early depth); translucent effects 146
+draws, ~0; **particles 297 draws, 54.4 M fragments (5.4 scene screens)**; the bloom chain's 1-2-draw passes 0.1-0.5 M each; composite
+12.6 M; colour pass 10.0 M. 87.6 M fragments, 6.5 G instructions; every module has a folded file (no fallback).
+
+| # | module | packets | draws | M fragments | instr (non-nop) | tex | regs | stages | G instr | share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | c23d6bfc | particles | 50 | 51.22 | 70 | 1 | 6 | 2 | 3.59 | 56% |
+| 2 | dd5a9b54 | 1 draws,2 draws | 4 | 13.12 | 60 | 1 | 6 | 1 | 0.79 | 12% |
+| 3 | 3ef591d8 | 1 draws | 1 | 10.04 | 73 | 1 | 6 | 4 | 0.73 | 11% |
+| 4 | 781d1728 | scene | 192 | 5.40 | 110 | 3 | 6 | 4 | 0.59 | 9% |
+| 5 | 4570041c | scene | 1 | 2.96 | 127 | 1 | 6 | 1 | 0.38 | 6% |
+| 6 | 9f4f3296 | particles | 53 | 3.13 | 76 | 1 | 6 | 2 | 0.24 | 4% |
+| 7 | a55deef4 | 2 draws | 1 | 0.46 | 120 | 1 | 6 | 1 | 0.06 | 1% |
+| 8 | b56f1c42 | 1 draws,2 draws | 4 | 0.46 | 64 | 1 | 6 | 1 | 0.03 | 0% |
+| 9 | 16b6fb07 | 2 draws | 1 | 0.46 | 51 | 0 | 6 | 1 | 0.02 | 0% |
+| 10 | 4dffd6f6 | scene | 13 | 0.04 | 311 | 10 | 16 | 2 | 0.01 | 0% |
+| 11 | a7129ef5 | 2 draws | 1 | 0.12 | 61 | 1 | 6 | 1 | 0.01 | 0% |
+| 12 | 81d50741 | 1 draws | 1 | 0.12 | 60 | 1 | 6 | 1 | 0.01 | 0% |
+| 13 | 76f5b441 | particles | 7 | 0.06 | 64 | 1 | 6 | 1 | 0.00 | 0% |
+| 14 | 6b6e34fe | scene | 8 | 0.02 | 166 | 3 | 6 | 4 | 0.00 | 0% |
+| 15 | 42606971 | scene | 20 | 0.02 | 95 | 3 | 6 | 3 | 0.00 | 0% |
+| 16 | e6209135 | 4 draws | 4 | 0.00 | 119 | 1 | 6 | 1 | 0.00 | 0% |
+| 17 | 299c8847 | 146 draws | 16 | 0.00 | 112 | 0 | 6 | 1 | 0.00 | 0% |
+| 18 | 521ee646 | scene | 5 | 0.00 | 69 | 1 | 6 | 1 | 0.00 | 0% |
+| 19 | 62a305ee | scene | 22 | 0.00 | 136 | 1 | 6 | 2 | 0.00 | 0% |
+| 20 | 55f423c3 | scene | 54 | 0.00 | 78 | 1 | 6 | 2 | 0.00 | 0% |
+
+Reading: the particle packet's heat haze (c23d6bfc, callsite 80359464: additive sprites sampling the scene's 320x180 copy through
+indirect texturing) is 56% of the frame's fragment instructions; the full-screen composite and colour pass are the next 23%; the main
+scene's fragments are a small share, so its 10.7 ms on the headset is draws, vertices and tiles (S17 main-scene section), not shading.
+Main-scene modules are 6 registers except one 2-stage indirect material (4dffd6f6: 311 instructions, 10 texture instructions, 16
+registers, few fragments). The GX lighting is per vertex already (the vertex pre-pass), as on the console; fog is a uniform branch.
+
+### Particle layer (opt-in, b85b41b)
+
+`UC_PARTICLE_LAYER=1`: the longest run of a packet's translucent world sprites (perspective, no depth write, a scalar destination factor:
+the fight's 281 additive and 14 alpha-over sprites) is drawn at half the EFB's size a side against a nearest-sampled half-size copy of
+the scene depth, into L (colour) and T (alpha), and composited into the EFB in one draw (EFB * T + L) before the rest of the packet and
+its copy: ~5.4 scene screens of shading become ~1.4 plus one full-screen composite. Off by default: the Mac's driver has no D32 blits,
+so the picture (sprites meeting geometry take the half-size depth; the haze samples a half-resolution copy anyway) is checked on the
+headset's captures first.
+
+### Present
+
+The screen pass is one pass: FXAA and both layers' composite in `xr_screen.slang`, the EFB read in place, the eye image cleared (not
+loaded) and stored, the overlay depth cleared and not stored. Handing the HUD to the runtime as a quad layer would not keep the picture:
+OpenXR layers blend with premultiplied alpha only (the HUD's DST_COLOR multiply needs a per-channel factor) and one quad loses HOTD4's
+per-draw depth spread. The composite costs ~0.7 ms at native (two images and a homography an eye pixel; the glow layer adds two taps
+where it is used).
+
 ### Checked and not changed
 
 - **fp16 (RelaxedPrecision)**: the folded modules relaxed by `tools/spirv_relaxed_precision.py` keep their instruction count in ir3 (338
