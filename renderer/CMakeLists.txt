@@ -298,7 +298,7 @@ if(UC_FOLD_TEV)
     COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/fold_tev_shaders.py --spirv-opt ${UC_SPIRV_OPT} --shaders ${shader_dir}
             --out ${shader_dir}/folded ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed ${CMAKE_SOURCE_DIR}/project/pipeline_keys.quest
     COMMAND ${CMAKE_COMMAND} -E touch ${shader_dir}/folded.stamp
-    DEPENDS ${CMAKE_SOURCE_DIR}/tools/fold_tev_shaders.py ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/fold_tev_shaders.py ${CMAKE_SOURCE_DIR}/project/pipeline_keys.seed ${CMAKE_SOURCE_DIR}/project/pipeline_keys.quest ${shader_dir}/smoke.stereo.frag.spv ${shader_dir}/smoke.stereo.early.frag.spv
     VERBATIM)
   add_custom_target(uc_folded_tev DEPENDS ${shader_dir}/folded.stamp)
 endif()
