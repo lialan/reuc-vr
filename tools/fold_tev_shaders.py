@@ -55,7 +55,9 @@ def fold(job):
     with tempfile.TemporaryDirectory() as tmp:
         staged = os.path.join(tmp, "set.spv")
         subprocess.run([spirv_opt, source, "--set-spec-const-default-value", spec, "-o", staged], check=True)
-        subprocess.run([spirv_opt, staged, "--freeze-spec-const", "-O", "-o", target + ".tmp"], check=True)
+        # fold-spec-const-op-composite: -O alone left the OpSpecConstantOp conditions (stage count, selectors) unfolded, so every unused
+        # stage stayed in the module behind a constant branch (one key: 41 -> 17 KB).
+        subprocess.run([spirv_opt, staged, "--freeze-spec-const", "--fold-spec-const-op-composite", "-O", "-o", target + ".tmp"], check=True)
     os.replace(target + ".tmp", target)
     return os.path.getsize(target)
 

@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include "vr_cull.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -309,6 +310,12 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     if (!xr_) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);   // the headset's swapchain is the runtime's
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     if (layers_ > 1) { features11.multiview = VK_TRUE; features11.pNext = features13.pNext; features13.pNext = &features11; }   // both eyes in one pass
+    xform_ = layers_ > 1 && supported12.bufferDeviceAddress && !std::getenv("UC_NO_XFORM");   // the headset's vertex pre-pass reads the vertices by address
+    if (xform_) {
+        features12.bufferDeviceAddress = VK_TRUE;
+        if (!features12_chained) { features12.pNext = features13.pNext; features13.pNext = &features12; features12_chained = true; }
+    }
+    if (layers_ > 1) std::fprintf(stderr, "[vr] vertex pre-pass %s\n", xform_ ? "on" : supported12.bufferDeviceAddress ? "off (UC_NO_XFORM)" : "unavailable (no bufferDeviceAddress)");
     if(chosen_maintenance)device_extensions.push_back(chosen_maintenance);
     {   // FidelityFX resolves these entry points by their extension names, including after a live switch.
         uint32_t n = 0; vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
@@ -408,6 +415,8 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     const auto alignment=size_t(limits.limits.minUniformBufferOffsetAlignment);
     uniform_stride_=(kDrawUniformBytes+alignment-1)/alignment*alignment;
     stereo_stride_=(kStereoBlockBytes+alignment-1)/alignment*alignment;   // the headset's eye blocks, one uniform-buffer binding each
+    static_assert(kDrawUniformBytes==132*16, "smoke.slang DrawState");
+    if (xform_ && uniform_stride_!=kDrawUniformBytes) { xform_=false; std::fprintf(stderr,"[vr] vertex pre-pass off: uniform stride %zu\n",uniform_stride_); }   // xformMain reads the uniform blocks as an array
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pool_info.queueFamilyIndex = family_;
     vk_check(vkCreateCommandPool(device, &pool_info, nullptr, &pool_), "command pool");
     VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; allocation.commandPool = pool_; allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; allocation.commandBufferCount = uint32_t(slots_.size());
@@ -427,6 +436,30 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     const std::string variant=layers_>1 ? "smoke.stereo." : motion_outputs_ ? "smoke.motion." : "smoke.";
     if (motion_outputs_) { shadow_vertex_module_=shader(device, shaders_ / "smoke.shadow.vert.spv"); shadow_map_.initialize(device,memory_); }
     vertex_module_=shader(device, shaders_ / (variant+"vert.spv")); fragment_module_=shader(device, shaders_ / (variant+"frag.spv")); if (layers_>1 && !std::getenv("UC_NO_NOBANK_VS")) nobank_vertex_module_=shader(device, shaders_ / "smoke.stereo.nobank.vert.spv"); early_module_=shader(device, shaders_ / (variant+"early.frag.spv")); uber_module_=shader(device, shaders_ / (variant+"uber.spv"));
+    if (layers_>1) {   // diagnostics (the headset's GPU cost split): UC_PROBE_VS=1 no lighting or texgen in the vertex stage, UC_PROBE_FS=1 the vertex colour as the fragment, UC_PROBE_NOINV=1 no Invariant position
+        const char* probe_vs=std::getenv("UC_PROBE_VS") ? "smoke.stereo.probe.vert.spv" : std::getenv("UC_PROBE_NOINV") ? "smoke.stereo.nobank.noinv.vert.spv" : nullptr;
+        if (probe_vs && nobank_vertex_module_) { vkDestroyShaderModule(device,nobank_vertex_module_,nullptr); nobank_vertex_module_=shader(device, shaders_ / probe_vs); std::fprintf(stderr,"[probe] vertex stage %s\n",probe_vs); }
+        if (std::getenv("UC_PROBE_FS")) {
+            probe_fragment_=true;
+            vkDestroyShaderModule(device,fragment_module_,nullptr); vkDestroyShaderModule(device,early_module_,nullptr);
+            fragment_module_=shader(device, shaders_ / "smoke.stereo.probe.frag.spv"); early_module_=shader(device, shaders_ / "smoke.stereo.probe.frag.spv");
+            std::fprintf(stderr,"[probe] fragment stage: vertex colour\n");
+        }
+    }
+    if (xform_) {   // the vertex pre-pass: its compute pipeline (own set: jobs, chunks, the draws' uniforms, palettes, banks, outputs)
+        xform_vertex_module_=shader(device, shaders_ / "smoke.stereo.xform.vert.spv"); xform_compute_module_=shader(device, shaders_ / "smoke.stereo.xform.comp.spv");
+        VkDescriptorSetLayoutBinding bindings[7]{};
+        const uint32_t numbers[7]={2,3,4,6,7,8,9};
+        for (uint32_t i=0;i<7;++i) bindings[i]={numbers[i],VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
+        VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; set_info.bindingCount=7; set_info.pBindings=bindings;
+        vk_check(vkCreateDescriptorSetLayout(device,&set_info,nullptr,&xform_set_layout_),"pre-pass descriptor layout");
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout_info.setLayoutCount=1; layout_info.pSetLayouts=&xform_set_layout_;
+        vk_check(vkCreatePipelineLayout(device,&layout_info,nullptr,&xform_layout_),"pre-pass pipeline layout");
+        VkComputePipelineCreateInfo create{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        create.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,xform_compute_module_,"xformMain",nullptr};
+        create.layout=xform_layout_;
+        vk_check(vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&create,nullptr,&xform_pipeline_),"pre-pass pipeline");
+    }
     load_pipeline_cache();
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
     gx::DrawPacket initial; initial.primitive=0x90; pipeline_for(pipeline_key(initial));
@@ -643,6 +676,8 @@ void VulkanRenderer::destroy_texture(Texture& texture) {
 void VulkanRenderer::retire_textures(Slot& slot) {
     if (slot.texture_pool) vkDestroyDescriptorPool(device,slot.texture_pool,nullptr);
     slot.texture_pool=VK_NULL_HANDLE; slot.descriptor_capacity=0; slot.texture_sets.clear();
+    if (slot.xform_pool) vkDestroyDescriptorPool(device,slot.xform_pool,nullptr);
+    slot.xform_pool=VK_NULL_HANDLE; slot.xform_set=VK_NULL_HANDLE;
     slot.textures.clear();   // the last slot to drop a texture destroys it
     slot.copy_sources.clear();
 }
@@ -895,8 +930,8 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
     {
         if (!layout_) {
         VkPushConstantRange projection{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof(DrawPush))};
-        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};   // 5: the headset's eye block (uniform) or motion blocks
-        VkDescriptorSetLayoutCreateInfo texture_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; texture_layout.bindingCount=6; texture_layout.pBindings=texture_bindings;
+        VkDescriptorSetLayoutBinding texture_bindings[]={{0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_SAMPLER,8,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},{3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{5,layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{7,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};   // 5: the headset's eye block (uniform) or motion blocks; 6, 7: the pre-pass's positions and attributes (xform_)
+        VkDescriptorSetLayoutCreateInfo texture_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; texture_layout.bindingCount=xform_ ? 8 : 6; texture_layout.pBindings=texture_bindings;
         vk_check(vkCreateDescriptorSetLayout(device,&texture_layout,nullptr,&texture_layout_),"texture descriptor layout");
         create_samplers();
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout_info.pushConstantRangeCount=1; layout_info.pPushConstantRanges=&projection;
@@ -920,11 +955,12 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         stages[1].pSpecializationInfo=uber ? &uber_specialization : &specialization;
         // The headset: a module specialized at build time for exactly these constants (tools/fold_tev_shaders.py), when there is one. The
         // driver's own specialization left most of the 600 KB module in (a one-stage quad ran 160-200 instructions a fragment).
-        if (!uber && layers_>1) if (const VkShaderModule folded=folded_module(spec_values,fragment==early_module_)) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
+        if (!uber && layers_>1 && !probe_fragment_) if (const VkShaderModule folded=folded_module(spec_values,fragment==early_module_)) { stages[1].module=folded; stages[1].pSpecializationInfo=nullptr; }
         static_assert(sizeof(gx::GpuMeshVertex)==108 && sizeof(gx::Projection)==64);
         VkVertexInputBindingDescription binding; std::array<VkVertexInputAttributeDescription,14> attributes;
         mesh_vertex_input(binding,attributes);
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; input.vertexBindingDescriptionCount = 1; input.pVertexBindingDescriptions = &binding; input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
+        if (xform_) { input.vertexBindingDescriptionCount = 0; input.vertexAttributeDescriptionCount = 0; stages[0].module = xform_vertex_module_; }   // the pre-pass's draws read their vertices from its outputs
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VkPrimitiveTopology(key[69]);
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = cull_mode(key); raster.frontFace = VK_FRONT_FACE_CLOCKWISE; raster.lineWidth = 1; raster.depthClampEnable = depth_clamp_;
@@ -1073,7 +1109,7 @@ VulkanRenderer::GpuMesh& VulkanRenderer::gpu_mesh(const std::shared_ptr<const gx
     const VkDeviceSize total=(vertex_bytes+15)/16*16+(index_bytes+15)/16*16;
     if (mesh_slabs_.empty() || mesh_slabs_.back()->buffer.size-mesh_slabs_.back()->used<total) {
         auto slab=std::make_unique<MeshSlab>();
-        slab->buffer=make_buffer(std::max<VkDeviceSize>(VkDeviceSize(32)<<20,total),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|rt_input_usage(),true);
+        slab->buffer=make_buffer(std::max<VkDeviceSize>(VkDeviceSize(32)<<20,total),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|vertex_usage(),true);
         mesh_slabs_.push_back(std::move(slab));
     }
     MeshSlab& slab=*mesh_slabs_.back();
@@ -1084,6 +1120,8 @@ VulkanRenderer::GpuMesh& VulkanRenderer::gpu_mesh(const std::shared_ptr<const gx
     std::memcpy(static_cast<std::byte*>(slab.buffer.mapped)+mesh.index_offset,indices.data(),index_bytes);
     slab.used+=total; ++slab.live;
     mesh.index_count=uint32_t(indices.size()); mesh.rows=gx::used_rows(vertices); mesh.owner=source; mesh.id=next_mesh_id_++;
+    mesh.box={1e30f,1e30f,1e30f,-1e30f,-1e30f,-1e30f};
+    for (const auto& vertex:vertices) for (int i=0;i<3;++i) { mesh.box[i]=std::min(mesh.box[i],vertex.position[i]); mesh.box[3+i]=std::max(mesh.box[3+i],vertex.position[i]); }
     if (const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-created_at).count(); ms>2) std::fprintf(stderr,"[gpu-mesh] %zu vertices %zu indices uploaded in %.2f ms (%zu meshes resident)\n",vertices.size(),indices.size(),ms,meshes_.size()+1);
     return meshes_.emplace(source.get(),std::move(mesh)).first->second;
 }
@@ -1344,6 +1382,7 @@ void VulkanRenderer::retire_images(bool keep_buffers) {
         if (!keep_buffers) {
             retire_textures(slot);
             destroy_buffer(slot.vertices); destroy_buffer(slot.indices); destroy_buffer(slot.pixels); destroy_buffer(slot.uniforms); destroy_buffer(slot.palettes); destroy_buffer(slot.banks); destroy_buffer(slot.motions); slot.mesh_refs.clear();
+            for (Buffer* buffer:{&slot.xform_jobs,&slot.xform_chunks,&slot.xform_positions,&slot.xform_attributes}) destroy_buffer(*buffer);
         }
         destroy_slot_images(slot);
         slot.submitted = slot.reported = slot.initialized = slot.copied = false; slot.serial = 0;
@@ -2090,7 +2129,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (!used && !owned) it=slot.textures.erase(it); else ++it;
     }
     // Per draw: where its vertices live (a persistent mesh buffer, or this frame's dynamic buffer for non-mesh draws) and which palette it reads.
-    struct DrawGpu { PipelineKey key{}; PipelineChoice choice{}; const Buffer* vertices=nullptr; const Buffer* indices=nullptr; VkDeviceSize vertex_offset=0, index_offset=0; uint32_t index_count=0, first_index=0; int32_t first_vertex=0; uint32_t palette=0, current=0, indexed=0, bank=kNoBank; uint64_t mesh_id=0; };   // mesh_id: GpuMesh::id of a cached mesh draw (0 for an inline draw)
+    struct DrawGpu { PipelineKey key{}; PipelineChoice choice{}; const Buffer* vertices=nullptr; const Buffer* indices=nullptr; VkDeviceSize vertex_offset=0, index_offset=0; uint32_t index_count=0, first_index=0; int32_t first_vertex=0; uint32_t palette=0, current=0, indexed=0, bank=kNoBank; uint64_t mesh_id=0; const std::array<float,6>* box=nullptr; };   // box: a cached mesh's object-space bounds   // mesh_id: GpuMesh::id of a cached mesh draw (0 for an inline draw)
     std::vector<DrawGpu> gpu_draws; gpu_draws.reserve(packet.draws.size());
     std::unordered_map<const gx::TextureBank*,uint32_t> bank_of;   // one bank per distinct texture matrix set
     std::vector<const gx::TextureBank*> banks;
@@ -2114,7 +2153,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             if (mesh.index_count % group != 0) throw std::invalid_argument("index count does not match native draw topology");
             gx::validate_draw_rows(*draw.transforms,indexed,mesh.rows,draw.callsite);
             if (slot.mesh_refs.empty() || slot.mesh_refs.back()!=draw.mesh) slot.mesh_refs.push_back(draw.mesh);
-            info.vertices=info.indices=&mesh.slab->buffer; info.vertex_offset=mesh.vertex_offset; info.index_offset=mesh.index_offset; info.index_count=mesh.index_count; info.mesh_id=mesh.id;
+            info.vertices=info.indices=&mesh.slab->buffer; info.vertex_offset=mesh.vertex_offset; info.index_offset=mesh.index_offset; info.index_count=mesh.index_count; info.mesh_id=mesh.id; info.box=&mesh.box;
         } else {
             const auto vertices = draw.vertex_view(); const auto indices = draw.index_view();
             if (indices.size() % group != 0) throw std::invalid_argument("index count does not match native draw topology");
@@ -2173,7 +2212,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     if (vertex_count && index_count) {
         if (slot.vertices.size < VkDeviceSize(vertex_count) * sizeof(gx::GpuMeshVertex)) {
-            destroy_buffer(slot.vertices); slot.vertices = make_buffer(VkDeviceSize(vertex_count) * sizeof(gx::GpuMeshVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            destroy_buffer(slot.vertices); slot.vertices = make_buffer(VkDeviceSize(vertex_count) * sizeof(gx::GpuMeshVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|vertex_usage());
         }
         if (slot.indices.size < VkDeviceSize(index_count) * sizeof(uint32_t)) {
             destroy_buffer(slot.indices); slot.indices = make_buffer(VkDeviceSize(index_count) * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
@@ -2221,15 +2260,51 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         for (size_t i=0;i<record_uniforms.size();++i) std::memcpy(lights+i*kLightsBytes,record_uniforms[i]->lights.data(),kLightsBytes);
         rt_record_count_=uint32_t(total);
     }
+    // The texture coordinates draw i's stages read (sampling stages and indirect maps): the vertex stage generates only those.
+    // Key words 1..: stage count, swap tables, then per stage colour/alpha env, order, konst; order bit 6 samples a texture
+    // at coordinate (order >> 3) & 7; an indirect stage also reads its indirect map's coordinate (IREF, indirect[9]).
+    const auto coord_mask=[&](size_t i) {
+        const auto& key=gpu_draws[i].key; const auto& u=*packet.draws[i].uniforms;
+        uint32_t coords=key[1]==0 ? 1u : 0u;
+        for(uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) {
+            const uint32_t order=key[5+4*stage];
+            if(order&64) coords|=1u<<((order>>3)&7);
+            if(u.ind_cmd[stage]) coords|=1u<<((u.indirect[9]>>((u.ind_cmd[stage]&3)*6+3))&7);
+        }
+        return coords;
+    };
+    // The vertex pre-pass (xform_): where each draw's shaded vertices go. Positions: one float4 a vertex; attributes: 2 + 3 per used
+    // coordinate words a vertex. A draw that draws nothing gets no job.
+    struct XformDraw { uint32_t positions=0, attributes=0, word=0, count=0; };   // word: stride | mask << 8 (the draws' currentRow)
+    std::vector<XformDraw> xform_draws;
+    std::vector<uint32_t> draw_uniform(packet.draws.size(),0);   // each draw's uniform block index (offset / uniform_stride_)
+    if (xform_ && !packet.draws.empty()) {
+        xform_draws.resize(packet.draws.size());
+        uint32_t positions=0, attributes=0;
+        for (size_t i=0;i<packet.draws.size();++i) {
+            if (!gpu_draws[i].index_count) continue;
+            const auto& draw=packet.draws[i];
+            const uint32_t n=uint32_t(draw.mesh ? draw.mesh->vertices.size() : draw.vertex_view().size());
+            const uint32_t mask=coord_mask(i), stride=2+3*uint32_t(std::popcount(mask));
+            xform_draws[i]={positions,attributes,stride|(mask<<8),n};
+            positions+=n; attributes+=n*stride;
+        }
+        const auto grow=[&](Buffer& buffer,VkDeviceSize bytes) {
+            bytes=std::max<VkDeviceSize>(bytes,16);
+            if (buffer.size>=bytes) return;
+            destroy_buffer(buffer); buffer=make_buffer(bytes+bytes/2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,true);
+        };
+        grow(slot.xform_positions,VkDeviceSize(positions)*16); grow(slot.xform_attributes,VkDeviceSize(attributes)*4);
+    }
     if (!packet.draws.empty()) {
         if (packet.draws.size()>UINT32_MAX) throw std::invalid_argument("too many native texture descriptors");
         if(packet.draws.size()>UINT32_MAX/8) throw std::invalid_argument("native texture descriptor count overflows");
         const uint32_t count=uint32_t(packet.draws.size());
-        if(slot.uniforms.size<VkDeviceSize(count)*uniform_stride_) { destroy_buffer(slot.uniforms); slot.uniforms=make_buffer(VkDeviceSize(count)*uniform_stride_,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT); }
+        if(slot.uniforms.size<VkDeviceSize(count)*uniform_stride_) { destroy_buffer(slot.uniforms); slot.uniforms=make_buffer(VkDeviceSize(count)*uniform_stride_,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|(xform_ ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0u)); }
         if(count>slot.descriptor_capacity) {
             if(slot.texture_pool) vkDestroyDescriptorPool(device,slot.texture_pool,nullptr);
             slot.texture_pool=VK_NULL_HANDLE; slot.descriptor_capacity=0; slot.texture_sets.clear();
-            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,layers_>1 ? count*2 : count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,layers_>1 ? count*2 : count*3}};
+            VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,count*8},{VK_DESCRIPTOR_TYPE_SAMPLER,count*8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,layers_>1 ? count*2 : count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,layers_>1 ? count*(xform_ ? 4 : 2) : count*3}};
             VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=count; pool.poolSizeCount=4; pool.pPoolSizes=sizes;
             vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.texture_pool),"texture descriptor pool");
             std::vector<VkDescriptorSetLayout> layouts(count,texture_layout_);
@@ -2297,16 +2372,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 std::array<uint32_t,kTevWords> tev{}; std::copy(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,tev.begin());
                 std::memcpy(uniform_at+sizeof(gx::DrawUniform),tev.data(),sizeof tev);
                 // The texture coordinates the stages read (fog[5], a spare word; bit 8: valid): the vertex shader generates only those.
-                // Key words 1..: stage count, swap tables, then per stage colour/alpha env, order, konst; order bit 6 samples a texture
-                // at coordinate (order >> 3) & 7; an indirect stage also reads its indirect map's coordinate (IREF, indirect[9]).
-                const auto& key=gpu_draws[i].key; const auto& u=*packet.draws[i].uniforms;
-                uint32_t coords=key[1]==0 ? 1u : 0u;
-                for(uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) {
-                    const uint32_t order=key[5+4*stage];
-                    if(order&64) coords|=1u<<((order>>3)&7);
-                    if(u.ind_cmd[stage]) coords|=1u<<((u.indirect[9]>>((u.ind_cmd[stage]&3)*6+3))&7);
-                }
-                const uint32_t coord_word=coords|0x100u;
+                const uint32_t coord_word=coord_mask(i)|0x100u;
                 std::memcpy(uniform_at+offsetof(gx::DrawUniform,fog)+5*sizeof(uint32_t),&coord_word,sizeof coord_word);
             }
             VkDescriptorBufferInfo uniform{slot.uniforms.buffer,uniform_offset,kDrawUniformBytes};
@@ -2321,15 +2387,19 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             VkDescriptorBufferInfo bank{slot.banks.buffer,0,VK_WHOLE_SIZE};
             VkDescriptorBufferInfo motion{slot.motions.buffer,0,VK_WHOLE_SIZE};
             if (layers_>1) motion={slot.motions.buffer,VkDeviceSize(i)*stereo_stride_,kStereoBlockBytes};   // this draw's eye block
-            VkWriteDescriptorSet writes[6]{};
-            for (uint32_t binding=0;binding<6;++binding) { writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=slot.texture_sets[i]; writes[binding].dstBinding=binding; writes[binding].descriptorCount=1; }
+            draw_uniform[i]=uint32_t(uniform_offset/uniform_stride_);
+            const VkDescriptorBufferInfo xform_positions{slot.xform_positions.buffer,0,VK_WHOLE_SIZE}, xform_attributes{slot.xform_attributes.buffer,0,VK_WHOLE_SIZE};
+            VkWriteDescriptorSet writes[8]{};
+            const uint32_t binding_count=xform_ ? 8 : 6;
+            for (uint32_t binding=0;binding<binding_count;++binding) { writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=slot.texture_sets[i]; writes[binding].dstBinding=binding; writes[binding].descriptorCount=1; }
             writes[0].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[0].descriptorCount=8; writes[0].pImageInfo=image.data();
             writes[1].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER; writes[1].descriptorCount=8; writes[1].pImageInfo=samplers.data();
             writes[2].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[2].pBufferInfo=&uniform;
             writes[3].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[3].pBufferInfo=&palette;
             writes[4].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[4].pBufferInfo=&bank;
             writes[5].descriptorType=layers_>1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[5].pBufferInfo=&motion;
-            vkUpdateDescriptorSets(device,6,writes,0,nullptr);
+            writes[6].descriptorType=writes[7].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[6].pBufferInfo=&xform_positions; writes[7].pBufferInfo=&xform_attributes;
+            vkUpdateDescriptorSets(device,binding_count,writes,0,nullptr);
         }
     }
     uint32_t image_index = 0;
@@ -2406,12 +2476,33 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         const size_t n = packet.draws.size();
         const char* bucket = n == 0 ? "0" : n < 10 ? "1-9" : n < 50 ? "10-49" : n < 200 ? "50-199" : "200+";
         if (n >= 200) {   // the vertex load of the big (scene) packets: indices drawn, per second
-            static uint64_t indices = 0, packets = 0; static auto since = std::chrono::steady_clock::now();
-            for (const auto& info : gpu_draws) indices += info.index_count;
+            static uint64_t indices = 0, packets = 0, drawn = 0, vertices = 0, switches = 0, distinct = 0, meshes = 0; static auto since = std::chrono::steady_clock::now();
+            static uint64_t uniform_changes = 0, texture_changes = 0, projection_changes = 0;
+            std::set<VkPipeline> pipelines; VkPipeline last = VK_NULL_HANDLE; size_t last_drawn = SIZE_MAX;
+            for (size_t d = 0; d < gpu_draws.size(); ++d) {
+                const auto& info = gpu_draws[d];
+                if (!info.index_count) continue;
+                indices += info.index_count; ++drawn;
+                vertices += packet.draws[d].mesh ? packet.draws[d].mesh->vertices.size() : packet.draws[d].vertex_view().size();
+                meshes += packet.draws[d].mesh != nullptr;
+                pipelines.insert(info.choice.pipeline); switches += info.choice.pipeline != last; last = info.choice.pipeline;
+                if (last_drawn != SIZE_MAX) {
+                    const auto& a = packet.draws[d]; const auto& b = packet.draws[last_drawn];
+                    uniform_changes += a.uniforms.block() != b.uniforms.block();
+                    bool same = a.texture_wrap == b.texture_wrap;
+                    for (size_t map = 0; map < 8 && same; ++map) same = draw_texture(a, map) == draw_texture(b, map);
+                    texture_changes += !same;
+                    projection_changes += a.transforms->projection != b.transforms->projection;
+                }
+                last_drawn = d;
+            }
+            distinct += pipelines.size();
             ++packets;
             if (std::chrono::steady_clock::now() - since > std::chrono::seconds(2)) {
-                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets)\n", double(indices) / double(packets), (unsigned long long)packets);
-                indices = packets = 0; since = std::chrono::steady_clock::now();
+                const double p = double(packets);
+                std::fprintf(stderr, "[gpu-packets] scene packets: %.0f indices each (%llu packets), %.0f draws (%.0f meshes), %.0f vertices, %.0f pipelines, %.0f pipeline changes, %.0f uniform changes, %.0f texture changes, %.0f projection changes\n", double(indices) / p, (unsigned long long)packets,
+                             drawn / p, meshes / p, vertices / p, distinct / p, switches / p, uniform_changes / p, texture_changes / p, projection_changes / p);
+                indices = packets = drawn = vertices = switches = distinct = meshes = uniform_changes = texture_changes = projection_changes = 0; since = std::chrono::steady_clock::now();
             }
         }
         char kind[128];
@@ -2490,6 +2581,52 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
     // A render target of the frame: efb_ (output resolution) or the internal scene targets. Between passes color is TRANSFER_SRC, depth
     // DEPTH_ATTACHMENT and motion COLOR_ATTACHMENT; *initialized false means never written (cleared on first use).
+    if (!xform_draws.empty()) {   // the vertex pre-pass: every vertex of the packet's draws shaded once, before the passes that draw them
+        struct XformJob { uint64_t vertices; uint32_t count, draw; gx::Projection rows; uint32_t palette, current, indexed, bank, positions, attributes, mask, stride; };   // smoke.slang XformJob
+        static_assert(sizeof(XformJob)==112 && offsetof(XformJob,rows)==16 && offsetof(XformJob,palette)==80);
+        std::vector<XformJob> jobs; std::vector<std::array<uint32_t,2>> chunks;
+        const auto address=[&](const Buffer& buffer) { VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; info.buffer=buffer.buffer; return uint64_t(vkGetBufferDeviceAddress(device,&info)); };
+        uint64_t inline_base=0;
+        for (size_t d=0;d<packet.draws.size();++d) {
+            const auto& x=xform_draws[d]; const auto& info=gpu_draws[d];
+            if (!x.count) continue;
+            uint64_t vertices;
+            if (info.vertices) vertices=address(*info.vertices)+info.vertex_offset;
+            else { if (!inline_base) inline_base=address(slot.vertices); vertices=inline_base+uint64_t(info.first_vertex)*sizeof(gx::GpuMeshVertex); }
+            for (uint32_t first=0;first<x.count;first+=64) chunks.push_back({uint32_t(jobs.size()),first});
+            jobs.push_back({vertices,x.count,draw_uniform[d],packet.draws[d].transforms->projection,info.palette,info.current,info.indexed,info.bank,x.positions,x.attributes,x.word>>8,x.word&255});
+        }
+        if (!jobs.empty()) {
+            const auto fill=[&](Buffer& buffer,const void* data,VkDeviceSize bytes) {
+                if (buffer.size<bytes) { destroy_buffer(buffer); buffer=make_buffer(bytes+bytes/2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+                std::memcpy(buffer.mapped,data,size_t(bytes));
+            };
+            fill(slot.xform_jobs,jobs.data(),jobs.size()*sizeof(XformJob)); fill(slot.xform_chunks,chunks.data(),chunks.size()*sizeof(chunks[0]));
+            if (!slot.xform_pool) {
+                const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,7};
+                VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&size;
+                vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.xform_pool),"pre-pass descriptor pool");
+                VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=slot.xform_pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&xform_set_layout_;
+                vk_check(vkAllocateDescriptorSets(device,&allocate,&slot.xform_set),"pre-pass descriptor set");
+            }
+            const Buffer* sources[7]={&slot.uniforms,&slot.palettes,&slot.banks,&slot.xform_positions,&slot.xform_attributes,&slot.xform_jobs,&slot.xform_chunks};
+            const uint32_t numbers[7]={2,3,4,6,7,8,9};
+            VkDescriptorBufferInfo infos[7]; VkWriteDescriptorSet writes[7]{};
+            for (int i=0;i<7;++i) {
+                infos[i]={sources[i]->buffer,0,VK_WHOLE_SIZE};
+                writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,slot.xform_set,numbers[i],0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&infos[i],nullptr};
+            }
+            vkUpdateDescriptorSets(device,7,writes,0,nullptr);
+            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_COMPUTE,xform_pipeline_);
+            vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_COMPUTE,xform_layout_,0,1,&slot.xform_set,0,nullptr);
+            vkCmdDispatch(slot.command,uint32_t(chunks.size()),1,1);
+            VkMemoryBarrier2 written{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            written.srcStageMask=VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT; written.srcAccessMask=VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            written.dstStageMask=VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT; written.dstAccessMask=VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.memoryBarrierCount=1; dependency.pMemoryBarriers=&written;
+            vkCmdPipelineBarrier2(slot.command,&dependency);
+        }
+    }
     struct PassTarget { VkImage color, depth; VkImageView color_view, depth_view, motion_view, gbuffer_view; VkExtent2D extent; bool* initialized; bool clear_depth=false; };   // clear_depth: a scratch depth buffer, cleared by every pass
     const PassTarget efb_target{efb_,depth_,efb_view_,depth_view_,VK_NULL_HANDLE,VK_NULL_HANDLE,efb_extent_,&efb_initialized_};
     const PassTarget scene_target{scene_color_,scene_depth_,scene_color_view_,scene_depth_view_,scene_motion_view_,scene_gbuffer_view_,scene_extent_,&scene_initialized_};
@@ -2627,6 +2764,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     if (!gpu_draws.empty()) {
         const Buffer* bound_vertices=nullptr; const Buffer* bound_indices=nullptr; VkDeviceSize bound_vertex_offset=0, bound_index_offset=0;
         uint32_t bound_state=~0u;   // cull and depth state last set on this command buffer (every pipeline bound below leaves them dynamic)
+        // The pipeline, viewport and scissor last set in this pass: a draw that changes none of them records no command for them (the
+        // scene packet's ~840 draws use ~18 pipelines). UC_NO_STATE_DEDUP=1 sets every one per draw, as before.
+        static const bool no_dedup=std::getenv("UC_NO_STATE_DEDUP")!=nullptr;
+        VkPipeline bound_pipeline=VK_NULL_HANDLE; VkViewport bound_viewport=viewport; VkRect2D bound_scissor=scissor;
+        const auto bind_pipeline=[&](VkPipeline pipeline) {
+            if (pipeline==bound_pipeline && !no_dedup) return;
+            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); bound_pipeline=pipeline;
+        };
         const auto set_draw_state=[&](const PipelineKey& key) {
             const uint32_t state=((key[0]>>14)&3)|((key[68]&31)<<2);
             if (state==bound_state) return;
@@ -2636,6 +2781,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdSetDepthWriteEnable(slot.command,(key[68]>>4)&1);
             vkCmdSetDepthCompareOp(slot.command,VkCompareOp((key[68]>>1)&7));
         };
+        bool probe_bound=false;
         for (size_t d=first; d<last; ++d) {
             const auto& draw=packet.draws[d]; const auto& info=gpu_draws[d];
             const size_t set_index=d;
@@ -2674,15 +2820,20 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (log_aim) std::fprintf(stderr,"[aim] t=%.4f consumed %.4f %.4f latest %.4f %.4f callsite %08X\n",std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),from[0],from[1],latest[0],latest[1],draw.callsite);
                 if (dx!=0 || dy!=0) { late_shift[0]=dx*2/draw_viewport.width; late_shift[1]=dy*2/draw_viewport.height; draw_scissor=scissor; ++late_aim_draws_; }
             }
-            vkCmdSetViewport(slot.command,0,1,&draw_viewport); vkCmdSetScissor(slot.command,0,1,&draw_scissor);
+            if (no_dedup || std::memcmp(&draw_viewport,&bound_viewport,sizeof draw_viewport)) { vkCmdSetViewport(slot.command,0,1,&draw_viewport); bound_viewport=draw_viewport; }
+            if (no_dedup || std::memcmp(&draw_scissor,&bound_scissor,sizeof draw_scissor)) { vkCmdSetScissor(slot.command,0,1,&draw_scissor); bound_scissor=draw_scissor; }
             const Buffer& vertex_buffer=info.vertices ? *info.vertices : slot.vertices;
             const Buffer& index_buffer=info.indices ? *info.indices : slot.indices;
-            if (&vertex_buffer!=bound_vertices || info.vertex_offset!=bound_vertex_offset) { VkDeviceSize offset=info.vertex_offset; vkCmdBindVertexBuffers(slot.command,0,1,&vertex_buffer.buffer,&offset); bound_vertices=&vertex_buffer; bound_vertex_offset=info.vertex_offset; }
+            if (!xform_ && (&vertex_buffer!=bound_vertices || info.vertex_offset!=bound_vertex_offset)) { VkDeviceSize offset=info.vertex_offset; vkCmdBindVertexBuffers(slot.command,0,1,&vertex_buffer.buffer,&offset); bound_vertices=&vertex_buffer; bound_vertex_offset=info.vertex_offset; }   // the pre-pass's pipelines have no vertex input
             if (&index_buffer!=bound_indices || info.index_offset!=bound_index_offset) { vkCmdBindIndexBuffer(slot.command,index_buffer.buffer,info.index_offset,VK_INDEX_TYPE_UINT32); bound_indices=&index_buffer; bound_index_offset=info.index_offset; }
-            vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,info.choice.pipeline);
+            bind_pipeline(info.choice.pipeline);
             set_draw_state(info.key);
+            static const bool probe_sets=std::getenv("UC_PROBE_SETS")!=nullptr;   // diagnostics: one descriptor set for the whole pass (wrong textures and uniforms)
+            if (!probe_sets || !probe_bound)
             vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[set_index],0,nullptr);
+            probe_bound=true;
             DrawPush push{draw.transforms->projection,info.palette,info.current,info.indexed,0,info.bank};
+            if (xform_) { const auto& x=xform_draws[d]; push.palette=x.attributes; push.current_row=x.word; push.indexed=x.positions; }   // XFORM_DRAW: where the pre-pass put this draw's vertices
             push.viewport[0]=draw_viewport.x; push.viewport[1]=draw_viewport.y; push.viewport[2]=draw_viewport.width; push.viewport[3]=draw_viewport.height;
             push.shift[0]=late_shift[0]; push.shift[1]=late_shift[1];
             if (effects_.per_pixel_lighting && motion_outputs_) push.effects|=kEffectPerPixelLighting;   // only lit draws change: nothing else has a lighting channel on
@@ -2694,6 +2845,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     push.effects|=kEffectRtMaterial|(records[draw_record[d]-first_record].flags&kRtModelValid ? kEffectRtModelValid : 0u);
                 }
             }
+            bool culled=false;   // the headset: neither eye sees this draw
             if (layers_>1 && stereo_) {   // HOTD4's per-draw reprojection: both eyes' transforms of this draw into binding 5
                 bool texture_view=false;
                 for(size_t map=0;map<8;++map) if(const auto texture=draw_texture(draw,map); texture && texture->gpu_only) texture_view=true;
@@ -2772,21 +2924,57 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     for(int r=0;r<4;++r) { g[r][0]=gl(r,0); g[r][1]=-gl(r,1); g[r][2]=2*gl(r,2); g[r][3]=gl(r,3)-gl(r,2); }
                     for(int c=0;c<4;++c) { block[eye*16+0*4+c]=float(g[0][c]); block[eye*16+1*4+c]=float(-g[1][c]); block[eye*16+2*4+c]=float(.5*(g[2][c]+g[3][c])); block[eye*16+3*4+c]=float(g[3][c]); }
                 }
+                static const bool probe_mono=std::getenv("UC_PROBE_MONO")!=nullptr;   // diagnostics: both eyes see the game's own clip space (no reprojection)
+                if (probe_mono) for(int eye=0;eye<2;++eye) for(int r=0;r<4;++r) for(int c=0;c<4;++c) block[eye*16+r*4+c]=r==c ? 1.f : 0.f;
                 push.motion=uint32_t(d);
+                // Culling (vr_cull.h): a world draw that neither eye sees is not drawn. Only perspective world draws of the visible scene
+                // (not offscreen copies the game reads, not HUD, reticle or late-aimed quads); a cached mesh drawn with one matrix is
+                // tested by its object-space box, any other draw by its vertices. UC_VR_NO_CULL=1 draws everything.
+                static const bool no_cull=std::getenv("UC_VR_NO_CULL")!=nullptr;
+                static uint64_t cull_tested=0, cull_draws=0, cull_indices=0, all_indices=0; static auto cull_since=std::chrono::steady_clock::now();
+                static float reach[2]={0,0};   // the eyes' largest extent in the game's clip space (vr_cull.h eye_extent) over the period
+                all_indices+=info.index_count;
+                if (kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen)
+                    for (int eye=0;eye<2;++eye) { const auto e=uc::eye_extent(block+16*eye); reach[0]=std::max(reach[0],e[0]); reach[1]=std::max(reach[1],e[1]); }
+                if (!no_cull && !probe_mono && kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen && !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer) {
+                    ++cull_tested;
+                    const auto& t=*draw.transforms;
+                    const auto to_clip=[&](const std::array<float,3>& p,uint32_t row) {
+                        float view[3]; for (int i=0;i<3;++i) { const auto& m=t.position_rows[row+i]; view[i]=m[0]*p[0]+m[1]*p[1]+m[2]*p[2]+m[3]; }
+                        std::array<float,4> clip; for (int i=0;i<4;++i) { const auto& m=t.projection[i]; clip[i]=m[0]*view[0]+m[1]*view[1]+m[2]*view[2]+m[3]; }
+                        return clip;
+                    };
+                    std::vector<std::array<float,4>>& points=cull_points_; points.clear();
+                    if (info.box && !info.indexed) {
+                        const auto& b=*info.box;
+                        for (int corner=0;corner<8;++corner) points.push_back(to_clip({b[corner&1 ? 3 : 0],b[corner&2 ? 4 : 1],b[corner&4 ? 5 : 2]},info.current));
+                    } else {
+                        for (const auto& vertex:draw.vertex_view()) { const uint32_t row=info.indexed ? vertex.position_matrix : info.current; if (row<=61) points.push_back(to_clip(vertex.position,row)); }
+                    }
+                    if (uc::clip_outside(block,points.data(),points.size()) && uc::clip_outside(block+16,points.data(),points.size())) {
+                        ++cull_draws; cull_indices+=info.index_count;
+                        culled=true;
+                    }
+                }
+                if (std::getenv("UC_GPU_PACKETS") && std::chrono::steady_clock::now()-cull_since>std::chrono::seconds(2)) {
+                    std::fprintf(stderr,"[vr-cull] 2 s: %llu world draws tested, %llu culled (%llu of %llu indices drawn); the eyes reach %.3f x %.3f of the game's view (widened %.2fx)\n",(unsigned long long)cull_tested,(unsigned long long)cull_draws,(unsigned long long)cull_indices,(unsigned long long)all_indices,reach[0],reach[1],gx::vr_fov_scale().load());
+                    cull_tested=cull_draws=cull_indices=all_indices=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
+                }
             }
+            if (culled) continue;
             vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push);
             const bool counted=frag_dump_ && (frag_queries_.size()+1)*layers_<=kFragQueries;
             if (counted) vkCmdBeginQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_),VK_QUERY_CONTROL_PRECISE_BIT);
-            vkCmdDrawIndexed(slot.command, info.index_count, 1, info.first_index, info.first_vertex, 0);
+            vkCmdDrawIndexed(slot.command, info.index_count, 1, info.first_index, xform_ ? 0 : info.first_vertex, 0);
             const auto depth=draw.uniforms->pixel[1]&31;
             if((draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0)) {
                 // GX destination alpha replaces stored alpha after RGB blending.
                 const auto alpha_key=pipeline_key(draw,true);
                 const auto alpha=pipeline_for(alpha_key);
-                vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,alpha.pipeline);
+                bind_pipeline(alpha.pipeline);
                 set_draw_state(alpha_key);
                 if (alpha.uber) { push.alpha_pass=1; vkCmdPushConstants(slot.command,layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,uint32_t(sizeof push),&push); }
-                vkCmdDrawIndexed(slot.command,info.index_count,1,info.first_index,info.first_vertex,0);
+                vkCmdDrawIndexed(slot.command,info.index_count,1,info.first_index,xform_ ? 0 : info.first_vertex,0);
             }
             if (counted) { vkCmdEndQuery(slot.command,frag_pool_,uint32_t(frag_queries_.size()*layers_)); frag_queries_.push_back(uint32_t(d)); }
         }
@@ -3205,7 +3393,12 @@ void VulkanRenderer::shutdown() {
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
-        for (auto module:{vertex_module_,nobank_vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        for (auto module:{vertex_module_,nobank_vertex_module_,fragment_module_,early_module_,uber_module_,shadow_vertex_module_,xform_vertex_module_,xform_compute_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        xform_vertex_module_=xform_compute_module_=VK_NULL_HANDLE;
+        if (xform_pipeline_) vkDestroyPipeline(device,xform_pipeline_,nullptr);
+        if (xform_layout_) vkDestroyPipelineLayout(device,xform_layout_,nullptr);
+        if (xform_set_layout_) vkDestroyDescriptorSetLayout(device,xform_set_layout_,nullptr);
+        xform_pipeline_=VK_NULL_HANDLE; xform_layout_=VK_NULL_HANDLE; xform_set_layout_=VK_NULL_HANDLE;
         for (auto& [hash,module]:folded_modules_) if (module) vkDestroyShaderModule(device,module,nullptr);
         folded_modules_.clear();
         shadow_vertex_module_=VK_NULL_HANDLE;

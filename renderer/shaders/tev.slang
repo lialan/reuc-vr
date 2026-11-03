@@ -24,7 +24,15 @@ struct DrawState {
     uint4 indCmd[4];
     uint4 tevWords[17];   // pipeline key words 1..67 (only the ubershader reads them)
 };
+#ifdef XFORM
+// The headset's vertex pre-pass (smoke.slang xformMain, a compute shader over every vertex of a packet): each job's draw state is
+// the draw's uniform block, read from the same buffer as an array (uniform stride == sizeof(DrawState)).
+[[vk::binding(2,0)]] StructuredBuffer<DrawState> xformDrawStates;
+static uint xformDraw = 0;
+#define drawState xformDrawStates[xformDraw]
+#else
 [[vk::binding(2,0)]] ConstantBuffer<DrawState> drawState : register(b0);
+#endif
 #ifdef STEREO
 // The headset (STEREO): every image is an array; EFB copies hold one layer per eye, other textures one layer, which Vulkan's layer clamp
 // picks for either eye. stereoLayer is the fragment's view (set by fragmentMain).
@@ -273,14 +281,17 @@ uint indirectWord(uint index) { return drawState.indirect[index / 4][index % 4];
 int signed11(uint value) { return int(value << 21) >> 21; }
 int indirectWrap(int coord, uint mode) { return mode == 0 ? coord : (mode < 6 ? (coord & int(0xFFFEu >> mode)) : 0); }
 // GX indirect texturing in hardware fixed point: texcoords are texels*128, matrices s.10, scale 2^(e-17).
-float2 indirectCoord(uint map, float2 coord, float2 uv[8], uint command, inout int2 previous) {
+// A texture coordinate as interpolated (s, t, q) divided by q where it is read: the stages and the indirect path pick coordinates by a
+// runtime index (an indirect stage's coordinate comes from a uniform), so dividing all eight up front cost every fragment eight divisions.
+float2 uvOf(float3 t) { return t.xy / (t.z != 0.0 ? t.z : 1.0); }
+float2 indirectCoord(uint map, float2 coord, float3 uv[8], uint command, inout int2 previous) {
     float2 size = imageSize(map);
     int2 fixedUV = int2(floor(coord * size * 128.0));
     uint stage = command & 3, format = (command >> 2) & 3, bias = (command >> 4) & 7, matrix = (command >> 9) & 15;
     uint iref = indirectWord(9), scale = indirectWord(10 + stage / 2) >> ((stage & 1) * 8);
     uint indirectMap = (iref >> (stage * 6)) & 7, indirectCoordinate = (iref >> (stage * 6 + 3)) & 7;
     float2 indirectSize = imageSize(indirectMap);
-    int2 indirectUV = int2(floor(uv[indirectCoordinate] * indirectSize * 128.0));
+    int2 indirectUV = int2(floor(uvOf(uv[indirectCoordinate]) * indirectSize * 128.0));
     indirectUV = int2(indirectUV.x >> (scale & 15), indirectUV.y >> ((scale >> 4) & 15));
     float4 texel = sampleImage(indirectMap, (float2(indirectUV) + 0.5) / (indirectSize * 128.0));
     int3 offset = int3(round(float3(texel.a, texel.b, texel.g) * 255.0));
@@ -307,12 +318,12 @@ float2 indirectCoord(uint map, float2 coord, float2 uv[8], uint command, inout i
     previous = result;
     return (float2(result) + 0.5) / (size * 128.0);
 }
-void tevStage(inout float4 r[4], float2 uv[8], float4 vertexColor, float4 vertexColor1,
+void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertexColor1,
               uint ce, uint ae, uint order, uint konst, uint stageIndex, inout int2 previousCoord) {
     float4 tex = float4(1.0);
     uint command = drawState.indCmd[stageIndex / 4][stageIndex % 4];
     if ((order & 64) != 0) {
-        float2 coord = uv[(order >> 3) & 7];
+        float2 coord = uvOf(uv[(order >> 3) & 7]);
         if (command != 0) coord = indirectCoord(order & 7, coord, uv, command, previousCoord);
         tex = sampleImage(order & 7, coord);
     }
@@ -335,8 +346,8 @@ void tevStage(inout float4 r[4], float2 uv[8], float4 vertexColor, float4 vertex
     r[(ce >> 22) & 3].rgb = rgb;
     r[(ae >> 22) & 3].a = alpha;
 }
-float4 evaluateTev(float2 uv[8], float4 color, float4 color1) {
-    if (stageCount == 0) return color * UC_SAMPLE(0, uv[0]);
+float4 evaluateTev(float3 uv[8], float4 color, float4 color1) {
+    if (stageCount == 0) return color * UC_SAMPLE(0, uvOf(uv[0]));
     float4 r[4];
     [unroll] for (uint i = 0; i < 4; ++i) r[i] = drawState.registers[i];
     int2 previousCoord = int2(0);
