@@ -622,7 +622,8 @@ last row is one run cut at 8 of 15 game seconds (the headset was handed to the o
 live fights (with and without UC_CPU_BOOST=1) are still to do.
 
 Mac (`uctest bench --demo fightmac --runs 3`, partly GPU-bound: its draw-done waits for GPU completion): 110dac2 -> builder -8.4% wall (CI
-[-15.7%, -1.1%]), guest Mcycles 7455 -> 6016 (-19%); feee800 -> merged -4.7% wall (inconclusive), peak FPS 102 -> 108.
+[-15.7%, -1.1%]), guest Mcycles 7455 -> 6016 (-19%); feee800 -> merged -4.7% wall (inconclusive), peak FPS 102 -> 108; feee800 -> c11423f guest Mcycles 6792 -> 5173/5125 (**-24%**), wall
+14.87 -> 14.67 s (one base round; the second was cut by a window close).
 
 Determinism: `fightmac --det-out` identical to the base over all 9226 retraces for the builder (vs 110dac2) and for the merge with the
 spin (vs feee800). 202/202 tests.
