@@ -481,3 +481,36 @@ Compares in body_800A4434 224 -> 99, calls 148 -> 32 (the cold MMIO calls were o
 
 Mac (`uctest bench dist/uc_base dist/uc_fm3 --demo fightmac --runs 3`): guest Mcycles 7444/7443/7663 -> 7020/7043/7087 (**-6.2%**),
 wall -2.8% (CI [-6.9%, +1.4%], inconclusive at 3 rounds; the Mac replay is partly GPU-bound).
+
+Headset (fightvr replay, render scale 1, UC_FINISH_AT_SUBMIT=1, guest Mcycles per game second over retraces 8450-9352; order base,
+1+2, 1, base, 1+2):
+
+| build | guest Mcycles / game s | wall ms / game s |
+|---|---|---|
+| a129833 | 2525, 2550 | 2835, 2879 |
+| fastmem (1a01dba) | 2350 (**-7.4%**) | 2628 |
+| fastmem + one-write bookkeeping (745bec5) | 2303, 2319 (**-8.9%**) | 2594, 2643 (-8.5%) |
+
+Quest host instructions after both (base -> now): body_800A4434 7208 -> 2844 (9.2 per guest instruction), body_80376904 2148 -> 1062
+(6.2), body_80284D58 1356 -> 1081, body_800BA398 9613 -> 7536, fn_802647AC 2568 -> 1634.
+
+## CPU items 2-5 (same branch)
+
+- **2, one write per store** (745bec5): rollback's dirty pages are the pages whose gx write epoch is newer than the tracker's stamp
+  (taken at every capture/restore; a watch_reset makes every page dirty once), so a store's bookkeeping is the one `page_epoch`
+  write. Determinism and the in-game rollback probe (UC_ROLLBACK_PROBE_RETRACE=8600 in the replay) pass. Mac guest Mcycles a further
+  -2.7% (7050 -> 6861), in the headset figures above.
+- **3, call-graph register summaries**: tried and shelved. The sound generalisation of the leaf calls is "closed" functions, whose
+  whole call tree reaches no safe point (no loop, no non-leaf HLE, no indirect or tail call; recursion dropped): 4434 instead of 3679
+  functions, 25.6k instead of 22.2k partial-sync calls, reloads 288k -> 284k but entry loads 404k -> 415k (a register kept across a
+  partial call has to be current from the entry instead of reloaded), no change in the hot functions, Mac Mcycles +0.5%. A summary
+  over callees that do reach safe points is not sound here: at every safe point the whole guest state must be in the context (a
+  parked SDK call resumes through secondary entries that load it; rollback/snapshot restore rewrites it and every frame reloads it
+  after its call), so a caller must flush before and reload after any such call whatever the callee touches.
+- **4, adjacent paired halves**: `Ctx::fpr[32][2]` with `c.f[i]`/`c.ps1[i]` as views; ps_pair/ps_set are one 16-byte access.
+  fn_802647AC (paired singles) 1634 -> 1472 Quest instructions, others unchanged; Mac Mcycles neutral within noise; headset
+  2308, 2329 against 2315 for 745bec5 in the same session (alternating): no gain, not committed (the register cache already keeps
+  both halves in host registers inside a function; only the context syncs got shorter).
+- **5, registers as arguments**: NDK 27's clang 18 ignores `preserve_none` (Apple clang 21 accepts it), and the safe-point rule above
+  means a pinned register would still be stored to the context before and reloaded after every non-closed call, which is where the
+  hot functions' context traffic is (body_800A4434: 497 of its loads/stores address the context, 426 the stack); not done.
