@@ -39,9 +39,13 @@ int main() {
     CHECK(a.find("fell off the end") != std::string::npos);
     {   // a backward branch polls for pending interrupts; a forward branch does not
         auto lp = make_prog({addi(3, 3, 1), 0x4BFFFFFC /* b -4 */, blr});
+        lp.reg_cache = false;
         std::string t = uc::emit_function(lp, lp.an.functions[0], st);
         CHECK(t.find("ppc::poll(c); goto L_80003100;") != std::string::npos);
-        auto fw = make_prog({0x48000008 /* b +8 */, addi(3, 3, 1), blr});
+        lp.reg_cache = true;   // the poll's slow path syncs the register cache with the real context around the safe point
+        t = uc::emit_function(lp, lp.an.functions[0], st);
+        CHECK(t.find("if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { ctx.r[3] = c.r[3]; ctx.poll_count = c.poll_count; ppc::poll_slow(ctx); "
+                     "c.r[3] = ctx.r[3]; c.poll_count = ctx.poll_count; } goto L_80003100;") != std::string::npos);        auto fw = make_prog({0x48000008 /* b +8 */, addi(3, 3, 1), blr});
         std::string u = uc::emit_function(fw, fw.an.functions[0], st);
         CHECK(u.find("goto L_80003108;") != std::string::npos && u.find("ppc::poll") == std::string::npos);
     }
@@ -71,9 +75,13 @@ int main() {
         auto q = make_prog(a.w, cfg);
         std::string t = uc::emit_function(q, q.an.functions[0], st);
         char buf[64];
-        std::snprintf(buf, sizeof buf, "fn_%08X(c); return;", g);
+        std::snprintf(buf, sizeof buf, "ctx.r[3] = c.r[3]; fn_%08X(ctx); return;", g);
         CHECK(t.find(buf) != std::string::npos);
         CHECK(t.find("fell off") == std::string::npos);
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        std::snprintf(buf, sizeof buf, "  fn_%08X(c); return;", g);
+        CHECK(t.find(buf) != std::string::npos);
     }
     {   // a branch target that is inside no function traps at run time and is counted
         Asm a;
@@ -83,6 +91,28 @@ int main() {
         std::string t = uc::emit_insn(q, q.an.functions[0], a.addr(0), a.w[0], s2);
         CHECK(t.find("not inside any translated function") != std::string::npos);
         CHECK(s2.traps_midfunc == 1);
+    }
+    {   // register cache: registers are loaded on entry only when read before written, stored before a call or return only when written
+        // since the last sync, and reloaded after a call only when read again before the next write
+        Asm a;
+        a.emit(addi(3, 3, 1)); a.emit(addi(4, 0, 7));
+        size_t call = a.emit(0);
+        a.emit(addi(3, 3, 2)); a.emit(addi(5, 4, 0)); a.emit(blr);
+        uint32_t g = a.here(); a.emit(blr);
+        a.patch_bl(call, g);
+        auto q = make_prog(a.w);
+        std::string t = uc::emit_function(q, q.an.functions[0], st);
+        auto has = [&](const std::string& s) { return t.find(s) != std::string::npos; };
+        CHECK(has("ppc::Ctx& ctx = c;"));
+        CHECK(has("ppc::Ctx c; c.mem = ctx.mem;\n  c.r[3] = ctx.r[3]; \n"));   // r4 and lr are written before any read
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "c.lr = 0x%08Xu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.lr = c.lr; fn_%08X(ctx); c.r[3] = ctx.r[3]; c.r[4] = ctx.r[4]; ",
+                      a.addr(call) + 4, g);
+        CHECK(has(buf));
+        CHECK(has("{ ctx.r[3] = c.r[3]; ctx.r[5] = c.r[5]; return; }"));   // r4 was not written after the call
+        q.reg_cache = false;
+        t = uc::emit_function(q, q.an.functions[0], st);
+        CHECK(!has("ctx"));
     }
     {   // every translated function starts with the trace hook (a no-op macro unless UC_TRACE is defined)
         std::string t = uc::emit_function(p, f, st);

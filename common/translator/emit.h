@@ -12,6 +12,7 @@ struct EmitStats {
     size_t functions = 0, instructions = 0, invalid = 0, traps_midfunc = 0, unresolved_bctr = 0, oe_traps = 0, unsupported = 0;
     size_t indirect_tail = 0, secondary_entries = 0, fallthrough_tail = 0;
     size_t cr_dead_compares = 0, cr_fused_branches = 0, cr_dropped_records = 0;   // condition-register writes that were never read
+    size_t reg_entry_loads = 0, reg_flushes = 0, reg_reloads = 0;                  // register-cache copies emitted
 };
 
 struct Program {
@@ -19,6 +20,7 @@ struct Program {
     Analysis an;
     Config cfg;
     bool cr_opt = true;   // drop dead CR writes and fuse compare+branch (translator --no-cr-opt turns it off)
+    bool reg_cache = true;   // keep guest registers in function-local copies, synced at calls and exits (translator --no-reg-cache turns it off)
 };
 
 struct Output {
@@ -39,6 +41,10 @@ struct FusedCmp { std::string lhs, rhs; };   // the compare feeding the next con
 struct CrHints {
     bool drop_rc = false;                 // the record form's CR write is never read
     const FusedCmp* fused = nullptr;      // a conditional branch tests this compare directly instead of reading CR
+    // Register cache (Program::reg_cache): `c` is the function's local copy of the guest registers and `ctx` the real context. Before a call,
+    // a return or a trap the instruction writes `flush` (local -> ctx); after a call or an interrupt poll it writes `reload` (ctx -> local).
+    bool local = false;
+    std::string flush, reload;
 };
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t word, EmitStats& st, const CrHints* hints = nullptr);

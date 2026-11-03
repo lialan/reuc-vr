@@ -1,4 +1,5 @@
 #include "translator/emit.h"
+#include "translator/regeffect.h"
 #include "ppc/insn.h"
 #include "ppc/isa.h"
 #include <algorithm>
@@ -97,16 +98,28 @@ static std::string cond_expr(uint32_t bo, uint32_t bi, std::string& pre) {
     return e.empty() ? "true" : e;
 }
 
-static std::string branch_action(const Program& p, const Function& f, uint32_t pc, uint32_t target, bool lk, EmitStats& st) {
+// Sync code of one instruction in register-cache mode (CrHints::local); empty strings and the context `c` otherwise.
+struct SyncText {
+    std::string cx = "c", flush, reload;
+    explicit SyncText(const CrHints* h) { if (h && h->local) { cx = "ctx"; flush = h->flush; reload = h->reload; } }
+    bool local() const { return cx == "ctx"; }
+};
+
+static std::string branch_action(const Program& p, const Function& f, uint32_t pc, uint32_t target, bool lk, EmitStats& st, const SyncText& s) {
     Target tk = classify(p, f, target);
-    if (tk.kind == Target::Internal && !lk) return std::string(target <= pc ? "ppc::poll(c); " : "") + "goto L_" + hex8(target) + ";";   // a loop is a safe point
+    if (tk.kind == Target::Internal && !lk) {
+        if (target > pc) return "goto L_" + hex8(target) + ";";
+        // a loop is a safe point; the interrupts that may run there see the registers in the real context
+        if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + "} goto L_" + hex8(target) + ";";
+        return "ppc::poll(c); goto L_" + hex8(target) + ";";
+    }
     if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) {
         ++st.traps_midfunc;
-        return trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
+        return s.flush + trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
     }
     std::string fn = tk.kind == Target::Secondary ? sec_name(tk.owner, target) : callee(p, target);
-    if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + fn + "(c);";
-    return fn + "(c); return;";
+    if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + fn + "(" + s.cx + ");" + (s.reload.empty() ? "" : " " + s.reload);
+    return s.flush + fn + "(" + s.cx + "); return;";
 }
 
 // Branch condition from a compare that was not written to CR: bit 0..3 of BI = LT GT EQ SO of that compare.
@@ -118,36 +131,38 @@ static std::string fused_cond(const FusedCmp& cmp, uint32_t bo, uint32_t bi) {
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t w, EmitStats& st, const CrHints* hints) {
     ++st.instructions;
+    const SyncText s(hints);
     const ppc::OpInfo* op = ppc::decode(w);
     if (!op) {
         ++st.invalid;
-        return trap_str(pc, "illegal or data word " + hex8(w));
+        return s.flush + trap_str(pc, "illegal or data word " + hex8(w));
     }
     using ppc::Kind;
     std::string name = op->name;
-    if ((name == "twi" || name == "tw") && ppc::t(w) == 31) return trap_str(pc, "unconditional trap");
-    if (op->sub == ppc::Sub::X9 && ppc::oe(w)) { ++st.oe_traps; return trap_str(pc, "OE (overflow-enabled) form of " + name + " is not implemented"); }
-    if (op->kind == Kind::UNSUP) { ++st.unsupported; return trap_str(pc, "unsupported instruction " + name); }
+    if ((name == "twi" || name == "tw") && ppc::t(w) == 31) return s.flush + trap_str(pc, "unconditional trap");
+    if (op->sub == ppc::Sub::X9 && ppc::oe(w)) { ++st.oe_traps; return s.flush + trap_str(pc, "OE (overflow-enabled) form of " + name + " is not implemented"); }
+    if (op->kind == Kind::UNSUP) { ++st.unsupported; return s.flush + trap_str(pc, "unsupported instruction " + name); }
 
     switch (op->kind) {
-        case Kind::SC: return "uc::hle_sc(c, 0x" + hex8(pc) + "u);";
+        case Kind::SC: return s.flush + "uc::hle_sc(" + s.cx + ", 0x" + hex8(pc) + "u);" + (s.reload.empty() ? "" : " " + s.reload);
         case Kind::BR: {
             int32_t li = ppc::li(w);
             uint32_t target = ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li);
-            return branch_action(p, f, pc, target, ppc::lk(w), st);
+            return branch_action(p, f, pc, target, ppc::lk(w), st, s);
         }
         case Kind::BC: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
             uint32_t target = ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w));
             std::string pre;
             std::string cond = hints && hints->fused ? fused_cond(*hints->fused, bo, bi) : cond_expr(bo, bi, pre);
-            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st) + " } }";
+            return "{ " + pre + "if (" + cond + ") { " + branch_action(p, f, pc, target, ppc::lk(w), st, s) + " } }";
         }
         case Kind::BCLR: {
             uint32_t bo = ppc::bo(w), bi = ppc::bi(w);
             std::string pre;
             std::string cond = hints && hints->fused ? fused_cond(*hints->fused, bo, bi) : cond_expr(bo, bi, pre);
-            std::string act = ppc::lk(w) ? "{ uint32_t t_ = c.lr; c.lr = 0x" + hex8(pc + 4) + "u; uc::call_indirect(c, t_); }" : "return;";
+            std::string act = ppc::lk(w) ? "{ uint32_t t_ = c.lr; c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", t_); " + s.reload + "}"
+                                         : s.flush + "return;";
             if (cond == "true" && pre.empty()) return act;
             return "{ " + pre + "if (" + cond + ") { " + act + " } }";
         }
@@ -156,23 +171,42 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
             std::string pre;
             std::string cond = cond_expr(bo | 4, bi, pre);   // bcctr never decrements CTR
             if (ppc::lk(w)) {
-                std::string act = "c.lr = 0x" + hex8(pc + 4) + "u; uc::call_indirect(c, c.ctr);";
+                std::string act = "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + "uc::call_indirect(" + s.cx + ", c.ctr);" + (s.reload.empty() ? "" : " " + s.reload);
                 return cond == "true" ? act : "if (" + cond + ") { " + act + " }";
             }
             for (const auto& jt : p.an.jump_tables) {
                 if (jt.bctr_addr != pc) continue;
                 std::set<uint32_t> seen;
-                std::string s = "switch (c.ctr) { ";
-                for (uint32_t t : jt.targets) if (seen.insert(t).second) s += "case 0x" + hex8(t) + "u: goto L_" + hex8(t) + "; ";
-                s += "default: " + trap_str(pc, "jump table index out of range") + " }";
-                return s;
+                std::string sw = "switch (c.ctr) { ";
+                for (uint32_t t : jt.targets) if (seen.insert(t).second) sw += "case 0x" + hex8(t) + "u: goto L_" + hex8(t) + "; ";
+                sw += "default: " + s.flush + trap_str(pc, "jump table index out of range") + " }";
+                return sw;
             }
             if (std::find(p.an.unresolved_bctr.begin(), p.an.unresolved_bctr.end(), pc) != p.an.unresolved_bctr.end()) ++st.unresolved_bctr;
             else ++st.indirect_tail;
-            std::string act = "uc::call_indirect(c, c.ctr); return;";
+            std::string act = s.flush + "uc::call_indirect(" + s.cx + ", c.ctr); return;";
             return cond == "true" ? "{ " + act + " }" : "if (" + cond + ") { " + act + " }";
         }
         default: break;
+    }
+    if (s.local()) {
+        // State the register cache does not hold lives in the real context; lmw/stmw become one access per register so every register index
+        // stays a compile-time constant (the local copy is then kept in host registers).
+        const uint32_t T = ppc::t(w), spr = ppc::spr(w);
+        const bool cached_spr = spr == 1 || spr == 8 || spr == 9 || (spr >= 912 && spr <= 919);
+        if (name == "mfspr" && !cached_spr) return "c.r[" + num(T) + "] = ctx.spr[" + num(spr & 1023) + "];";
+        if (name == "mtspr" && !cached_spr) return "ctx.spr[" + num(spr & 1023) + "] = c.r[" + num(T) + "];";
+        if (name == "mfmsr") return "c.r[" + num(T) + "] = ctx.msr;";
+        if (name == "mtmsr") return "ctx.msr = c.r[" + num(T) + "];";
+        if (name == "lmw" || name == "stmw") {
+            const uint32_t A = ppc::a(w);
+            std::string o = "const uint32_t e_ = " + (A ? "c.r[" + num(A) + "] + " : std::string()) + "uint32_t(" + num(ppc::simm(w)) + ");";
+            for (uint32_t i = T; i < 32; ++i) {
+                const std::string at = "e_ + " + num(4 * (i - T)) + "u";
+                o += name == "lmw" ? " c.r[" + num(i) + "] = ppc::rd32(c, " + at + ");" : " ppc::wr32(c, " + at + ", c.r[" + num(i) + "]);";
+            }
+            return o;
+        }
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
@@ -374,6 +408,108 @@ CrLive analyze_cr(const Program& p) {
     return live;
 }
 
+// ---- register cache ----
+// In register-cache mode every translated function works on a local ppc::Ctx `c` (only the parts it uses survive the optimiser, as host
+// registers) and syncs it with the real context `ctx` where other code can look: before a call, a return, a tail call, a trap or an interrupt
+// poll it stores the registers written since the last sync ("dirty", forward dataflow), and after a call or a poll it reloads the registers
+// that are read before being written again ("live", backward dataflow; a later flush counts as a read, so a flushed copy is always current).
+// Guest memory stores can no longer alias the registers, so the compiler keeps them in host registers across loads and stores.
+namespace {
+struct RegNode {
+    RegEffect eff;
+    bool fall = true;          // continues at the next instruction on a path without a sync
+    bool call = false;         // a call on some path, after which execution continues at the next instruction
+    bool exit = false;         // a path that flushes and leaves (return, tail call, trap)
+    int target = -1;           // internal branch target (instruction index; n = past the end)
+    bool poll = false;         // the internal branch is a loop back edge (an interrupt poll on its slow path)
+    std::vector<int> table;    // jump table targets
+};
+
+RegSet cached_mask() { RegSet m; for (int i = 0; i < res::COUNT; ++i) m.set(size_t(i)); return m; }
+
+std::string copy_text(const RegSet& set, bool to_ctx) {
+    std::string s;
+    for (int i = 0; i < res::COUNT; ++i) {
+        if (!set.test(size_t(i))) continue;
+        s += to_ctx ? reg_field(i, "ctx") + " = " + reg_field(i, "c") + "; " : reg_field(i, "c") + " = " + reg_field(i, "ctx") + "; ";
+    }
+    return s;
+}
+
+// Control flow of one instruction as emit_insn writes it.
+RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment) {
+    using ppc::Kind;
+    RegNode nd;
+    auto index = [&](uint32_t t) { return int((t - f.entry) / 4); };
+    const ppc::OpInfo* op = ppc::decode(w);
+    if (comment) return nd;   // a dead or folded compare: no code
+    if (!op || ((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31) || (op->sub == ppc::Sub::X9 && ppc::oe(w)) ||
+        op->kind == Kind::UNSUP) { nd.fall = false; nd.exit = true; return nd; }
+    auto use = [&](int i) { nd.eff.use.set(size_t(i)); };
+    auto def = [&](int i, bool always) { nd.eff.may.set(size_t(i)); if (always) nd.eff.must.set(size_t(i)); };
+    // a taken branch to `target` (lk: a call): the same classification as branch_action
+    auto action = [&](uint32_t target, bool lk, bool always) {
+        const Target tk = classify(p, f, target);
+        if (tk.kind == Target::Internal && !lk) {
+            nd.target = index(target); nd.poll = target <= pc;
+            if (nd.poll) { use(res::POLL); def(res::POLL, false); }   // the back edge counts in the local copy of poll_count
+            return;
+        }
+        if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) { nd.exit = true; return; }
+        if (lk) { def(res::LR, always); nd.call = true; return; }
+        nd.exit = true;
+    };
+    // the condition of a conditional branch; true when it is always taken
+    auto condition = [&](uint32_t bo, uint32_t bi, bool ctr_ok) {
+        if (!(bo & 4) && ctr_ok) { use(res::CTR); def(res::CTR, true); }
+        if (!(bo & 16)) { if (h.fused) nd.eff.use |= fused_use; else use(res::CR + int(bi >> 2)); }
+        return (bo & 16) && ((bo & 4) || !ctr_ok);
+    };
+    switch (op->kind) {
+        case Kind::SC: nd.fall = false; nd.call = true; return nd;
+        case Kind::BR: {
+            const int32_t li = ppc::li(w);
+            action(ppc::aa(w) ? uint32_t(li) : pc + uint32_t(li), ppc::lk(w), true);
+            nd.fall = false;
+            return nd;
+        }
+        case Kind::BC: {
+            const bool always = condition(ppc::bo(w), ppc::bi(w), true);
+            action(ppc::aa(w) ? uint32_t(ppc::bd(w)) : pc + uint32_t(ppc::bd(w)), ppc::lk(w), always);
+            nd.fall = !always;
+            return nd;
+        }
+        case Kind::BCLR: {
+            const bool always = condition(ppc::bo(w), ppc::bi(w), true);
+            if (ppc::lk(w)) { use(res::LR); def(res::LR, always); nd.call = true; }
+            else nd.exit = true;
+            nd.fall = !always;
+            return nd;
+        }
+        case Kind::BCCTR: {
+            const bool table = !ppc::lk(w) && std::any_of(p.an.jump_tables.begin(), p.an.jump_tables.end(), [&](const auto& jt) { return jt.bctr_addr == pc; });
+            use(res::CTR);
+            if (table) {
+                for (const auto& jt : p.an.jump_tables)
+                    if (jt.bctr_addr == pc) for (uint32_t t : jt.targets) if (t >= f.entry && t < f.end) nd.table.push_back(index(t));
+                nd.fall = false; nd.exit = true;   // the default case traps
+                return nd;
+            }
+            const bool always = condition(ppc::bo(w) | 4, ppc::bi(w), false);
+            if (ppc::lk(w)) { def(res::LR, always); nd.call = true; }
+            else nd.exit = true;
+            nd.fall = !always;
+            return nd;
+        }
+        default: break;
+    }
+    bool ok = false;
+    nd.eff = reg_effect(*op, w, op->rc && ppc::rc(w) && !h.drop_rc, ok);
+    if (!ok) { nd.eff.use = cached_mask(); }   // not expected: read everything, write nothing
+    return nd;
+}
+}  // namespace
+
 std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live) {
     std::set<uint32_t> labels{f.entry};
     for (uint32_t pc = f.entry; pc < f.end; pc += 4) {
@@ -393,65 +529,128 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     bool has_sec = sit != p.an.secondary.end();
     if (has_sec) for (uint32_t t : sit->second) labels.insert(t);
 
-    std::ostringstream o;
-    if (has_sec) {
-        o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n  switch (at) { ";
-        for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
-        o << "default: break; }\n";
-    } else {
-        o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
-    }
+    // pass 1: what each instruction becomes (CR liveness decisions)
+    const size_t n = (f.end - f.entry) / 4;
+    std::vector<uint32_t> words(n, 0);
+    std::vector<CrHints> hints(n);
+    std::vector<std::string> comment(n);              // a dead or folded compare: emitted as this comment
+    std::vector<FusedCmp> fused(n);                   // compare operands for the branch at i
+    std::vector<RegSet> fused_use(n);
     const std::vector<uint8_t>* after = nullptr;   // CR fields still readable after each instruction
     if (live) { auto it = live->out.find(f.entry); if (it != live->out.end()) after = &it->second; }
-    FusedCmp fused;
-    bool fuse_next = false;   // the previous compare was folded into this instruction's branch
-    for (uint32_t pc = f.entry; pc < f.end; pc += 4) {
-        uint32_t w = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pc = f.entry + uint32_t(i) * 4;
+        uint32_t& w = words[i];
         p.img.word(pc, w);
-        if (labels.count(pc)) o << "L_" << hex8(pc) << ":;\n";
-        CrHints hints;
-        if (fuse_next) { hints.fused = &fused; fuse_next = false; }
-        std::string code;
         const ppc::OpInfo* op = after ? ppc::decode(w) : nullptr;
         if (op && op->kind != ppc::Kind::UNSUP && !(op->sub == ppc::Sub::X9 && ppc::oe(w)) && !((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31)) {
-            const uint8_t live_after = (*after)[(pc - f.entry) / 4];
+            const uint8_t live_after = (*after)[i];
             const std::string name = op->name;
             if (name == "cmp" || name == "cmpl" || name == "cmpi" || name == "cmpli") {
                 const uint32_t field = ppc::crfd(w);
                 uint32_t next = 0;
                 const ppc::OpInfo* nop = pc + 4 < f.end && !labels.count(pc + 4) && p.img.word(pc + 4, next) ? ppc::decode(next) : nullptr;
-                if (!(live_after & fld(field))) { code = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
+                if (!(live_after & fld(field))) { comment[i] = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
                 else if (nop && (nop->kind == ppc::Kind::BC || nop->kind == ppc::Kind::BCLR) && !ppc::lk(next) && (ppc::bo(next) & 4) && !(ppc::bo(next) & 16) &&
-                         (ppc::bi(next) >> 2) == field && !((*after)[(pc + 4 - f.entry) / 4] & fld(field))) {
+                         (ppc::bi(next) >> 2) == field && !((*after)[i + 1] & fld(field))) {
                     // the only reader is the next branch: test the operands there and skip the CR write
                     const std::string a = "c.r[" + num(ppc::a(w)) + "]";
                     const bool is_signed = name == "cmp" || name == "cmpi";
                     const std::string lhs = is_signed ? "int32_t(" + a + ")" : a;
                     std::string rhs;
-                    if (name == "cmp" || name == "cmpl") rhs = is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]";
+                    RegSet u;
+                    u.set(size_t(res::R + int(ppc::a(w)))); u.set(size_t(res::SO));
+                    if (name == "cmp" || name == "cmpl") { rhs = is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]"; u.set(size_t(res::R + int(ppc::b(w)))); }
                     else rhs = is_signed ? num(ppc::simm(w)) : num(ppc::uimm(w)) + "u";
-                    fused = {lhs, rhs};
-                    fuse_next = true;
-                    code = "/* cr" + num(field) + " compare is folded into the next branch */";
+                    fused[i + 1] = {lhs, rhs};
+                    fused_use[i + 1] = u;
+                    hints[i + 1].fused = &fused[i + 1];
+                    comment[i] = "/* cr" + num(field) + " compare is folded into the next branch */";
                     ++st.cr_fused_branches;
                 }
             } else if (op->rc && ppc::rc(w) && !(live_after & fld(fp_name(name) ? 1 : 0))) {
-                hints.drop_rc = true;
+                hints[i].drop_rc = true;
                 ++st.cr_dropped_records;
             }
         }
-        if (code.empty()) code = emit_insn(p, f, pc, w, st, &hints);
-        else ++st.instructions;
-        o << "  /*" << hex8(pc) << "*/ { " << code << " }\n";
     }
     uint32_t last = 0;
     p.img.word(f.end - 4, last);
-    if (!is_terminator_word(last) && p.an.is_entry(f.end)) {
-        ++st.fallthrough_tail;
-        o << "  " << callee(p, f.end) << "(c); return;\n}\n";
-    } else {
-        o << "  " << trap_str(f.end, "fell off the end of function " + hex8(f.entry)) << "\n}\n";
+    const bool tail_end = !is_terminator_word(last) && p.an.is_entry(f.end);
+
+    // pass 2: register cache dataflow
+    const bool local = p.reg_cache;
+    RegSet entry_load;
+    std::vector<RegSet> dirty_after(n + 1), live_in(n + 1);
+    if (local) {
+        std::vector<RegNode> nodes(n);
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty());
+        std::vector<RegSet> dirty_in(n + 1);
+        for (bool changed = true; changed;) {   // forward: written since the last sync, on some path
+            changed = false;
+            auto flow = [&](int to, const RegSet& s) { const RegSet before = dirty_in[size_t(to)]; dirty_in[size_t(to)] |= s; changed |= dirty_in[size_t(to)] != before; };
+            for (size_t i = 0; i < n; ++i) {
+                const RegNode& nd = nodes[i];
+                dirty_after[i] = dirty_in[i] | nd.eff.may;
+                if (nd.fall) flow(int(i + 1), dirty_after[i]);
+                if (nd.target >= 0) flow(nd.target, dirty_after[i]);
+                for (int t : nd.table) flow(t, dirty_after[i]);
+            }
+        }
+        dirty_after[n] = dirty_in[n];
+        live_in[n] = dirty_in[n];   // past the end: a tail call or a trap flushes
+        for (bool changed = true; changed;) {   // backward: needed (read, or flushed) before the next write
+            changed = false;
+            for (size_t i = n; i-- > 0;) {
+                const RegNode& nd = nodes[i];
+                RegSet x;
+                if (nd.fall) x |= live_in[i + 1];
+                if (nd.call || nd.exit) x |= dirty_after[i];
+                if (nd.target >= 0) { x |= live_in[size_t(nd.target)]; if (nd.poll) x |= dirty_after[i]; }
+                for (int t : nd.table) x |= live_in[size_t(t)];
+                const RegSet in = nd.eff.use | (nd.eff.may & ~nd.eff.must) | (x & ~nd.eff.must);
+                if (in != live_in[i]) { live_in[i] = in; changed = true; }
+            }
+        }
+        entry_load = live_in[0];
+        if (has_sec) for (uint32_t t : sit->second) if (t >= f.entry && t < f.end) entry_load |= live_in[(t - f.entry) / 4];
+        for (size_t i = 0; i < n; ++i) {
+            const RegNode& nd = nodes[i];
+            hints[i].local = true;
+            if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(dirty_after[i], true); st.reg_flushes += dirty_after[i].count(); }
+            if (nd.call) { hints[i].reload = copy_text(live_in[i + 1], false); st.reg_reloads += live_in[i + 1].count(); }
+            else if (nd.poll) { hints[i].reload = copy_text(live_in[size_t(nd.target)], false); st.reg_reloads += live_in[size_t(nd.target)].count(); }
+        }
+        st.reg_entry_loads += entry_load.count();
     }
+
+    // pass 3: text
+    std::ostringstream o;
+    if (has_sec) o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
+    else o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
+    if (local) o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n  " << copy_text(entry_load, false) << "\n";
+    if (has_sec) {
+        o << "  switch (at) { ";
+        for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
+        o << "default: break; }\n";
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pc = f.entry + uint32_t(i) * 4;
+        if (labels.count(pc)) o << "L_" << hex8(pc) << ":;\n";
+        std::string code = comment[i];
+        if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
+        else ++st.instructions;
+        o << "  /*" << hex8(pc) << "*/ { " << code << " }\n";
+    }
+    const std::string end_flush = local ? copy_text(dirty_after[n], true) : "";
+    if (local) st.reg_flushes += dirty_after[n].count();
+    if (tail_end) {
+        ++st.fallthrough_tail;
+        o << "  " << end_flush << callee(p, f.end) << (local ? "(ctx)" : "(c)") << "; return;\n";
+    } else {
+        o << "  " << end_flush << trap_str(f.end, "fell off the end of function " + hex8(f.entry)) << "\n";
+    }
+    o << (local ? "  }\n}\n" : "}\n");
     if (has_sec) {
         o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) { body_" << hex8(f.entry) << "(c, 0); }\n";
         for (uint32_t t : sit->second) {

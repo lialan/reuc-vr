@@ -33,5 +33,5 @@ def reference_generation():
     if not manifest.exists() or "# translation-input: " + key not in manifest.read_text(encoding="utf-8"):
         print("leaf_ref: translating the reference generation into %s" % out, file=sys.stderr)
         subprocess.run([str(translator), "--dol", str(dol), "--cfg", str(cfg), "--cfg", str(reference_hle), "--out", str(out), "--shard", "150",
-                        "--cache-key", key], check=True, stdout=subprocess.DEVNULL)
+                        "--cache-key", key, "--no-reg-cache"], check=True, stdout=subprocess.DEVNULL)   # leaf_hle.py reads the plain op sequence
     return out / re.search(r"generation_[0-9a-f_]+", manifest.read_text(encoding="utf-8"))[0]

@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     std::string dol_path, out_dir, cache_key;
     std::vector<std::string> cfg_paths;   // --cfg may be given several times; the files are merged in order
     size_t shard = 150;
-    bool verbose = false, cr_opt = true;
+    bool verbose = false, cr_opt = true, reg_cache = true;
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
         if (arg("--dol")) dol_path = argv[++i];
@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
         else if (arg("--cache-key")) cache_key = argv[++i];
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--no-cr-opt")) cr_opt = false;
+        else if (!std::strcmp(argv[i], "--no-reg-cache")) reg_cache = false;
         else { std::fprintf(stderr, "usage: translator --dol <file> --out <dir> [--cfg <file>]... [--shard N]\n"); return 2; }
     }
     if (dol_path.empty() || out_dir.empty() || shard == 0) { std::fprintf(stderr, "usage: translator --dol <file> --out <dir> [--cfg <file>]... [--shard N]\n"); return 2; }
@@ -65,6 +66,7 @@ int main(int argc, char** argv) {
 
     uc::Program p;
     p.cr_opt = cr_opt;
+    p.reg_cache = reg_cache;
     std::string err;
     for (const auto& cp : cfg_paths)
         if (!uc::load_config(cp, p.cfg, err)) { std::fprintf(stderr, "config error in %s: %s\n", cp.c_str(), err.c_str()); return 1; }

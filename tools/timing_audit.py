@@ -83,7 +83,7 @@ def scan_function(function):
     for address, line_no, text in instructions:
         if address in targets:
             reset()
-        if re.search(r"(?:fn_[0-9A-F]+|hle_\w+)\(c\)", text) or "call_indirect" in text:
+        if re.search(r"(?:fn_[0-9A-F]+|hle_\w+)\((?:c|ctx)\)", text) or "call_indirect" in text:
             reset()
             continue
         match = OP.search(text)
@@ -167,8 +167,8 @@ def scan_source(text, path):
         instruction = INSTRUCTION.search(line)
         if current and instruction:
             current["instructions"].append((int(instruction[1], 16), line_no, line))
-            current["callees"].update(re.findall(r"fn_([0-9A-F]{8})\(c\)", line))
-            current["hle_calls"].update(re.findall(r"hle_(\w+)\(c\)", line))
+            current["callees"].update(re.findall(r"fn_([0-9A-F]{8})\((?:c|ctx)\)", line))
+            current["hle_calls"].update(re.findall(r"hle_(\w+)\((?:c|ctx)\)", line))
             current["indirect_calls"] += "call_indirect" in line
     if current and current["instructions"]:
         functions.append(scan_function(current))

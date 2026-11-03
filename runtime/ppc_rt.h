@@ -450,16 +450,30 @@ PPC_INLINE void gq_store1(Ctx& c, uint32_t ea, int type, int scale, double v) {
     x = std::isnan(x) ? lo : x < lo ? lo : x > hi ? hi : x;
     if (gq_bytes(type) == 1) wr8(c, ea, uint32_t(int32_t(x))); else wr16(c, ea, uint32_t(int32_t(x)));
 }
+// A float pair in guest (big-endian) memory as one vector: one 8-byte access, a per-lane byte swap and a two-lane conversion (NEON
+// ld1/rev32/fcvtl and fcvtn/rev32/st1 on arm64) instead of two scalar loads, swaps and conversions. The conversions are exact (float to
+// double) or round as the scalar casts did (double to float), so the results are bit-identical.
+using PsBytes = uint8_t __attribute__((ext_vector_type(8)));
+PPC_INLINE PsDoublePair ps_load_pair(const uint8_t* p) {
+    PsBytes b; std::memcpy(&b, p, 8);
+    return __builtin_convertvector(__builtin_bit_cast(PsFloatPair, __builtin_shufflevector(b, b, 3, 2, 1, 0, 7, 6, 5, 4)), PsDoublePair);
+}
+PPC_INLINE void ps_store_pair(uint8_t* p, PsDoublePair v) {
+    const PsBytes b = __builtin_bit_cast(PsBytes, __builtin_convertvector(v, PsFloatPair));
+    const PsBytes s = __builtin_shufflevector(b, b, 3, 2, 1, 0, 7, 6, 5, 4);
+    std::memcpy(p, &s, 8);
+}
+// An access of n bytes at ea touches MMIO (one compare instead of one per word).
+PPC_INLINE bool touches_mmio(uint32_t ea, uint32_t n) { return ea - (0xCC000000u - (n - 1)) < 0x02000000u + (n - 1); }
 PPC_INLINE void psq_load(Ctx& c, int t, uint32_t ea, int w, int i, bool ram = false) {
     uint32_t g = c.gqr[i]; int type = (g >> 16) & 7, scale = gq_scale(g >> 24);
     if (type < 4 && w && (ram || !is_mmio(ea))) [[likely]] {   // single float: ps1 reads as 1.0
         const uint32_t bits = rd32_ram(c, ea); float f; std::memcpy(&f, &bits, 4);
         c.f[t] = f; c.ps1[t] = 1.0; return;
     }
-    if (type < 4 && !w && (ram || (!is_mmio(ea) && !is_mmio(ea + 4)))) [[likely]] {   // float pair: one 8-byte read instead of two 4-byte ones
-        uint64_t v; std::memcpy(&v, hp(c, ea), 8);
-        const uint32_t b0 = uc_bswap32(uint32_t(v)), b1 = uc_bswap32(uint32_t(v >> 32)); float f0, f1; std::memcpy(&f0, &b0, 4); std::memcpy(&f1, &b1, 4);
-        c.f[t] = f0; c.ps1[t] = f1; return;
+    if (type < 4 && !w && (ram || !touches_mmio(ea, 8))) [[likely]] {   // float pair: one 8-byte read instead of two 4-byte ones
+        const PsDoublePair v = ps_load_pair(hp(c, ea));
+        c.f[t] = v[0]; c.ps1[t] = v[1]; return;
     }
     double p0 = gq_load1(c, ea, type, scale);
     double p1 = w ? 1.0 : gq_load1(c, ea + gq_bytes(type), type, scale);
@@ -471,12 +485,10 @@ PPC_INLINE void psq_store(Ctx& c, int t, uint32_t ea, int w, int i, bool stack =
         const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4);
         if (stack) wr32_stack(c, ea, bits); else wr32_ram(c, ea, bits); return;
     }
-    if (type < 4 && !w && (stack || (!is_mmio(ea) && !is_mmio(ea + 4)))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
-        const float f0 = float(c.f[t]), f1 = float(c.ps1[t]); uint32_t b0, b1; std::memcpy(&b0, &f0, 4); std::memcpy(&b1, &f1, 4);
-        const uint64_t v = uint64_t(uc_bswap32(b0)) | uint64_t(uc_bswap32(b1)) << 32;
+    if (type < 4 && !w && (stack || !touches_mmio(ea, 8))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
         if (!stack) { gx::note_write(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] gx::note_write(ea + 7); }
         else uc::rollback_note_range(ea,8);
-        std::memcpy(hp(c, ea), &v, 8); return;
+        ps_store_pair(hp(c, ea), ps_pair(c, t)); return;
     }
     gq_store1(c, ea, type, scale, c.f[t]);
     if (!w) gq_store1(c, ea + gq_bytes(type), type, scale, c.ps1[t]);
