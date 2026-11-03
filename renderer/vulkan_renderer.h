@@ -451,6 +451,9 @@ private:
     uint32_t max_image_dimension_=0;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<PipelineKey,VkPipeline> pipelines_, uber_pipelines_;   // guarded by pipelines_mutex_ with the members below: compile threads insert too
+    // The last specialized pipeline pipeline_for found, by its requested key (render thread only): consecutive draws mostly share one, and a
+    // specialized entry never changes until shutdown, so the lock and the map search are skipped for them.
+    PipelineKey last_key_{}; VkPipeline last_pipeline_=VK_NULL_HANDLE;
     std::mutex pipelines_mutex_;
     struct CompileJob { PipelineKey key; bool uber; };
     std::deque<CompileJob> compile_queue_;
