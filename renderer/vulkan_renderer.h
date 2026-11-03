@@ -6,6 +6,7 @@
 #include "hdr_pass.h"
 #include "hud_layer.h"
 #include "pipeline_keys.h"
+#include "uber_merge.h"
 #include "prompt_overlay.h"
 #include "menu_overlay.h"
 #include "motion_tracker.h"
@@ -229,6 +230,7 @@ private:
         VkDescriptorPool texture_pool=VK_NULL_HANDLE;
         uint32_t descriptor_capacity=0;
         VkDescriptorPool table_pool=VK_NULL_HANDLE; VkDescriptorSet table_set=VK_NULL_HANDLE; uint32_t table_capacity=0;   // the texture table (tex_merge_): set 1, one per packet
+        VkDescriptorPool merge_pool=VK_NULL_HANDLE; VkDescriptorSet merge_set=VK_NULL_HANDLE;   // the small-draw ubershader (uber_small_*): set 2, the packet's uniform blocks as an array
         uint64_t serial = 0;
         bool submitted = false, reported = false, initialized = false, copied = false, timed = false;
         std::string timing_kind;   // UC_GPU_PACKETS: what this packet was (copy size, present, draws), for the per-kind GPU time
@@ -272,6 +274,7 @@ private:
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early,bool table=false);   // tools/fold_tev_shaders.py's module for these constants, or null
     VkPipeline table_pipeline(const PipelineKey& key);   // the texture-table variant of a draw's pipeline when compiled (else queued, null)
+    VkPipeline uber_merge_pipeline(const PipelineKey& key);   // the small-draw ubershader pipeline of the draw's fixed-function state when compiled (else queued, null)
     std::mutex folded_mutex_; std::unordered_map<uint64_t,VkShaderModule> folded_modules_;
     void queue_pipeline(const PipelineKey& key,bool uber);   // pipelines_mutex_ held
     void load_pipeline_cache();
@@ -556,6 +559,21 @@ private:
     VkShaderModule table_vertex_module_ = VK_NULL_HANDLE, table_fragment_module_ = VK_NULL_HANDLE, table_early_module_ = VK_NULL_HANDLE;
     PipelineKey last_table_key_{}; VkPipeline last_table_pipeline_ = VK_NULL_HANDLE;   // table_pipeline's memo (render thread only)
     uint64_t table_runs_ = 0, table_joins_ = 0, table_packets_ = 0, table_overflows_ = 0, table_pending_ = 0, table_entries_ = 0;   // [tex-merge] (UC_GPU_PACKETS)
+    // The headset's small-draw ubershader (uber_merge.h; UC_UBER_SMALL=1 for the EFB passes and the HUD layer, =scene or =hud for one of
+    // them; needs the texture table, which it turns on): draws whose screen box covers at most uber_max_pixels_ guest pixels (UC_UBER_PX) go on
+    // the ubershader pipeline of their fixed-function state (key bit kUberMergeKeyBit, merge_layout_: set 2 the packet's uniform blocks), so
+    // runs join draws of different TEV setups, uniform blocks and textures. A draw moves onto it only to join a run it could not join
+    // otherwise: a run of one draw, or of draws that join anyway, keeps its folded module.
+    // frag_uniform_merge_ (UC_MERGE_FRAG_UNIFORM=1): runs join draws whose uniform blocks differ only where no fragment reads them.
+    bool uber_small_scene_ = false, uber_small_hud_ = false, frag_uniform_merge_ = false;
+    float uber_max_pixels_ = 0;
+    VkDescriptorSetLayout merge_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout merge_layout_ = VK_NULL_HANDLE;
+    VkShaderModule merge_vertex_module_ = VK_NULL_HANDLE, merge_fragment_module_ = VK_NULL_HANDLE, merge_early_module_ = VK_NULL_HANDLE;
+    PipelineKey last_merge_key_{}; VkPipeline last_merge_pipeline_ = VK_NULL_HANDLE;   // uber_merge_pipeline's memo (render thread only)
+    uint64_t uber_runs_ = 0, uber_draws_ = 0, uber_joins_ = 0, uber_singles_ = 0, uber_pending_ = 0, uber_big_ = 0, frag_uniform_joins_ = 0;   // [uber-merge] (UC_GPU_PACKETS)
+    uint64_t hud_uber_runs_ = 0, hud_uber_draws_ = 0, hud_layer_runs_ = 0, hud_layer_draws_ = 0;
+    double uber_pixels_ = 0;   // guest pixels of the draws drawn on the ubershader (their screen boxes)
     VkBufferUsageFlags vertex_usage() const { return rt_input_usage() | (xform_ ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0); }   // buffers the pre-pass reads by address
     VkShaderModule vertex_module_ = VK_NULL_HANDLE, fragment_module_ = VK_NULL_HANDLE, early_module_ = VK_NULL_HANDLE, uber_module_ = VK_NULL_HANDLE, nobank_vertex_module_ = VK_NULL_HANDLE;   // early_module_: EARLY_Z (no discard)
     std::filesystem::path cache_dir_;
