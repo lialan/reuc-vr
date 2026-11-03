@@ -53,6 +53,8 @@ def run_on_quest(name, args):
     run_dir.mkdir(parents=True, exist_ok=True)
     adb = ["adb", "-s", QUEST_SERIAL]
     game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", str(4 * 3600 if name == "play" else 1800), "--speed", str(args.speed)] + list(args.game_arg)
+    if "--fps-limit" not in game_args:
+        game_args += ["--fps-limit", "0"]   # as on the desktop (client.py): unlocked, else the game paces itself at the original 30 Hz
     runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)
                               + [f"--arg={a}" for a in game_args] + [f"--set={s}" for s in getattr(args, "quest_set", [])]
                               + ([f"--saves={SAVE_SOURCE}"] if SAVE_SOURCE and Path(SAVE_SOURCE).is_dir() else []),   # the desktop runs' save snapshot: the menu route needs slot 1
