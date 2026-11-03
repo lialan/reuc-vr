@@ -1104,10 +1104,13 @@ void VulkanRenderer::sweep_meshes(bool all) {
     if (all) { for (auto& slab : mesh_slabs_) destroy_buffer(slab->buffer); mesh_slabs_.clear(); }
 }
 void VulkanRenderer::collect() {
-    for (auto& slot : slots_) {
+    // Oldest submission first (the ring is filled in order from next_slot_), stopping at the first unfinished fence: one queue completes its
+    // submissions in order, and a fence status is a ~10 us kernel call on KosmicKrisp (polling every slot cost ~4 ms of render thread per frame, S16).
+    for (size_t k = 0; k < slots_.size(); ++k) {
+        auto& slot = slots_[(next_slot_ + k) % slots_.size()];
         if (!slot.submitted || slot.reported) continue;
         VkResult status = vkGetFenceStatus(device, slot.fence);
-        if (status == VK_NOT_READY) continue;
+        if (status == VK_NOT_READY) break;
         vk_check(status, "frame fence status");
         completed_.push_back(slot.serial); slot.reported = true;
         uint64_t stamps[2];

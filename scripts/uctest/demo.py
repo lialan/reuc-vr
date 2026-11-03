@@ -67,6 +67,11 @@ def replay_args(exe, demo, stop, saves, extra=()):
     pin += [] if "--fps-limit" in extra else ["--fps-limit", "0"]   # every test runs the game unlocked, as a player does; a limit only by an explicit argument
     pin += [] if "--game-hz" in extra else ["--game-hz", str(DET_GAME_HZ)]
     if "--window-mode" not in extra: pin += ["--window-mode", "windowed"]
+    if "--game" not in extra:   # as a live run (client.py): a dev build folder has no "game" beside the exe
+        import localenv   # on sys.path through client.py
+        beside = Path(exe).parent / "game"
+        game = os.environ.get("UC_GAME_DIR") or (beside if beside.is_dir() else localenv.game_dir())
+        if game is not None: pin += ["--game", str(game)]
     return [str(exe), "--test-server", "demo", "--save-root", str(saves), "--width", "1280", "--height", "720", "--god", "--skip-tutorials",
             "--skip-intro", "--deterministic", "--demo-play", str(demo), "--stop-retrace", str(stop), "--mute", "--no-vulkan-layers", "--profile", *pin, *extra]
 
