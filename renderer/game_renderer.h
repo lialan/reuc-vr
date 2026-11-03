@@ -36,6 +36,7 @@ public:
     void set_aim_source(std::function<std::array<float,2>()> source) {if(vulkan_)vulkan_->set_aim_source(std::move(source));else {controls_.aim=std::move(source);apply_controls();}}
     void set_aim_history(std::function<std::array<float,2>(double)> history) {if(vulkan_)vulkan_->set_aim_history(std::move(history));else {controls_.aim_history=std::move(history);apply_controls();}}
     void set_wake_seconds(double seconds) {if(vulkan_)vulkan_->set_wake_seconds(seconds);else {controls_.wake_seconds=seconds;apply_controls();}}
+    void keep_frame(bool keep) {if(vulkan_)vulkan_->keep_frame(keep);}   // the next presented frame may be read back (capture): keep its slot image
     void set_crosshair_scale(uint32_t percent) {if(vulkan_)vulkan_->set_crosshair_scale(percent);else {if(percent>100)throw std::invalid_argument("invalid crosshair scale");controls_.crosshair_percent=percent;apply_controls();}}
     void set_prompt_style(PromptStyle style) {if(vulkan_)vulkan_->set_prompt_style(style);else native_->set_prompt_style(style);}
     void warm_pipelines(const std::function<void(size_t,size_t)>& progress) {if(vulkan_)vulkan_->warm_pipelines(progress);else if(progress)progress(1,1);}

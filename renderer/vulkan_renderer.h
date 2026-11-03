@@ -73,6 +73,8 @@ public:
     // The pointer `seconds` ago, and how many seconds the local wake strip spans: the wake is laid along the mouse path (late_aim.h) while both are set.
     void set_aim_history(std::function<std::array<float,2>(double)> history) { aim_history_ = std::move(history); }
     void set_wake_seconds(double seconds) { wake_seconds_ = seconds; }
+    // The headset's eyes read the presented EFB region in place (no copy into the slot image) unless the frame may be captured.
+    void keep_frame(bool keep) { keep_frame_ = keep; }
     uint64_t late_aim_draws() const { return late_aim_draws_.load(); }
     struct FrameTimings { double acquire_ms = 0, submit_ms = 0, present_ms = 0; };   // inside the last render(): the calls a layer or the driver can stall
     FrameTimings last_timings() const { return timings_; }
@@ -382,6 +384,7 @@ private:
     BloomLayer bloom_layer(VkOffset2D origin, VkExtent2D size) const;   // the glow for an HDR encode of this EFB rectangle; empty unless this frame's glow is valid
     static constexpr uint32_t kFragQueries=16384; VkQueryPool frag_pool_=VK_NULL_HANDLE; bool frag_dump_=false; std::vector<uint32_t> frag_queries_;   // UC_FRAG_DUMP
     size_t stereo_stride_=128;   // bytes between the headset's eye blocks (minUniformBufferOffsetAlignment)
+    bool keep_frame_=false;   // keep_frame(): the next presented frame keeps its slot image (captures read it)
     bool load_op_none_=false;   // VK_KHR/EXT_load_store_op_none enabled: depth a pass does not use is not loaded
     PFN_vkCmdSetFragmentShadingRateKHR set_shading_rate_=nullptr;   // VK_KHR_fragment_shading_rate (pipeline rate) enabled: the bloom chain's draws shade coarsely
     bool colorspace_ext_=false;   // VK_EXT_swapchain_colorspace enabled: HDR10 surface formats are usable
