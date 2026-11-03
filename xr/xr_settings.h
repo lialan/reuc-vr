@@ -36,7 +36,8 @@ typedef struct {
 /* ... dual off, stats panel on (vr.cfg "stats off" hides it), medium foveation */
 /* foveation off (version 3): the game draws its own picture and only the screen pass renders into the eye image, so foveating it saved
  * nothing and coarsened the picture's edges */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,1,1,0,0,1,0,4,0.0f}
+/* game crosshair hidden (version 5): the laser is the aim; the game's reticle sat a little off it in the headset */
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,0,1,0,0,1,0,5,0.0f}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);

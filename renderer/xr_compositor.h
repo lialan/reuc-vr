@@ -78,6 +78,7 @@ public:
     void rumble(int hand, float amplitude, int milliseconds);
     void recenter() { if (config_.anchor_head) anchor_pending_ = true; }
     void set_foveation(int level);
+    bool game_crosshair() const { return config_.settings.crosshair != 0; }   // the panel's "Game crosshair": the game's own reticle (off: the laser is the aim)
     int foveation_level() const { return config_.settings.foveation; }   // vr.cfg / the panel: the renderer's foveation map (0 off .. 3 high)
     float render_scale() const { return config_.settings.render_scale; }   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
     // The panel changed the render scale since the last call: the renderer applies it at its next frame (no restart).

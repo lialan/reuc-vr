@@ -40,7 +40,9 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 3 && c->foveation == 3) c->foveation = 0;
     /* written before version 4, the Quest's default eye height was 1440: now native */
     if (c->version < 4 && c->resolution == LG_XR_OLD_QUEST_HEIGHT && c->width == 0) { c->resolution = LG_XR_NATIVE_HEIGHT; c->width = LG_XR_NATIVE_WIDTH; }
-    c->version = 4;
+    /* written before version 5, the game's crosshair was shown: now hidden (the laser aims; the reticle sat a little off it) */
+    if (c->version < 5) c->crosshair = 0;
+    c->version = 5;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {
