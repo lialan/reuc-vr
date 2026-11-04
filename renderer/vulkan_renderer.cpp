@@ -406,7 +406,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         // The update-after-bind limits only when the plain ones are small (or UC_TEX_MERGE_UAB=1): the table is written before the packet is
         // recorded, so the flag buys nothing else.
         table_update_after_bind_ = after_bind > plain && (plain < 4096 || std::getenv("UC_TEX_MERGE_UAB"));
-        table_limit_ = table_update_after_bind_ ? after_bind : plain;
+        // At most 1024 entries (a fight packet holds ~21): the Quest's driver charges a pool for the layout's whole array, whatever the variable
+        // count of the set, so every slot's pool is sized to the limit (VK_ERROR_OUT_OF_POOL_MEMORY otherwise).
+        table_limit_ = std::min<uint32_t>(1024, table_update_after_bind_ ? after_bind : plain);
         const bool indexing = supported12.runtimeDescriptorArray && supported12.descriptorBindingPartiallyBound && supported12.descriptorBindingVariableDescriptorCount &&
                               supported12.shaderSampledImageArrayNonUniformIndexing;
         // The small-draw ubershader (UC_UBER_SMALL=1|scene|hud, uber_merge.h) reads its draws' textures from the table: it turns the table on.
@@ -1192,7 +1194,7 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         vk_check(vkCreatePipelineLayout(device, &layout_info, nullptr, &layout_), "pipeline layout");
         if (tex_merge_) {   // the texture table: set 0 as above (its maps unused), set 1 one array of combined image samplers, as many as the packet has
             const VkDescriptorSetLayoutBinding table{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,table_limit_,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
-            const VkDescriptorBindingFlags flags=VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT|VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT|(table_update_after_bind_ ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0u);
+            const VkDescriptorBindingFlags flags=VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT|(table_update_after_bind_ ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0u);
             VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO}; binding_flags.bindingCount=1; binding_flags.pBindingFlags=&flags;
             VkDescriptorSetLayoutCreateInfo table_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; table_info.pNext=&binding_flags; table_info.bindingCount=1; table_info.pBindings=&table;
             if (table_update_after_bind_) table_info.flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
@@ -3196,12 +3198,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (slot.table_pool) vkDestroyDescriptorPool(device,slot.table_pool,nullptr);
                 slot.table_pool=VK_NULL_HANDLE; slot.table_set=VK_NULL_HANDLE; slot.table_capacity=0;
                 const uint32_t capacity=std::min<uint32_t>(table_limit_,std::max<uint32_t>(256,uint32_t(table_entries.size()+table_entries.size()/2)));
-                const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,capacity};
-                VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&size;
+                // The layout's whole array (see table_limit_), twice over and also as separate images and samplers: the Quest's driver refused a
+                // pool of exactly the variable count (VK_ERROR_OUT_OF_POOL_MEMORY); a combined image sampler may count against both budgets there.
+                const VkDescriptorPoolSize sizes[3]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*table_limit_},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,table_limit_},{VK_DESCRIPTOR_TYPE_SAMPLER,table_limit_}};
+                VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=3; pool.pPoolSizes=sizes;
                 if (table_update_after_bind_) pool.flags=VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
                 vk_check(vkCreateDescriptorPool(device,&pool,nullptr,&slot.table_pool),"texture table pool");
-                VkDescriptorSetVariableDescriptorCountAllocateInfo variable{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO}; variable.descriptorSetCount=1; variable.pDescriptorCounts=&capacity;
-                VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.pNext=&variable; allocate.descriptorPool=slot.table_pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&table_set_layout_;
+                VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; allocate.descriptorPool=slot.table_pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&table_set_layout_;
                 vk_check(vkAllocateDescriptorSets(device,&allocate,&slot.table_set),"texture table set");
                 slot.table_capacity=capacity;
             }
