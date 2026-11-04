@@ -356,7 +356,10 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     xform_ = layers_ > 1 && supported12.bufferDeviceAddress && !std::getenv("UC_NO_XFORM");
     // UC_DEPTH_FORMAT (depth_efb.h), the headset and its preview only: GX depth is 24-bit, so a 24-bit format holds it exactly. X8_D24 first
     // (depth only); D24S8 needs separate depth/stencil layouts for the depth-only barriers and views used here. Unsupported: D32 as before.
-    if (const char* wanted=std::getenv("UC_DEPTH_FORMAT"); layers_>1 && wanted && *wanted && std::string(wanted)!="d32") {
+    // Default in VR: 24-bit (GX's own precision, Dolphin's Adreno choice; headset native 33.0 -> 31.2 ms with the clear fold, no z-fighting in
+    // captures). UC_DEPTH_FORMAT=d32 keeps 32-bit float depth.
+    const char* depth_env=std::getenv("UC_DEPTH_FORMAT");
+    if (const char* wanted=depth_env && *depth_env ? depth_env : "d24"; layers_>1 && std::string(wanted)!="d32") {
         const auto usable=[&](VkFormat format) {
             VkFormatProperties properties{}; vkGetPhysicalDeviceFormatProperties(physical_,format,&properties);
             const VkFormatFeatureFlags needed=VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -4784,7 +4787,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             vkCmdEndRendering(slot.command);
             barrier(slot.command,active.color,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
     };
-    static const bool fold_clear=gx::depth_switch("UC_FOLD_CLEAR");
+    // The copy's clear folded into the next EFB pass's load op (Dolphin's ClearRegion): on by default in VR (headset A/B at render scale 1,
+    // foveation high: 12.6 -> 12.0 ms with the 24-bit depth); UC_FOLD_CLEAR=0 / 1 decides otherwise.
+    static const char* fold_env=std::getenv("UC_FOLD_CLEAR");
+    const bool fold_clear=fold_env && *fold_env ? *fold_env!='0' : layers_>1;
     if (packet.clear_after_copy && (packet.present || copy_target || packet.clear_only)) {
         if (fold_clear && !scene_only && &active==&efb_target && !full_render_area_clears && efb_initialized_) {   // the next EFB pass applies it (efb_clear_)
             const auto& source=copy_target ? packet.texture_copy->source : packet.display_source;
