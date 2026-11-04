@@ -37,7 +37,7 @@ typedef struct {
 #if defined(__ANDROID__)
 #define LG_XR_DEFAULT_WIDTH  1548
 #define LG_XR_DEFAULT_HEIGHT 1656
-#define LG_XR_DEFAULT_RENDER_SCALE 1.0f
+#define LG_XR_DEFAULT_RENDER_SCALE 1.5f   /* version 9: live fight at 90 Hz holds 60 fps (59.5 mean, 5th percentile 60); replay GPU 9.4 ms */
 #else
 #define LG_XR_DEFAULT_WIDTH  LG_XR_NATIVE_WIDTH
 #define LG_XR_DEFAULT_HEIGHT LG_XR_NATIVE_HEIGHT
@@ -53,7 +53,7 @@ typedef struct {
 /* display refresh 90 Hz (version 8): at 120 Hz the compositor's work per refresh left frames missing their slot (40 fps); at 90 the live
  * fight holds 60 */
 #define LG_XR_DEFAULT_REFRESH 90
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,0,1,0,0,1,3,8,LG_XR_DEFAULT_RENDER_SCALE}
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,0,1,0,0,1,3,9,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
