@@ -49,7 +49,10 @@ void xr_settings_load(LgXrSettings *c)
         if (c->render_scale == 0.0f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
         if (c->resolution == LG_XR_NATIVE_HEIGHT && (c->width == LG_XR_NATIVE_WIDTH || c->width == 0)) { c->resolution = LG_XR_DEFAULT_HEIGHT; c->width = LG_XR_DEFAULT_WIDTH; }
     }
-    c->version = 7;
+    /* written before version 8, the display ran at 120 Hz by default: now 90 (live train fight at render scale 1.0: 120 Hz 58.6 fps mean, 5th
+     * percentile 40; 90 Hz 59.6, 5th percentile 60, GPU ~60% busy: the compositor's per-refresh work at 120 Hz left the game no slack) */
+    if (c->version < 8 && c->refresh == 120) c->refresh = LG_XR_DEFAULT_REFRESH;
+    c->version = 8;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

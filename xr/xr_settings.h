@@ -50,7 +50,10 @@ typedef struct {
 /* game crosshair hidden (version 5): the laser is the aim; the game's reticle sat a little off it in the headset */
 /* high foveation (version 6): the game's own scene passes are foveated (renderer/fovea_map.h), most of the GPU time; 60 fps first */
 /* render scale 1.0 and 1548x1656 eye images on the Quest (version 7): 60 fps (see LG_XR_DEFAULT_WIDTH) */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,0,1,0,0,1,3,7,LG_XR_DEFAULT_RENDER_SCALE}
+/* display refresh 90 Hz (version 8): at 120 Hz the compositor's work per refresh left frames missing their slot (40 fps); at 90 the live
+ * fight holds 60 */
+#define LG_XR_DEFAULT_REFRESH 90
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,0,1,0,0,1,3,8,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
