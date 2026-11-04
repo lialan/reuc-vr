@@ -431,3 +431,115 @@ already did, the new shader variants are stereo-only.
 **What needs the headset** (`/tmp/qgs/plan_uber.sh`, not run): captures (table vs + fragment uniforms vs + ubershader; a late-Z pair if they
 differ), GPU ms of the main scene and HUD packet with the five switch combinations at native and 1.0x in alternating order, the threshold
 sweep (256-65536) and the HUD packet with the ubershader unlimited against S17's 1.3 ms bound. Both stay off until then.
+
+## 8. Why the table and the ubershader were slower on the headset, and the fix (2026-11-04, branch uber-fast)
+
+Starting point (headset, quest3-vr 44f55c6, fightvr replay, 1.0x, foveation off, GPU ms per presented frame at 545 MHz): defaults 14.3-15.1,
+`UC_TEX_MERGE=1` 16.3, `UC_TEX_MERGE=1 UC_UBER_SMALL=1` 16.3 (native: 33.1 vs 43.1 with the ubershader and fragment uniforms). Fewer draws
+(-40%) did not pay.
+
+**What was slow: the texture table's per-fragment cost on big draws.** Per packet (the same runs):
+
+| packet (1.0x, foveation off) | defaults | `UC_TEX_MERGE=1` | + `UC_UBER_SMALL=1` |
+|---|---|---|---|
+| main scene (`copy 640x360 draws 200+`) | 5.39 | **4.51** | 4.57 |
+| HUD packet (`no copy draws 50-199`: at 1.0x the glow layer is off, so its two lens glows and the fade are full-screen EFB draws) | 1.43 | **3.01** | 3.03 |
+| particles (`copy 320x180 draws 200+`: ~295 heat-haze / smoke sprites, ~5 screens of overdraw) | 1.37 | **2.11** | 1.77 |
+| frame | 14.3 | 16.3 | 16.3 |
+
+The table did what it was built for in the main scene (-0.9 ms: ~40% fewer draws, few fragments) and cost 2x per fragment in the
+fill-bound packets. Every draw that could went onto its TEX_TABLE module, also single draws and runs whose textures are all equal, so
+the full-screen glows and the sprites sampled through `tableImages[NonUniformResourceIndex(base + map)]`. The table without any merging
+(`UC_TEX_MERGE_EAGER=1 UC_NO_MERGE=1`, below) shows it: the HUD packet is 3.2 ms with no merge at all, the same as with merging. It is not
+the non-uniform qualifier: an APK whose table modules index without `NonUniformResourceIndex` (measurement only: wrong where a wave holds
+two draws) measures the same, 14.2 eager and 11.0 lazy + ubershader, as the real one (14.2 / 11.0, same session). What costs is sampling
+through a run-time index into a descriptor array at all instead of a fixed binding (most likely: the driver sets up a fixed binding's
+texture state once a draw, before the fragments run, while an indexed descriptor is fetched by the shader; not traced). Static compiles do not show it (ir3 for Adreno 740: a native
+`sam.s2en.nonuniform`, +4 instructions a module, same registers). The ubershader was not the problem: on top of the table it was neutral
+to slightly positive (particles 2.11 -> 1.77).
+
+**Fix 1: the table only where a run joins across textures (lazy, the default with the table on).** A draw keeps its folded module and own
+set and only remembers its table pipeline; a run moves onto the table when a draw with the same key and uniform block but other textures
+joins it (`record_pass`: `table_moves`, `table_takes`). Single draws and runs of equal textures never read the table. Draws a frame stay the
+same (Mac: 222 lazy vs 232 eager, the windows vary ~3%), table runs drop from ~228 to ~47 a frame. `UC_TEX_MERGE_EAGER=1` restores every
+draw on the table; `UC_TEX_MERGE_PX=<guest px>` lets only draws up to that screen box join across textures; `UC_TEX_MERGE_MAX=<n>` a
+smaller table (diagnostics).
+
+**Fix 2: a cheaper ubershader.** (ir3, Adreno 740, non-nop instructions / vec4 registers / waves)
+- Colour and alpha inputs by select trees on the selector bits (`uberColorSource`, `uberAlphaSource`: bit 3 the group, bits 2..1 the
+  vector, bit 0 the alpha broadcast; 12..15 fall out of (1, 1, 1, 0.5) and (konst, 0)) instead of switches, which both compilers lower to a
+  compare and a select per case (~5 instructions a case, 60 cases a stage): general module 1106 -> 918.
+- Families of draws with one and with two stages (`smoke.stereo.uber1.*`, `uber2.*`, `UBER_STAGES`): stages unrolled; the vertex stage
+  reads each stage's coordinate straight from the pre-pass's attributes (the mask's ids in order) and passes the draw's TEV words as flat
+  inputs, so the fragment no longer picks one of eight coordinates per stage or loads its words from the storage buffer: one stage 799 / 13
+  / 14, two stages 1447 static (a 1-stage draw runs about half) / 24 / 8, against the general loop's 918 / 32 / 6. Runs still join on the
+  general pipeline; a run is drawn with the smallest family that holds all its draws (Mac fight: ~27% of the ubershader's draws have one
+  stage, ~53% two; ~47% of its runs take a family). `UC_UBER_FAMILY=0|1|2` (none / only one).
+- An array of all 16 colour inputs indexed by the selector was tried: 839 instructions but 48 registers (4 waves); dropped.
+All exact: Mac VR preview, late Z (`UC_NO_EARLY_Z=1`), EFB captures at 8700/9060/9300 identical (0 px) table-off vs lazy table, and lazy
+table vs lazy table + ubershader (general, families).
+
+### Headset A/B (uber-fast 3bcc9c6, fightvr replay, 1.0x, foveation High, GPU ms per presented frame, 545 MHz, two passes in alternating order)
+
+| configuration | frame | main scene | HUD packet | particles | present | draws issued |
+|---|---|---|---|---|---|---|
+| defaults (table off) | 12.7 / 12.6 | 5.37 / 5.39 | 1.29 / 1.31 | 1.57 / 1.54 | 2.14 / 2.19 | 447 |
+| `UC_TEX_MERGE=1 UC_TEX_MERGE_EAGER=1` (the old table) | 14.3 / 14.2 | 4.42 / 4.35 | 2.96 / 2.84 | 2.07 / 2.03 | 2.43 / 2.42 | 279 |
+| `... EAGER=1 UC_NO_MERGE=1` (the table's cost alone) | 19.3 / 19.5 | 8.84 / 8.93 | 3.22 / 3.26 | 2.19 / 2.22 | 2.38 / 2.39 | 964 |
+| `UC_TEX_MERGE=1` (lazy table) | 11.6 / 11.5 | 4.56 / 4.51 | 1.48 / 1.48 | 1.31 / 1.28 | 2.46 / 2.43 | 273-280 |
+| **`UC_TEX_MERGE=1 UC_UBER_SMALL=1`** (lazy + ubershader, families) | **11.0 / 10.7** | 4.38 / 4.22 | 1.33 / 1.21 | 1.03 / 0.96 | 2.44 / 2.44 | 166-169 |
+
+(The present and the small bloom-chain packets trade ~0.3 ms between them across configurations: work that overlaps a packet boundary is
+counted on either side; the frame total is the measure.) `UC_NO_MERGE=1` also bounds the per-draw cost: 964 draws instead of 447 cost
+the main scene +3.5 ms with the table's per-fragment cost included, at most ~7 us a draw.
+
+More A/Bs on the same APK and settings (each row two runs, alternating with its neighbours):
+
+| configuration | frame | main | HUD | particles | draws |
+|---|---|---|---|---|---|
+| lazy + ubershader (families on), the runs of this batch | 10.7 / 10.7 | 4.21 / 4.21 | 1.28 / 1.25 | 0.94 / 0.96 | 169 |
+| lazy + ubershader, `UC_UBER_FAMILY=0` (the general loop only) | 11.0 / 10.7 | 4.37 / 4.21 | 1.34 / 1.28 | 1.02 / 0.97 | 162-174 |
+| lazy table, `UC_TEX_MERGE_PX=16384` (big draws never join across textures) | 12.0 / 12.0 | 4.84 / 4.80 | 1.73 / 1.70 | 1.19 / 1.21 | 326 |
+| lazy + ubershader, table modules without `NonUniformResourceIndex` (diagnostic APK) | 11.0 | 4.40 | 1.33 | 1.00 | 169 |
+| eager table, same diagnostic APK | 14.2 | 4.39 | 2.87 | 2.03 | 274 |
+
+- The families do not show at 1.0x (the ubershader's ~30k guest pixels a frame are ~0.3 M fragments here); they stay on: exact, fewer
+  registers, measured at native below.
+- A size gate on the table's joins is worse (+1.3 ms): the joins of big draws pay for their per-fragment cost. No gate.
+- The non-uniform qualifier costs nothing measurable (above).
+
+### Defaults (43e78fb): the table (lazy) and the small-draw ubershader on, on the headset
+
+`UC_TEX_MERGE=0` turns both off, `UC_UBER_SMALL=0` the ubershader alone; the Mac's VR preview keeps both opt-in. Same APK, foveation High,
+alternating:
+
+| scale | both off (`UC_TEX_MERGE=0`) | defaults (lazy table + ubershader) | draws issued |
+|---|---|---|---|
+| native (3.07x) | 26.3 / 26.3 (main 9.65, HUD 2.86, particles 3.40) | **24.4 / 24.2** (main 8.16 / 8.01, HUD 2.81 / 2.77, particles 3.16 / 3.05) | 430-446 -> 165-168 |
+| 1.0x | 12.6 (main 5.30, particles 1.56) | **11.3** (main 4.21, particles 1.01) | 435 -> 170 |
+
+So at native -2.0 ms (-8%), at 1.0x -1.3 to -2.0 ms (-10 to -16%), against +2 ms (+14%) for the old table + ubershader. Pictures (EFB
+captures at 8700/9060/9300, native, off vs defaults): the same by eye; 13-29k of 9.1 M pixels differ by more than 1% (1-2.3k by more than
+4%), along edges, which the head pose of two runs already moves.
+
+What is left of the per-fragment table cost is in the runs that do join across textures (~47 a frame): the gate test shows those joins pay
+anyway. The remaining HUD packet at 1.0x (1.2-1.5 ms) is its full-screen glows and fade in the EFB (the glow layer starts at 2.5 points a
+guest pixel); the particles' heat haze is fill (S17).
+
+Native (foveation High), the ubershader's knobs on top of the defaults:
+
+| configuration | frame | HUD packet | draws |
+|---|---|---|---|
+| defaults (`UC_UBER_PX` 1024, families on) | 24.2 / 24.2 (and 24.4 / 24.2 above) | 2.76-2.81 | 168 |
+| `UC_UBER_FAMILY=0` | 24.1 / 24.3 | 2.79 | 168 |
+| `UC_UBER_PX=4096` | 24.8 | 3.14 | 148 |
+| `UC_UBER_PX=4096 UC_UBER_FAMILY=0` | 24.7 | 3.11 | 151 |
+
+The families are neutral at native too, even with four times the ubershader's fragments: the ubershader's ALU is not what limits these
+packets (its draws are small; ~0.3 M fragments a frame at 1.0x). They stay (exact, a third to half the registers) for scenes with more
+small multi-stage draws. A larger size limit joins 20 more draws and costs +0.6 ms (the HUD layer's bigger quads on the ubershader): the
+default stays 1024.
+
+**Recommended defaults (now in the code, headset only):** lazy texture table + small-draw ubershader at 1024 guest pixels with its
+families; `UC_MERGE_FRAG_UNIFORM` not measured on top of the lazy table here (it was -1.1 ms on the old eager table: 16.3 -> 15.2), worth
+a pair before turning it on; no table size gate.
