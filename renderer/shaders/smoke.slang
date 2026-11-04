@@ -71,6 +71,9 @@ struct Output {
 #endif
 #ifdef UBER_MERGE
     [[vk::location(11)]] nointerpolation uint mergeDraw : TEXCOORD15;     // the small-draw ubershader: the draw's uniform block index (tev.slang)
+#ifdef UBER_STAGES
+    [[vk::location(12)]] nointerpolation uint4 mergeWords[1 + UBER_STAGES] : TEXCOORD16;   // its family of few stages: the draw's TEV words (tev.slang tevWord)
+#endif
 #endif
 #ifdef MOTION
     [[vk::location(10)]] float4 currentClip : TEXCOORD8;    // unjittered
@@ -236,10 +239,37 @@ Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   //
 #endif
     output.color = unpackColor(xformAttributes[at]); output.color1 = unpackColor(xformAttributes[at + 1]);
     at += 2;
+#if defined(UBER_MERGE) && defined(UBER_STAGES)
+    // The ubershader family of draws with at most UBER_STAGES stages (tev.slang): coordinate s is the one stage s samples, read here once a
+    // vertex (the attributes hold the coordinates of the mask's ids in id order) instead of chosen out of all eight in every fragment.
+    // A draw without stages reads coordinate 0.
+    const uint draw = output.mergeDraw;
+    const bool staged = mergeDrawStates[draw].tevWords[0].x != 0;
+    {   // the TEV words the family's fragment stage reads (tev.slang tevWord): key words 1, 2, 67 and each stage's four
+        const uint4 head = mergeDrawStates[draw].tevWords[0];
+        output.mergeWords[0] = uint4(head.x, head.y, mergeDrawStates[draw].tevWords[16].z, 0);
+        [unroll] for (uint stage = 0; stage < UBER_STAGES; ++stage) {
+            const uint word = 2 + 4 * stage;
+            output.mergeWords[1 + stage] = uint4(mergeDrawStates[draw].tevWords[word / 4][word % 4], mergeDrawStates[draw].tevWords[(word + 1) / 4][(word + 1) % 4],
+                                                 mergeDrawStates[draw].tevWords[(word + 2) / 4][(word + 2) % 4], mergeDrawStates[draw].tevWords[(word + 3) / 4][(word + 3) % 4]);
+        }
+    }
+    [unroll] for (uint stage = 0; stage < 8; ++stage) output.texcoords[stage] = float3(0.0, 0.0, 1.0);
+    [unroll] for (uint stage = 0; stage < UBER_STAGES; ++stage) {
+        const uint word = 4 + 4 * stage;   // the stage's order word (tev.slang LOAD_STAGE)
+        const uint id = staged ? (mergeDrawStates[draw].tevWords[word / 4][word % 4] >> 3) & 7 : 0;
+        if ((mask & (1u << id)) != 0) {
+            const uint coordinate = at + 3 * countbits(mask & ((1u << id) - 1));
+            output.texcoords[stage] = asfloat(uint3(xformAttributes[coordinate], xformAttributes[coordinate + 1], xformAttributes[coordinate + 2]));
+        }
+    }
+    at += 3 * countbits(mask);
+#else
     [unroll] for (uint id = 0; id < 8; ++id) {
         output.texcoords[id] = float3(0.0, 0.0, 1.0);
         if ((mask & (1u << id)) != 0) { output.texcoords[id] = asfloat(uint3(xformAttributes[at], xformAttributes[at + 1], xformAttributes[at + 2])); at += 3; }
     }
+#endif
 #ifdef TEX_TABLE
     output.textureBase = xformAttributes[at];   // the draw's first texture-table entry (the pre-pass's last word)
 #endif
@@ -398,6 +428,9 @@ Targets fragmentMain(Output input, uint view : SV_ViewID) {
 #endif
 #ifdef UBER_MERGE
     mergeDraw = input.mergeDraw;
+#if defined(UBER) && defined(UBER_STAGES)
+    mergeWords = input.mergeWords;
+#endif
 #endif
 #else
 Targets fragmentMain(Output input) {

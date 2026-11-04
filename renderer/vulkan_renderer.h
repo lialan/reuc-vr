@@ -283,7 +283,7 @@ private:
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early,bool table=false);   // tools/fold_tev_shaders.py's module for these constants, or null
     VkPipeline table_pipeline(const PipelineKey& key);   // the texture-table variant of a draw's pipeline when compiled (else queued, null)
-    VkPipeline uber_merge_pipeline(const PipelineKey& key);   // the small-draw ubershader pipeline of the draw's fixed-function state when compiled (else queued, null)
+    VkPipeline uber_merge_pipeline(const PipelineKey& key,uint32_t family=0);   // the small-draw ubershader pipeline of the draw's fixed-function state when compiled (else queued, null)
     std::mutex folded_mutex_; std::unordered_map<uint64_t,VkShaderModule> folded_modules_;
     void queue_pipeline(const PipelineKey& key,bool uber);   // pipelines_mutex_ held
     void load_pipeline_cache();
@@ -563,6 +563,8 @@ private:
     // only in their textures merge into one run. Pipelines with key bit kTexTableKeyBit use the TEX_TABLE modules and table_layout_.
     bool tex_merge_ = false, table_update_after_bind_ = false;
     uint32_t table_limit_ = 0;   // entries a packet's table may hold (the device's per-stage limits less set 0's eight)
+    bool table_eager_ = false;   // UC_TEX_MERGE_EAGER=1: every draw that can reads the table (default: only runs that join draws of other textures)
+    float table_max_pixels_ = 0;   // UC_TEX_MERGE_PX: only draws whose screen box covers at most this many guest pixels join across textures (0: any)
     VkDescriptorSetLayout table_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout table_layout_ = VK_NULL_HANDLE;
     VkShaderModule table_vertex_module_ = VK_NULL_HANDLE, table_fragment_module_ = VK_NULL_HANDLE, table_early_module_ = VK_NULL_HANDLE;
@@ -579,8 +581,11 @@ private:
     VkDescriptorSetLayout merge_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout merge_layout_ = VK_NULL_HANDLE;
     VkShaderModule merge_vertex_module_ = VK_NULL_HANDLE, merge_fragment_module_ = VK_NULL_HANDLE, merge_early_module_ = VK_NULL_HANDLE;
-    PipelineKey last_merge_key_{}; VkPipeline last_merge_pipeline_ = VK_NULL_HANDLE;   // uber_merge_pipeline's memo (render thread only)
+    uint32_t uber_families_ = 0;   // the ubershader's families of draws with 1 and 2 stages (bit family-1; uber_merge.h; UC_UBER_FAMILY=0 none, =2 the two-stage one)
+    VkShaderModule few_vertex_module_[2]{}, few_fragment_module_[2]{}, few_early_module_[2]{};   // per family (index family-1)
+    PipelineKey last_merge_key_[3]{}; VkPipeline last_merge_pipeline_[3]{};   // uber_merge_pipeline's memo per family (render thread only)
     uint64_t uber_runs_ = 0, uber_draws_ = 0, uber_joins_ = 0, uber_singles_ = 0, uber_pending_ = 0, uber_big_ = 0, frag_uniform_joins_ = 0;   // [uber-merge] (UC_GPU_PACKETS)
+    uint64_t uber_few_runs_ = 0, uber_stage_draws_[4] = {};   // [uber-merge]: draws in EFB ubershader runs by stage count (0, 1, 2, 3 or more)
     uint64_t hud_uber_runs_ = 0, hud_uber_draws_ = 0, hud_layer_runs_ = 0, hud_layer_draws_ = 0;
     double uber_pixels_ = 0;   // guest pixels of the draws drawn on the ubershader (their screen boxes)
     VkBufferUsageFlags vertex_usage() const { return rt_input_usage() | (xform_ ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0); }   // buffers the pre-pass reads by address
