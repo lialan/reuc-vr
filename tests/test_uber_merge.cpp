@@ -12,8 +12,8 @@ static uc::PipelineKey sample_key() {
 
 static void test_merge_key() {   // one pipeline per fixed-function state; the TEV words and the destination-alpha flag are read per draw
     const auto key=sample_key();
-    const auto merged=uc::uber_merge_key(key,true);
-    CHECK(merged[1]==uc::kUberFewStages);   // two stages: the family of draws with few stages
+    const auto merged=uc::uber_merge_key(key,2);
+    CHECK(merged[1]==2);   // two stages: the family of draws with two
     for (size_t i=2;i<68;++i) CHECK(merged[i]==0);
     CHECK((merged[0]&uc::kUberMergeKeyBit)!=0 && (merged[0]&uc::kTexTableKeyBit)!=0);
     CHECK((merged[0]&uc::kBankKeyBit)==0);
@@ -21,12 +21,14 @@ static void test_merge_key() {   // one pipeline per fixed-function state; the T
     CHECK(merged[68]==key[68] && merged[69]==key[69]);
     CHECK(!uc::valid_pipeline_key(merged,true));   // never recorded in a key file
     auto hud=key; hud[0]|=uc::kHudLayerKeyBit;
-    CHECK((uc::uber_merge_key(hud,true)[0]&uc::kHudLayerKeyBit)!=0);   // the HUD layer's own blend attachments
+    CHECK((uc::uber_merge_key(hud,2)[0]&uc::kHudLayerKeyBit)!=0);   // the HUD layer's own blend attachments
     auto other=key; other[2]=0x4321; other[3]=0x777; other[1]=1; other[67]=0;
-    CHECK(uc::uber_merge_key(other,true)==merged);
+    CHECK(uc::uber_merge_key(other,2)==merged && uc::uber_merge_key(other,1)[1]==1);   // one stage: both families hold it
+    CHECK(uc::uber_merge_key(key,1)[1]==0);   // two stages are not in the one-stage family
     auto many=key; many[1]=5;   // more stages: the general module (word 1 = 0), which every draw has (runs join on it)
-    CHECK(uc::uber_merge_key(many,true)[1]==0 && uc::uber_merge_key(many,true)!=merged);
+    CHECK(uc::uber_merge_key(many,2)[1]==0 && uc::uber_merge_key(many,2)!=merged);
     CHECK(uc::uber_merge_key(key)[1]==0 && uc::uber_merge_key(key)==uc::uber_merge_key(many));
+    CHECK(uc::uber_family(0)==1 && uc::uber_family(1)==1 && uc::uber_family(2)==2 && uc::uber_family(3)==0);
 }
 
 static void test_same_state() {   // draws of one ubershader run: same blend, cull, alpha-test bit, depth and topology

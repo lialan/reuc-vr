@@ -283,7 +283,7 @@ private:
     VkPipeline make_pipeline(const PipelineKey& key,bool uber);
     VkShaderModule folded_module(const std::array<uint32_t,68>& values,bool early,bool table=false);   // tools/fold_tev_shaders.py's module for these constants, or null
     VkPipeline table_pipeline(const PipelineKey& key);   // the texture-table variant of a draw's pipeline when compiled (else queued, null)
-    VkPipeline uber_merge_pipeline(const PipelineKey& key,bool few=false);   // the small-draw ubershader pipeline of the draw's fixed-function state when compiled (else queued, null)
+    VkPipeline uber_merge_pipeline(const PipelineKey& key,uint32_t family=0);   // the small-draw ubershader pipeline of the draw's fixed-function state when compiled (else queued, null)
     std::mutex folded_mutex_; std::unordered_map<uint64_t,VkShaderModule> folded_modules_;
     void queue_pipeline(const PipelineKey& key,bool uber);   // pipelines_mutex_ held
     void load_pipeline_cache();
@@ -581,9 +581,9 @@ private:
     VkDescriptorSetLayout merge_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout merge_layout_ = VK_NULL_HANDLE;
     VkShaderModule merge_vertex_module_ = VK_NULL_HANDLE, merge_fragment_module_ = VK_NULL_HANDLE, merge_early_module_ = VK_NULL_HANDLE;
-    bool uber_families_ = false;   // the ubershader's family of draws with few stages (uber_merge.h kUberFewStages; UC_UBER_FAMILY=0 off)
-    VkShaderModule few_vertex_module_ = VK_NULL_HANDLE, few_fragment_module_ = VK_NULL_HANDLE, few_early_module_ = VK_NULL_HANDLE;
-    PipelineKey last_merge_key_[2]{}; VkPipeline last_merge_pipeline_[2]{};   // uber_merge_pipeline's memo per family (render thread only)
+    uint32_t uber_families_ = 0;   // the ubershader's families of draws with 1 and 2 stages (bit family-1; uber_merge.h; UC_UBER_FAMILY=0 none, =2 the two-stage one)
+    VkShaderModule few_vertex_module_[2]{}, few_fragment_module_[2]{}, few_early_module_[2]{};   // per family (index family-1)
+    PipelineKey last_merge_key_[3]{}; VkPipeline last_merge_pipeline_[3]{};   // uber_merge_pipeline's memo per family (render thread only)
     uint64_t uber_runs_ = 0, uber_draws_ = 0, uber_joins_ = 0, uber_singles_ = 0, uber_pending_ = 0, uber_big_ = 0, frag_uniform_joins_ = 0;   // [uber-merge] (UC_GPU_PACKETS)
     uint64_t uber_few_runs_ = 0, uber_stage_draws_[4] = {};   // [uber-merge]: draws in EFB ubershader runs by stage count (0, 1, 2, 3 or more)
     uint64_t hud_uber_runs_ = 0, hud_uber_draws_ = 0, hud_layer_runs_ = 0, hud_layer_draws_ = 0;
