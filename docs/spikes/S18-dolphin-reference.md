@@ -532,7 +532,7 @@ Native (foveation High), the ubershader's knobs on top of the defaults:
 |---|---|---|---|
 | defaults (`UC_UBER_PX` 1024, families on) | 24.2 / 24.2 (and 24.4 / 24.2 above) | 2.76-2.81 | 168 |
 | `UC_UBER_FAMILY=0` | 24.1 / 24.3 | 2.79 | 168 |
-| `UC_UBER_PX=4096` | 24.8 | 3.14 | 148 |
+| `UC_UBER_PX=4096` | 24.8 / 24.7 | 3.14 / 3.14 | 148 |
 | `UC_UBER_PX=4096 UC_UBER_FAMILY=0` | 24.7 | 3.11 | 151 |
 
 The families are neutral at native too, even with four times the ubershader's fragments: the ubershader's ALU is not what limits these
@@ -540,6 +540,9 @@ packets (its draws are small; ~0.3 M fragments a frame at 1.0x). They stay (exac
 small multi-stage draws. A larger size limit joins 20 more draws and costs +0.6 ms (the HUD layer's bigger quads on the ubershader): the
 default stays 1024.
 
-**Recommended defaults (now in the code, headset only):** lazy texture table + small-draw ubershader at 1024 guest pixels with its
-families; `UC_MERGE_FRAG_UNIFORM` not measured on top of the lazy table here (it was -1.1 ms on the old eager table: 16.3 -> 15.2), worth
-a pair before turning it on; no table size gate.
+`UC_MERGE_FRAG_UNIFORM=1` on top of the defaults (1.0x, foveation High, alternating fu / def / fu / def): 10.7 / 10.8 against 11.1 / 11.0
+(main 4.25 / 4.30 vs 4.47 / 4.42, 156 vs 169 draws): -0.3 ms, the same sign in both pairs but under the run-to-run noise; no picture risk
+on late Z (section 7).
+
+**Recommended defaults (the first two now in the code, headset only):** lazy texture table + small-draw ubershader at 1024 guest pixels
+with its families; no table size gate; `UC_MERGE_FRAG_UNIFORM=1` as the next candidate (-0.3 ms) once a native pair confirms it.
