@@ -853,8 +853,11 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
                 if (const auto at=std::chrono::steady_clock::now(); overlay_due<=at+overlay_period/2) overlay_due=std::max(overlay_due+overlay_period,at+overlay_period/2);
             }
             packet_dump.packet(*pending);
-            if(options.capture_scene_passes && !scene_capture_started) scene_capture_started=std::any_of(pending->draws.begin(),pending->draws.end(),[](const auto& draw){return draw.callsite==0x80366E14;});
-            if(options.capture_scene_passes && scene_capture_started && scene_capture_pass<24) {
+            // A deterministic replay can isolate the first faulty pass at a known packet serial.
+            static const uint64_t capture_pass_serial=std::getenv("UC_CAPTURE_PASS_SERIAL") ? std::strtoull(std::getenv("UC_CAPTURE_PASS_SERIAL"),nullptr,10) : 0;
+            const bool capture_passes=options.capture_scene_passes || capture_pass_serial;
+            if(capture_passes && !scene_capture_started) scene_capture_started=capture_pass_serial ? pending_serial>=capture_pass_serial : std::any_of(pending->draws.begin(),pending->draws.end(),[](const auto& draw){return draw.callsite==0x80366E14;});
+            if(capture_passes && scene_capture_started && scene_capture_pass<(capture_pass_serial ? 1u : 24u)) {
                 scene_capture_serial=pending_serial; ++scene_capture_pass;
                 std::fprintf(stderr,"[scene-pass] %u serial %llu draws %zu present %u clear %u\n",scene_capture_pass,(unsigned long long)pending->serial,pending->draws.size(),pending->present,pending->clear_after_copy);
                 if(pending->texture_copy) {
@@ -932,7 +935,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             if (packets.complete(serial)) uc::gx_completed(serial);
             if(serial==scene_capture_serial) {
                 const auto pixels=renderer.capture(serial,true);
-                const auto directory=exe_dir()/"debug";
+                const auto directory=options.capture_dir.empty() ? exe_dir()/"debug" : options.capture_dir;
                 const auto path=directory/("pass-"+std::to_string(uc::host_process_id())+"-"+std::to_string(scene_capture_pass)+"-"+std::to_string(serial)+".png");
                 try {
                     fs::create_directories(directory); uc::save_png(pixels,path);

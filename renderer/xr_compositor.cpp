@@ -392,6 +392,11 @@ bool XrCompositor::begin_frame() {
     // UC_VR_WOBBLE=1 (diagnostics): a slow artificial head sway on top of the tracked pose (yaw +-6 degrees and +-4 cm sideways, about a
     // 3 s period), so runs with the headset lying still move as a worn one does.
     static const bool wobble = [] { const char* v = std::getenv("UC_VR_WOBBLE"); return v && *v == '1'; }();
+    // Deterministic EFB comparisons on the headset: keep 64 mm stereo separation,
+    // but remove tracking drift and the headset's resting orientation. Diagnostic
+    // captures only; the compositor still receives the real tracked poses.
+    static const bool fixed_pose = [] { const char* v = std::getenv("UC_VR_TEST_POSE"); return v && *v == '1'; }();
+    static const float test_pitch = [] { const char* v = std::getenv("UC_VR_TEST_PITCH"); return v ? float(std::atof(v)) * .017453292f : 0.f; }();
     const double phase = wobble ? double(frame_.predictedDisplayTime % 3000000000ll) / 3e9 * 6.283185307 : 0.0;
     const float yaw = wobble ? float(0.105 * std::sin(phase)) : 0.f, sway = wobble ? float(0.04 * std::sin(phase * 1.7)) : 0.f;
     const float qy[4] = {0, std::sin(yaw / 2), 0, std::cos(yaw / 2)};   // x y z w
@@ -399,6 +404,10 @@ bool XrCompositor::begin_frame() {
         const auto& v = views_[i];
         eyes[i].orientation = {v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w};
         eyes[i].position = {v.pose.position.x, v.pose.position.y, v.pose.position.z};
+        if (fixed_pose) {
+            eyes[i].orientation = {std::sin(test_pitch / 2), 0, 0, std::cos(test_pitch / 2)};
+            eyes[i].position = {i ? .032f : -.032f, 0, 0};
+        }
         if (wobble) {   // yaw about the head's vertical axis (q = qy * q, the position rotated with it), then the sideways sway
             const float x = eyes[i].orientation[0], y = eyes[i].orientation[1], z = eyes[i].orientation[2], w = eyes[i].orientation[3];
             eyes[i].orientation = {qy[3] * x + qy[1] * z, qy[3] * y + qy[1] * w, qy[3] * z - qy[1] * x, qy[3] * w - qy[1] * y};

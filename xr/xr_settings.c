@@ -56,7 +56,18 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 9 && c->render_scale == 1.0f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
     /* written before version 10, the game crosshair was hidden by default: shown again (aiming by the laser alone was not enough) */
     if (c->version < 10) c->crosshair = 1;
-    c->version = 10;
+#if defined(__ANDROID__)
+    /* Move the old performance defaults once; retain other explicit choices.
+     * This also applies before the first panel save, through the new defaults. */
+    if (c->version < 11) {
+        if (c->width == 1548 && c->resolution == 1656) {
+            c->width = LG_XR_DEFAULT_WIDTH; c->resolution = LG_XR_DEFAULT_HEIGHT;
+        }
+        if (c->render_scale == 1.5f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
+        if (c->foveation == 3) c->foveation = LG_XR_DEFAULT_FOVEATION;
+    }
+#endif
+    c->version = 11;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

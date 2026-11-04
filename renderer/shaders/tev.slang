@@ -23,6 +23,12 @@ struct DrawState {
     uint4 indirect[3];
     uint4 indCmd[4];
     uint4 tevWords[17];   // pipeline key words 1..67 (only the ubershader reads them)
+#ifdef STEREO
+    // Guest dimensions of scaled EFB copies, two (width,height) pairs per word.
+    // Indirect offsets/wrapping are GX texels, not pixels of the enlarged image.
+    // Zero keeps the image's dimensions for ordinary textures.
+    uint4 copyDimensions[4];
+#endif
 };
 #ifdef XFORM
 // The headset's vertex pre-pass (smoke.slang xformMain, a compute shader over every vertex of a packet): each job's draw state is
@@ -309,6 +315,11 @@ float combineAlpha(float a, float b, float c, float d, float3 colorA, float3 col
     return ((env >> 19) & 1) != 0 ? clamp(result, 0.0, 1.0) : clamp(result, -4.0, 4.0);
 }
 float2 imageSize(uint id) {
+#ifdef STEREO
+    const uint4 pair = drawState.copyDimensions[id / 2];
+    const uint2 logical = (id & 1) != 0 ? pair.zw : pair.xy;
+    if (logical.x != 0 && logical.y != 0) return float2(logical);
+#endif
     uint w = 1, h = 1;
 #ifdef TEX_TABLE
     UC_DIMENSIONS(id);

@@ -53,6 +53,12 @@ def run_on_quest(name, args):
     run_dir.mkdir(parents=True, exist_ok=True)
     adb = ["adb", "-s", QUEST_SERIAL]
     game_args = ["--test-server", "quest", "--save-root", "saves", "--capture-dir", "captures", "--seconds", str(4 * 3600 if name == "play" else 1800), "--speed", str(args.speed)] + list(args.game_arg)
+    # Game(launch=False) only attaches: it cannot forward these launch options.
+    # Keep the Quest scenario's advertised cheats/tutorial policy like desktop.
+    if args.god and "--god" not in game_args:
+        game_args.append("--god")
+    if (args.skip_tutorials or name in ("fight", "play")) and "--skip-tutorials" not in game_args:
+        game_args.append("--skip-tutorials")
     # The bot reaches the fight at the original 30 Hz pacing (unlocked, the headset's slow frames gave the game long variable steps and
     # the bot stuck before the wave); the fight itself is measured at the headset's default, the retrace-locked 60 Hz (--fight-fps-limit).
     # Both through the live settings (set_options), never --fps-limit: a live change only takes effect when it differs from the saved
@@ -76,7 +82,7 @@ def run_on_quest(name, args):
         g = Game(run_dir=run_dir / "harness", speed=args.speed, god=args.god, launch=False,
                  transport_factory=lambda: PipeTransport.tcp("quest", QUEST_PORT))
         start = time.monotonic()
-        report = {"scenario": name, "ok": False, "speed": args.speed, "quest": True}
+        report = {"scenario": name, "ok": False, "speed": args.speed, "god": args.god, "quest": True}
         try:
             with g:
                 report["result"] = SCENARIOS[name](g, args)

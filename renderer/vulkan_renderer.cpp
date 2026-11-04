@@ -39,7 +39,9 @@
 namespace uc {
 namespace {
 // Per-draw uniform block: the GX draw state followed by the pipeline key words the ubershader reads (key[1..67], padded to 17 vec4).
-constexpr size_t kTevWords=68, kDrawUniformBytes=sizeof(gx::DrawUniform)+kTevWords*sizeof(uint32_t);
+using CopyDimensions=std::array<std::array<uint32_t,2>,8>;
+constexpr size_t kTevWords=68, kCopyDimensionsOffset=sizeof(gx::DrawUniform)+kTevWords*sizeof(uint32_t);
+constexpr size_t kDrawUniformBytes=kCopyDimensionsOffset+sizeof(CopyDimensions);
 constexpr size_t kStereoBlockBytes=128;   // smoke.slang StereoBlock: two eyes x four rows
 const std::shared_ptr<const gx::TexturePixels>& draw_texture(const gx::DrawPacket& draw,size_t map) { return map ? draw.texture_maps[map-1] : draw.texture; }
 // The fragment shading rate of a draw whose textures are all magnified onto it, so that coarse shading only drops texels that are not
@@ -606,7 +608,7 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     const auto alignment=size_t(limits.limits.minUniformBufferOffsetAlignment);
     uniform_stride_=(kDrawUniformBytes+alignment-1)/alignment*alignment;
     stereo_stride_=(kStereoBlockBytes+alignment-1)/alignment*alignment;   // the headset's eye blocks, one uniform-buffer binding each
-    static_assert(kDrawUniformBytes==132*16, "smoke.slang DrawState");
+    static_assert(kDrawUniformBytes==136*16, "tev.slang stereo DrawState");
     if (xform_ && uniform_stride_!=kDrawUniformBytes) { xform_=false; std::fprintf(stderr,"[vr] vertex pre-pass off: uniform stride %zu\n",uniform_stride_); }   // xformMain reads the uniform blocks as an array
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pool_info.queueFamilyIndex = family_;
     vk_check(vkCreateCommandPool(device, &pool_info, nullptr, &pool_), "command pool");
@@ -3068,6 +3070,18 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     struct XformDraw { uint32_t positions=0, attributes=0, word=0, count=0, first=0; };   // word: stride | mask << 8 (the draws' currentRow)
     std::vector<XformDraw> xform_draws;
     std::vector<uint32_t> draw_uniform(packet.draws.size(),0);   // each draw's uniform block index (offset / uniform_stride_)
+    // The indirect TEV math must stay in guest texels at every render scale.
+    // GetDimensions sees the enlarged EFB image; Dolphin likewise keeps native
+    // texture dimensions separately (TextureCacheBase::BindTextures).
+    std::vector<CopyDimensions> copy_dimensions(packet.draws.size());
+    std::vector<bool> screen_refraction(packet.draws.size(),false);
+    static const bool original_refraction=std::getenv("UC_VR_SCREEN_REFRACTION")!=nullptr;   // diagnostic: original flat-screen displacement
+    if (layers_>1 && !original_refraction) for (size_t d=0;d<packet.draws.size();++d)
+        screen_refraction[d]=gx::vr_screen_refraction(packet.draws[d]);
+    static const bool physical_indirect=std::getenv("UC_INDIRECT_PHYSICAL_SIZE")!=nullptr;   // diagnostic old behaviour
+    if (layers_>1 && !physical_indirect) for (size_t d=0;d<packet.draws.size();++d)
+        for (size_t map=0;map<8;++map) if (const auto& texture=draw_texture(packet.draws[d],map); texture && texture->gpu_only && !texture->levels.empty())
+            copy_dimensions[d][map]={texture->levels[0].width,texture->levels[0].height};
     std::vector<std::array<uint64_t,17>> set_keys(layers_>1 ? packet.draws.size() : 0);   // per draw: image views, samplers, uniform offset
     // The headset: one descriptor set per distinct texture/sampler combination (the uniform block and the eye block are dynamic offsets)
     std::map<std::array<uint64_t,16>,uint32_t> set_of;
@@ -3141,7 +3155,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                         if(diag) {
                             static std::set<uint64_t> seen;
                             const auto& d=packet.draws[i]; const auto& u=*d.uniforms;
-                            if(seen.insert((uint64_t(d.callsite)<<4)|map).second && seen.size()<64) {
+                            if(seen.insert((uint64_t(d.callsite)<<4)|map|(uint64_t(d.transforms->projection[3][3]==0)<<36)).second && seen.size()<64) {
                                 std::string gens; char b[160];
                                 for(int g=0;g<8;++g) { std::snprintf(b,sizeof b," g%d src%u proj%u",g,(u.tex_gens[g]>>7)&31,(u.tex_gens[g]>>1)&1); gens+=b; }
                                 bool indirect=false; for(auto c:u.ind_cmd) indirect|=c!=0;
@@ -3177,12 +3191,19 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 generated_mips[map]=slot.textures[found->second]->auto_mips;
             }
             if(i==0 || packet.draws[i].uniforms.block()!=packet.draws[i-1].uniforms.block() ||
+               copy_dimensions[i]!=copy_dimensions[i-1] ||
+               screen_refraction[i]!=screen_refraction[i-1] ||
                !std::equal(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,gpu_draws[i-1].key.begin()+1)) {
                 uniform_offset=i*uniform_stride_;
                 auto* uniform_at=static_cast<std::byte*>(slot.uniforms.mapped)+uniform_offset;
                 std::memcpy(uniform_at,&*packet.draws[i].uniforms,sizeof(gx::DrawUniform));
+                if (screen_refraction[i]) {
+                    const uint32_t direct=0;
+                    std::memcpy(uniform_at+offsetof(gx::DrawUniform,ind_cmd),&direct,sizeof direct);
+                }
                 std::array<uint32_t,kTevWords> tev{}; std::copy(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,tev.begin());
                 std::memcpy(uniform_at+sizeof(gx::DrawUniform),tev.data(),sizeof tev);
+                std::memcpy(uniform_at+kCopyDimensionsOffset,copy_dimensions[i].data(),sizeof(CopyDimensions));
                 // The texture coordinates the stages read (fog[5], a spare word; bit 8: valid): the vertex shader generates only those.
                 const uint32_t coord_word=coord_mask(i)|0x100u;
                 std::memcpy(uniform_at+offsetof(gx::DrawUniform,fog)+5*sizeof(uint32_t),&coord_word,sizeof coord_word);
@@ -3573,8 +3594,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }();
     // UC_POST_DUMP=N (diagnostics): every Nth presented frame (up to 12 of them), each packet's passes, draws and copy.
     static const long post_dump_every = std::getenv("UC_POST_DUMP") ? std::atol(std::getenv("UC_POST_DUMP")) : 0;
+    static const uint64_t post_dump_serial = std::getenv("UC_CAPTURE_PASS_SERIAL") ? std::strtoull(std::getenv("UC_CAPTURE_PASS_SERIAL"),nullptr,10) : 0;
     static long post_dumps = 0;
-    const bool post_dump = post_dump_every > 0 && frame_index_ > 0 && frame_index_ % uint64_t(post_dump_every) == 0 && post_dumps < 12;
+    const bool post_dump = (post_dump_serial && packet.serial==post_dump_serial) ||
+        (post_dump_every > 0 && frame_index_ > 0 && frame_index_ % uint64_t(post_dump_every) == 0 && post_dumps < 12);
     if (post_dump) {
         std::fprintf(stderr, "[post-dump] frame %llu packet draws %zu scene_draws %zu present %d copy %s clear_after %d scene_phase %d upscale_here %d\n", (unsigned long long)frame_index_,
                      packet.draws.size(), scene_draws, int(packet.present), packet.texture_copy ? (std::to_string(packet.texture_copy->source[0]) + "," + std::to_string(packet.texture_copy->source[1]) + " " +
@@ -4298,7 +4321,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // projection the draw vertex stage does not read, the destination-alpha flag, the bank) need not be equal
                 const auto same_uber_push=[](DrawPush a,DrawPush b) { a.projection=b.projection={}; a.palette=b.palette=a.current_row=b.current_row=a.indexed=b.indexed=a.alpha_pass=b.alpha_pass=a.bank=b.bank=0; return std::memcmp(&a,&b,sizeof a)==0; };
                 // the uniform blocks: the same block, or with UC_MERGE_FRAG_UNIFORM blocks equal where a fragment reads them (uber_merge.h)
-                const auto same_uniform=[&](size_t a,size_t b) { return set_keys[a][16]==set_keys[b][16] || (frag_uniform_merge_ && gx::fragment_uniforms_equal(*packet.draws[a].uniforms,*packet.draws[b].uniforms)); };
+                const auto same_uniform=[&](size_t a,size_t b) { return set_keys[a][16]==set_keys[b][16] || (frag_uniform_merge_ && screen_refraction[a]==screen_refraction[b] && copy_dimensions[a]==copy_dimensions[b] && gx::fragment_uniforms_equal(*packet.draws[a].uniforms,*packet.draws[b].uniforms)); };
                 const bool same_textures=pending && std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin());
                 // the sets: equal (textures, samplers, uniform block), or for two table runs the uniform block alone (the textures are in the table)
                 // Lazily (run.table_pipeline): a run on its folded modules moves onto the table (table_moves) when the next draw has the same key and

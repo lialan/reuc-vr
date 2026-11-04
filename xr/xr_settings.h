@@ -30,19 +30,17 @@ typedef struct {
 #endif
 /* Umbrella Chronicles on the Quest (version 4): native eye images, and the game renders each eye at that size (VulkanRenderer: the scene's
  * rows are the eye image's), so nothing is resampled on the way to the display. */
-/* Version 7 on the Quest: the scene at render scale 1.0 (720 rows an eye) into 1548x1656 eye images (0.75 of the panel; the runtime
- * scales them to the panel). Live train fight, foveation high: render scale 1.0 59 fps mean (p50 60), 1.25 56, 1.5 54 (the GPU's work
- * plus the compositor's 120 Hz timewarp leave no slack above 1.0 yet). fightvr replay GPU per frame: 1.0 9.2 ms, 1.25 10.1, 1.5 11.4,
- * native / native eyes 24.5. The eye images' size also sets the HUD and glow layers and the screen pass (~2.8 ms of the native size). */
+/* Version 11: restore image quality. The 1080-row scene, reduced eye images and
+ * high foveation visibly blurred the 3D view. Native removes both resizes; lower
+ * render scales and foveation remain explicit performance choices in the panel. */
 #if defined(__ANDROID__)
-#define LG_XR_DEFAULT_WIDTH  1548
-#define LG_XR_DEFAULT_HEIGHT 1656
-#define LG_XR_DEFAULT_RENDER_SCALE 1.5f   /* version 9: live fight at 90 Hz holds 60 fps (59.5 mean, 5th percentile 60); replay GPU 9.4 ms */
+#define LG_XR_DEFAULT_FOVEATION 0
 #else
+#define LG_XR_DEFAULT_FOVEATION 3
+#endif
 #define LG_XR_DEFAULT_WIDTH  LG_XR_NATIVE_WIDTH
 #define LG_XR_DEFAULT_HEIGHT LG_XR_NATIVE_HEIGHT
 #define LG_XR_DEFAULT_RENDER_SCALE 0.0f
-#endif
 #define LG_XR_OLD_QUEST_HEIGHT 1440   /* the version 2-3 default eye height on the Quest: moves to native */
 /* ... dual off, stats panel on (vr.cfg "stats off" hides it), medium foveation */
 /* foveation off (version 3): the game draws its own picture and only the screen pass renders into the eye image, so foveating it saved
@@ -54,7 +52,7 @@ typedef struct {
  * fight holds 60 */
 #define LG_XR_DEFAULT_REFRESH 90
 /* game crosshair shown again (version 10): with it hidden the owner could not aim properly by the laser alone */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,3,10,LG_XR_DEFAULT_RENDER_SCALE}
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,11,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
