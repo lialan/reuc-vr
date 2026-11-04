@@ -113,6 +113,7 @@ const Matrices &StereoScene::transforms(const Matrix &p,int kind)
         // HUD maps guest clip space straight onto its screen plane. It is
         // independent of the original lens, so needs one transform per frame.
         lg_stereo_eye_projection(hud?unit.data():p.data(),hud?LG_STEREO_HUD:kind,&policy,effective.data());
+        std::memcpy(e.matrices.from_view[eye],effective.data(),64);
         if(hud)std::memcpy(out,effective.data(),64);
         else if(!lg_stereo_clip_reprojection(p.data(),effective.data(),out))
             throw std::runtime_error("Cannot reproject a singular guest camera");

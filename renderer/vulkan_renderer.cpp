@@ -3063,7 +3063,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         }
         return coords;
     };
-    // The vertex pre-pass (xform_): where each draw's shaded vertices go. Positions: one float4 a vertex; attributes: 2 + 3 per used
+    // The vertex pre-pass (xform_): where each draw's shaded vertices go. Positions: clip and view float4s a vertex; attributes: 2 + 3 per used
     // coordinate words a vertex. A draw that draws nothing gets no job.
     // The draws' indices are rebased onto the positions, in draw order, into one index buffer (first: the draw's first index there): a
     // run of draws that share their state is then one draw.
@@ -3110,7 +3110,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             destroy_buffer(buffer); buffer=make_buffer(bytes+bytes/2,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,true);
         };
         if (uber_small) merge_map=attributes;
-        grow(slot.xform_positions,VkDeviceSize(positions)*16); grow(slot.xform_attributes,(VkDeviceSize(attributes)+(uber_small ? 2*VkDeviceSize(positions) : 0))*4);
+        grow(slot.xform_positions,VkDeviceSize(positions)*32); grow(slot.xform_attributes,(VkDeviceSize(attributes)+(uber_small ? 2*VkDeviceSize(positions) : 0))*4);
         if (slot.xform_indices.size<VkDeviceSize(indices)*4) { destroy_buffer(slot.xform_indices); slot.xform_indices=make_buffer(std::max<VkDeviceSize>(indices,16)*6,VK_BUFFER_USAGE_INDEX_BUFFER_BIT,true); }
         auto* out=static_cast<uint32_t*>(slot.xform_indices.mapped);
         for (size_t i=0;i<packet.draws.size();++i) {
@@ -4276,6 +4276,17 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     uber_runs_=uber_draws_=uber_joins_=uber_singles_=uber_big_=uber_pending_=frag_uniform_joins_=hud_layer_draws_=hud_layer_runs_=hud_uber_runs_=hud_uber_draws_=0; uber_pixels_=0;
                     cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=alpha_passes_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
+            }
+            // Preserve view position through the pre-pass: reconstructing it
+            // from rounded guest clip depth creates flashing holes under head
+            // translation. UC_VR_CLIP_REPROJECT restores that path for diagnosis.
+            static const bool direct_view=std::getenv("UC_VR_CLIP_REPROJECT")==nullptr;
+            if (direct_view && stereo_ && stereo_->tracking_valid() && stereo_kind==LG_STEREO_WORLD &&
+                !draw_offscreen && draw.transforms->projection[3][3]==0 && push.shift[0]==0 && push.shift[1]==0) {
+                const auto& matrices=stereo_->transforms(gl_from_vulkan(draw.transforms->projection),LG_STEREO_WORLD);
+                float* block=reinterpret_cast<float*>(static_cast<std::byte*>(slot.motions.mapped)+size_t(d)*stereo_stride_);
+                stereo_view_block(matrices,block);
+                push.effects|=kEffectStereoView;
             }
             if (culled) continue;
             // The foveation map: the eyes' scene (world draws that are not a picture for a copy), full-screen fades over it and the 2D passes

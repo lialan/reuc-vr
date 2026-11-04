@@ -1,4 +1,50 @@
-# Latest continuation: cabin missing surfaces are still unresolved
+# Latest continuation: cabin projection fix, owner taking over testing
+
+Updated 2026-11-04. The owner reports **"the texture issue is fixed"** and asks
+to install the latest code for manual testing. Keep native **2064x2208**. The
+next reported issue is that aiming was a little off; it has not been diagnosed
+or changed in this iteration. **Release the Quest after installation; do not
+start further automated runs while the owner tests.**
+
+- Captured flashing black floor polygons and seat patches in the first train
+  cabin, before attack effects: `priority-fix/cabin-video-tracked/headset.mp4`.
+  The short upright clip is `flashing-floor-seats.mp4` in that folder.
+- Added `UC_VR_POSE_DUMP=N` and `UC_VR_TEST_POSE_FILE=<file>` (22 floats: each
+  eye's quaternion xyzw, position xyz, and left/right/down/up tangents). Recording
+  and replaying the actual eye transforms finally reproduces the large holes
+  deterministically. The older symmetric fixed pose hid the failure.
+- `priority-fix/cabin.pose` with `close.demo`, native/medium, at retraces
+  3400/3800/4200/4600: `cabin-pose-baseline/sheet.jpg` shows the faults.
+  Forced depth preservation, no vertex prepass, D32, and no CPU culling retain
+  the holes in matched frames. Earlier unpaired live improvements were false
+  leads; their speculative source changes were reverted.
+- The fix retains view positions in the compute prepass and projects world
+  geometry directly with the eye projection/view matrix. It avoids recovering
+  view coordinates from rounded guest clip depth. HUD/copies retain their clip
+  mapping. `UC_VR_CLIP_REPROJECT=1` restores the original path for diagnosis.
+  `cabin-pose-direct-view` restores both saved faulty frames with no prepass;
+  `cabin-pose-direct-prepass/sheet.jpg` restores all four frames on the normal
+  optimized path. The same intermediate APK using the old path still showed
+  the holes in `cabin-pose-nocull`; the prepass control was stopped for the
+  owner's takeover request and must not be treated as a completed comparison.
+- New analytic regression `test_stereo_projection` checks eye translation,
+  asymmetric FOV, Vulkan conversion and pose cache invalidation, including a
+  near plane small enough that float clip z loses the information needed for
+  reprojection. Six focused CTests pass. No new FPS benefit is claimed.
+- Latest install provenance is in `priority-fix/cabin-fixed-installed.json`,
+  with preserved APK `cabin-fixed.apk`, SHA256
+  `518fdfd633dd85e95ecb4621b58c45bc8b5734d931da082dd823b810cf7508f2`.
+  Installed hash matches, private test overrides are absent, and the normal app
+  was opened for the owner. The original `cabin-diagnostics.apk`
+  and `clarity-fixed.apk` are retained. Temporary run archives and private
+  device overrides are cleaned after runs; useful evidence is kept.
+
+Evidence root: `/Users/lialan/workspace/reuc-vr-glitch/priority-fix/`.
+Use quest3-lock for device work. Push only to `lialan`, never `origin`.
+
+---
+
+# Earlier continuation: cabin missing surfaces were unresolved
 
 Updated 2026-11-04 after the owner's follow-up. **Clarity is accepted; missing or
 black patches on cabin surfaces are not fixed or accepted.** Keep native

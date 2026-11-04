@@ -41,7 +41,8 @@ uint4 loadedRows(uint palette) { return palettes[palette].loaded; }
 // alphaPass: ubershader only. motion/jitter/viewport: the MOTION variant (upscaling) only; jitter in target pixels, viewport = the draw's
 // Vulkan viewport (x, y, width, height) in target pixels.
 // effects: bit 0 = per-pixel lighting (uc::kEffectPerPixelLighting), bit 1 = albedo and material targets (kEffectRtMaterial), bit 2 = the draw's record is
-// model-valid (kEffectRtModelValid); the MOTION variant only. record: the draw's material record index (rt_material.h), ~0u = none.
+// model-valid (kEffectRtModelValid); the MOTION variant only. Bit 3 selects view position for stereo world projection (kEffectStereoView).
+// record: the draw's material record index (rt_material.h), ~0u = none.
 struct Projection { float4 rows[4]; uint palette; uint currentRow; uint indexed; uint alphaPass; uint bank; uint motion; float2 jitter; float4 viewport; uint effects; uint record; float2 shift; };
 #ifdef XFORM
 static Projection projection;   // the pre-pass: the job's copy of the draw's push constants
@@ -165,12 +166,15 @@ float3 generateTexcoord(uint id, Input input) {
 // word; the draw's uniform block index | coordinate mask << 24), which the small-draw ubershader's vertex stage reads instead of the
 // draw's push constants, so draws of different strides and uniform blocks are one run; 0xFFFFFFFF: no map.
 struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint mergeMap; uint pad1; uint pad2; };
+// Keep the view position as well as guest clip: stereo world draws must not
+// recover it from a rounded projected depth. HUD/copy draws still use clip.
+struct XformPosition { float4 clip; float4 view; };
 float4 unpackColor(uint c) { return float4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24) / 255.0; }
 uint packColor(float4 c) { const uint4 b = uint4(round(saturate(c) * 255.0)); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
 #ifdef XFORM
 [[vk::binding(8, 0)]] StructuredBuffer<XformJob> xformJobs;
 [[vk::binding(9, 0)]] StructuredBuffer<uint2> xformChunks;   // per 64-thread group: job, first vertex
-[[vk::binding(6, 0)]] RWStructuredBuffer<float4> xformPositions;
+[[vk::binding(6, 0)]] RWStructuredBuffer<XformPosition> xformPositions;
 [[vk::binding(7, 0)]] RWStructuredBuffer<uint> xformAttributes;
 [numthreads(64, 1, 1)]
 void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
@@ -192,7 +196,8 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     float4 row1 = positionRow(projection.palette, row + 1);
     float4 row2 = positionRow(projection.palette, row + 2);
     float4 viewPosition = float4(dot(row0, objectPosition), dot(row1, objectPosition), dot(row2, objectPosition), 1.0);
-    xformPositions[job.positions + i] = float4(dot(projection.rows[0], viewPosition), dot(projection.rows[1], viewPosition), dot(projection.rows[2], viewPosition), dot(projection.rows[3], viewPosition));
+    xformPositions[job.positions + i].clip = float4(dot(projection.rows[0], viewPosition), dot(projection.rows[1], viewPosition), dot(projection.rows[2], viewPosition), dot(projection.rows[3], viewPosition));
+    xformPositions[job.positions + i].view = viewPosition;
     uint normalRow = row & 31;
     uint4 loaded = loadedRows(projection.palette);
     bool allLoaded = true;
@@ -219,11 +224,11 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // The draws' vertex stage with the pre-pass: projection.palette = the draw's first attribute word, currentRow = stride | mask << 8,
 // indexed = the draw's first position. The renderer rebases the draws' indices onto the positions (one index buffer for the packet), so
 // the vertex index is the position's, and consecutive draws that share everything else can be one draw.
-[[vk::binding(6, 0)]] StructuredBuffer<float4> xformPositions;
+[[vk::binding(6, 0)]] StructuredBuffer<XformPosition> xformPositions;
 [[vk::binding(7, 0)]] StructuredBuffer<uint> xformAttributes;
 Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   // gl_VertexIndex: the rebased index (vertexOffset 0)
     Output output;
-    float4 clip = xformPositions[vertex];
+    float4 clip = (projection.effects & 8u) != 0 ? xformPositions[vertex].view : xformPositions[vertex].clip;
     clip.xy += projection.shift * clip.w;
     output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
 #ifdef UBER_MERGE
@@ -305,7 +310,9 @@ Output vertexMain(Input input) {
 #ifdef STEREO
     {   // every stereo draw has its block (the renderer writes one per draw): the canonical multiview form, the view's matrix from a
         // uniform buffer, unconditionally, so the driver can shade the rest of the vertex once for both eyes
-        const float4 clip = output.position;
+        // Direct view-space projection (effects bit 3). The host
+        // enables this only for perspective world draws without clip shifts.
+        const float4 clip = (projection.effects & 8u) != 0 ? viewPosition : output.position;
         output.position = float4(dot(eyeBlock.rows[view][0], clip), dot(eyeBlock.rows[view][1], clip), dot(eyeBlock.rows[view][2], clip), dot(eyeBlock.rows[view][3], clip));
     }
 #endif   // late aim: a clip-space translation, so a quad the game placed at the screen edge is clipped after the move, not before

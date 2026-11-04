@@ -61,6 +61,7 @@ inline bool needs_scene_targets(const GraphicsEffects& effects) { return effects
 constexpr uint32_t kEffectPerPixelLighting=1;
 constexpr uint32_t kEffectRtMaterial=2;     // write the albedo and material-record targets (any RT effect active); the draw's record index rides in the push constant
 constexpr uint32_t kEffectRtModelValid=4;   // the draw's record has kRtModelValid (rt_material.h): the G-buffer flags carry kGBufferModelValid
+constexpr uint32_t kEffectStereoView=8;    // the stereo matrix consumes view position instead of guest clip position
 inline bool valid_anisotropy(uint32_t value) { return value==1 || value==2 || value==4 || value==8 || value==16; }
 // The level a device runs: 1 without samplerAnisotropy, never above its maxSamplerAnisotropy.
 inline uint32_t clamp_anisotropy(uint32_t requested, bool supported, float device_max) {

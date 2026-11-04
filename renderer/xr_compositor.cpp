@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #ifdef __ANDROID__
@@ -423,6 +424,41 @@ bool XrCompositor::begin_frame() {
             eyes[i].position[0] = c * px + s * pz + sway; eyes[i].position[2] = -s * px + c * pz;
         }
         eyes[i].tangents = {std::tan(-v.fov.angleLeft), std::tan(v.fov.angleRight), std::tan(-v.fov.angleDown), std::tan(v.fov.angleUp)};
+    }
+    // Reproduce an observed faulty view without tracking drift. The file holds
+    // orientation xyzw, position xyz and four tangents for each eye (22 floats).
+    // Like TEST_POSE, this changes rendering only; XR submission stays tracked.
+    static const auto recorded_pose = []() -> std::optional<std::array<xr::StereoPose, 2>> {
+        const char* path = std::getenv("UC_VR_TEST_POSE_FILE");
+        if (!path || !*path) return std::nullopt;
+        std::ifstream file(path);
+        std::array<xr::StereoPose, 2> result;
+        const auto read = [&](auto& values) {
+            for (float& value : values)
+                if (!(file >> value) || !std::isfinite(value)) throw std::runtime_error("Invalid UC_VR_TEST_POSE_FILE");
+        };
+        for (auto& eye : result) {
+            read(eye.orientation); read(eye.position); read(eye.tangents);
+            float norm = 0;
+            for (float q : eye.orientation) norm += q * q;
+            if (std::fabs(norm - 1.f) > .001f || std::any_of(eye.tangents.begin(), eye.tangents.end(), [](float t) { return t <= 0; }))
+                throw std::runtime_error("Invalid eye in UC_VR_TEST_POSE_FILE");
+        }
+        std::string extra;
+        if (file >> extra) throw std::runtime_error("Extra data in UC_VR_TEST_POSE_FILE");
+        return result;
+    }();
+    if (recorded_pose) eyes = *recorded_pose;
+    static const unsigned pose_dump = [] { const char* v = std::getenv("UC_VR_POSE_DUMP"); return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u; }();
+    static uint64_t pose_number = 0;
+    if (pose_dump && ++pose_number % pose_dump == 0) {
+        std::fprintf(stderr, "[vr-pose] %llu %lld", (unsigned long long)pose_number, (long long)frame_.predictedDisplayTime);
+        for (const auto& eye : eyes) {
+            for (float value : eye.orientation) std::fprintf(stderr, " %.9g", value);
+            for (float value : eye.position) std::fprintf(stderr, " %.9g", value);
+            for (float value : eye.tangents) std::fprintf(stderr, " %.9g", value);
+        }
+        std::fputc('\n', stderr);
     }
     scene_.publish(eyes);
     controller_frame(true);

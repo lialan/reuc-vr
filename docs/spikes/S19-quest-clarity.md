@@ -1,5 +1,55 @@
 # Quest clarity and scene-copy distortion, 2026-11-04
 
+## Cabin floor and seat fix: recorded-pose reproduction
+
+The owner subsequently confirmed the texture issue is fixed and requested the
+latest installation for manual testing. Native 2064x2208 remains unchanged.
+The owner also reports an aim offset, still pending investigation.
+
+All paths below are relative to `/Users/lialan/workspace/reuc-vr-glitch/priority-fix/`.
+
+1. `cabin-video-tracked/headset.mp4` and `cabin-video-tracked-novrs/headset.mp4`
+   clearly show large flashing black floor/seat polygons before attack effects.
+   `cabin-video-tracked/flashing-floor-seats.mp4` is the short upright example.
+   This supersedes the earlier no-reproduction status below.
+2. Earlier unpaired live tests of D32, forced STORE, disabled prepass, precise
+   shader arithmetic and ordered dot products were inconclusive: restoring the
+   old code/APK did not restore the same large faults. All speculative source
+   changes from those tests were removed.
+3. `UC_VR_POSE_DUMP=N` records the final renderer eye transforms;
+   `UC_VR_TEST_POSE_FILE=<file>` replays 22 whitespace-separated floats (two eyes,
+   each orientation xyzw / position xyz / tangents left,right,down,up). It checks
+   finite values, unit quaternions and positive tangents. Like the older fixed
+   pose, it changes rendering only, not the runtime's submitted tracking pose.
+4. Replaying `cabin.pose` with `close.demo` gives actual XR captures at
+   3400/3800/4200/4600 with clearly missing floor and seat surfaces. See
+   `cabin-pose-baseline/sheet.jpg`. Medium foveation/native resolution are fixed.
+
+| Matched comparison | Result |
+| --- | --- |
+| `cabin-pose-store` | Forced STORE retains the same large holes at 3400; 894 changed pixels are tiny display differences. Final-stop capture at 4200 did not complete. |
+| `cabin-pose-noxform` | Disabling prepass retains holes at 3400/4200; only 1,693/1,812 pixels differ. |
+| `cabin-pose-d32` | D32 retains holes at both frames; 16,340/15,591 pixels differ, mostly small edge/depth regions. |
+| `cabin-pose-direct-view` | Direct view-space projection restores floor/seat surfaces at both frames, prepass disabled. |
+| `cabin-pose-nocull` | Same intermediate APK, original projection, no CPU culling: holes return; only 1,019/777 pixels differ from baseline. |
+| `cabin-pose-direct-prepass` | Direct projection on the normal prepass restores all four sampled frames. |
+| `cabin-pose-prepass-control` | Stopped for owner takeover; not a completed validation run. |
+
+The fix keeps both view and clip positions (32 bytes/vertex) in the prepass.
+Perspective world draws use `C * eyeProjection * eyeView` on view positions;
+other draw classes use their existing clip mapping. This avoids the lossy
+guest-projection/inverse-projection round trip when applying eye translation.
+The corrected path is the default; `UC_VR_CLIP_REPROJECT=1` restores the original
+path for diagnosis. Depth formats, depth STORE policy and foveation are unchanged.
+The new `test_stereo_projection` analytically checks translated asymmetric eyes,
+Vulkan Y/depth conversion, pose invalidation and a tiny near plane. Six scoped
+CTests pass; these supplement, rather than replace, the device image evidence.
+
+Full-chapter acceptance and a new performance measurement are not claimed.
+Normal tracked-headset acceptance is the owner's next manual test. Automated
+device testing stops after the requested installation. See HANDOFF.md and
+`cabin-fixed-installed.json` for latest source/install state.
+
 ## Follow-up: missing cabin surfaces remain unresolved
 
 The owner accepts clarity but reports **missing or black patches on surfaces**.

@@ -16,4 +16,13 @@ inline xr::Matrix gl_from_vulkan(const gx::Projection& r) {
     }
     return m;
 }
+// Direct view -> Vulkan clip. Unlike clip reprojection, this needs C * E,
+// with no inverse guest projection and no input clip-space conversion.
+inline void stereo_view_block(const xr::Matrices& matrices, float* block) {
+    for (int eye=0; eye<2; ++eye) for (int c=0; c<4; ++c) {
+        const float* m=matrices.from_view[eye]+4*c;
+        block[eye*16+c]=m[0]; block[eye*16+4+c]=-m[1];
+        block[eye*16+8+c]=float(.5*(double(m[2])+m[3])); block[eye*16+12+c]=m[3];
+    }
+}
 }  // namespace uc

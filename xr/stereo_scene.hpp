@@ -8,7 +8,10 @@
 
 namespace uc::xr {
 using Matrix = std::array<float, 16>;
-struct Matrices { float view_projection[2][16]{}; };
+struct Matrices {
+    float view_projection[2][16]{}; // guest GL clip -> eye GL clip (HUD/copies)
+    float from_view[2][16]{};       // view -> eye GL clip (perspective world only)
+};
 inline Matrix identity() { Matrix m{}; m[0] = m[5] = m[10] = m[15] = 1; return m; }
 inline Matrix multiply(const Matrix& a, const Matrix& b) {
     Matrix r{};
