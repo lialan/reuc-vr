@@ -30,13 +30,14 @@ typedef struct {
 #endif
 /* Umbrella Chronicles on the Quest (version 4): native eye images, and the game renders each eye at that size (VulkanRenderer: the scene's
  * rows are the eye image's), so nothing is resampled on the way to the display. */
-/* Version 7 on the Quest: the scene at render scale 1.5 (1080 rows an eye) into 1548x1656 eye images (0.75 of the panel; the runtime
- * scales them to the panel). Headset A/B, fightvr replay, foveation high: 11.4 ms GPU per frame against 24.5 at native / native, room for
- * 60 fps. The eye images' size also sets the HUD and glow layers and the screen pass, ~2.8 ms of the native size at render scale 1. */
+/* Version 7 on the Quest: the scene at render scale 1.0 (720 rows an eye) into 1548x1656 eye images (0.75 of the panel; the runtime
+ * scales them to the panel). Live train fight, foveation high: render scale 1.0 59 fps mean (p50 60), 1.25 56, 1.5 54 (the GPU's work
+ * plus the compositor's 120 Hz timewarp leave no slack above 1.0 yet). fightvr replay GPU per frame: 1.0 9.2 ms, 1.25 10.1, 1.5 11.4,
+ * native / native eyes 24.5. The eye images' size also sets the HUD and glow layers and the screen pass (~2.8 ms of the native size). */
 #if defined(__ANDROID__)
 #define LG_XR_DEFAULT_WIDTH  1548
 #define LG_XR_DEFAULT_HEIGHT 1656
-#define LG_XR_DEFAULT_RENDER_SCALE 1.5f
+#define LG_XR_DEFAULT_RENDER_SCALE 1.0f
 #else
 #define LG_XR_DEFAULT_WIDTH  LG_XR_NATIVE_WIDTH
 #define LG_XR_DEFAULT_HEIGHT LG_XR_NATIVE_HEIGHT
@@ -48,7 +49,7 @@ typedef struct {
  * nothing and coarsened the picture's edges */
 /* game crosshair hidden (version 5): the laser is the aim; the game's reticle sat a little off it in the headset */
 /* high foveation (version 6): the game's own scene passes are foveated (renderer/fovea_map.h), most of the GPU time; 60 fps first */
-/* render scale 1.5 and 1548x1656 eye images on the Quest (version 7): 60 fps (see LG_XR_DEFAULT_WIDTH) */
+/* render scale 1.0 and 1548x1656 eye images on the Quest (version 7): 60 fps (see LG_XR_DEFAULT_WIDTH) */
 #define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,0,1,0,0,1,3,7,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
