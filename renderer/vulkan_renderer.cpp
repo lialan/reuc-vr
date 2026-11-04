@@ -376,7 +376,15 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     }
     // Fragment-only uniform identity (uber_merge.h): with the pre-pass the draws' vertex stage reads no uniform block, so a run ends only where
     // the part a fragment reads differs.
-    frag_uniform_merge_ = xform_ && std::getenv("UC_MERGE_FRAG_UNIFORM") && std::strcmp(std::getenv("UC_MERGE_FRAG_UNIFORM"), "0") != 0;
+    // On by default on the headset (Dolphin's split of vertex and pixel constants, S18 rec 4): fightvr replay at native, foveation high,
+    // two alternating pairs 14.2 / 13.8 -> 13.6 / 13.6 ms GPU a frame; Mac preview identical with late Z. UC_MERGE_FRAG_UNIFORM=0 / 1 decides.
+#ifdef __ANDROID__
+    constexpr bool kFragUniformDefault = true;
+#else
+    constexpr bool kFragUniformDefault = false;
+#endif
+    const char* frag_uniform_env = std::getenv("UC_MERGE_FRAG_UNIFORM");
+    frag_uniform_merge_ = xform_ && (frag_uniform_env && *frag_uniform_env ? std::strcmp(frag_uniform_env, "0") != 0 : kFragUniformDefault);
     if (frag_uniform_merge_) std::fprintf(stderr, "[vr] fragment-only uniform identity for merging on\n");
     static_depth_ = layers_ > 1 && std::getenv("UC_STATIC_DEPTH");   // diagnostics: does dynamic depth state cost the tiler its LRZ?   // the headset's vertex pre-pass reads the vertices by address
     if (xform_) {
