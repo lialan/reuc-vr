@@ -417,9 +417,18 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         const bool indexing = supported12.runtimeDescriptorArray && supported12.descriptorBindingPartiallyBound && supported12.descriptorBindingVariableDescriptorCount &&
                               supported12.shaderSampledImageArrayNonUniformIndexing;
         // The small-draw ubershader (UC_UBER_SMALL=1|scene|hud, uber_merge.h) reads its draws' textures from the table: it turns the table on.
+        // On the headset both are on by default (S18 section 8: fightvr replay at 1.0x, foveation High, 12.7 -> 10.7-11.0 ms GPU a frame);
+        // UC_TEX_MERGE=0 turns both off, UC_UBER_SMALL=0 the ubershader alone. Elsewhere (the Mac's VR preview) both are opt-in.
+#ifdef __ANDROID__
+        constexpr const char* kTableDefault = "1";
+#else
+        constexpr const char* kTableDefault = "0";
+#endif
+        const char* tex_env = std::getenv("UC_TEX_MERGE");
         const char* uber_small = std::getenv("UC_UBER_SMALL");
-        const bool uber_wanted = uber_small && std::strcmp(uber_small, "0") != 0;
-        const bool wanted = (std::getenv("UC_TEX_MERGE") && std::strcmp(std::getenv("UC_TEX_MERGE"), "0") != 0) || uber_wanted;
+        if (!uber_small) uber_small = tex_env && std::strcmp(tex_env, "0") == 0 ? "0" : kTableDefault;
+        const bool uber_wanted = std::strcmp(uber_small, "0") != 0;
+        const bool wanted = std::strcmp(tex_env ? tex_env : kTableDefault, "0") != 0 || uber_wanted;
         tex_merge_ = wanted && xform_ && indexing && table_limit_ >= 256;
         if (uber_wanted && tex_merge_) {
             uber_small_scene_ = std::strcmp(uber_small, "hud") != 0;
