@@ -1,5 +1,70 @@
 # Quest clarity and scene-copy distortion, 2026-11-04
 
+## Follow-up: missing cabin surfaces remain unresolved
+
+The owner accepts clarity but reports **missing or black patches on surfaces**.
+The refraction result below is not acceptance of the cabin's overall rendering.
+Native resolution is retained. Further evidence, all under `priority-fix/`:
+
+- The normal player's `vr.cfg` was read through a temporary, read-only app-side
+  export. It has native 2064x2208, native render scale, **medium foveation**, 90 Hz,
+  scale 10 and screen distance 3. The normal folder has no readable config.json,
+  env.txt or args.txt. This supersedes the earlier inability to inspect settings.
+  The export is `player-config-check/logs/player-vr.cfg`; normal files were not
+  changed. The export code was removed after use.
+- A second read-only export retained the normal-play log at
+  `player-log-check/logs/player-uc.log`: the session starts with foveation off,
+  switches to low/medium, and reaches room r000c (the first train cabin). All
+  2,713 normal installed shader/data files match the APK bytes. The 78 background
+  pipeline compilation failures also occur in the isolated runs; they are not
+  evidence of a normal-folder-only failure. Temporary export code was removed.
+- Ordinary screenshot requests set `keep_frame_`, disabling the direct XR
+  presentation path. Thus the earlier raw captures did not cover the normal
+  direct EFB/HUD composite. `UC_CAPTURE_XR=1` now preserves that path and copies
+  the actual two-eye swapchain output after composition, including FXAA and HUD.
+  It requires native-sized RGBA8 eyes and requests transfer-source usage only
+  when enabled. The copy preserves sRGB-encoded bytes rather than blitting them
+  through an extra sRGB decode. This is a diagnostic, not a visual fix.
+- `UC_VR_TEST_YAW=<degrees>` extends the existing fixed-pose diagnostic. Eye
+  positions rotate with the head so 64 mm stereo separation remains consistent.
+  Runtime projection-layer poses remain tracked; these fixed-pose captures
+  still cannot establish worn-headset tracking correctness.
+- The XR screen pipeline now supplies an explicit disabled depth/stencil state.
+  It declares a depth attachment for the controller overlay and lacks dynamic
+  depth/stencil state, so a null state violated
+  `VUID-VkGraphicsPipelineCreateInfo-renderPass-09033` (checked against the local
+  Khronos validusage registry). `cabin-xr-direct` versus
+  `cabin-xr-depth-state` shows only changing stats digits. **This API correction
+  has not been shown to fix the reported black patches.**
+
+| Controlled check | Result and limit |
+| --- | --- |
+| `cabin-no-cull` | Renderer CPU culling disabled: all three captures at 7000/8500/8800 are byte-identical to `close-final`. |
+| `cabin-d32` | D32 versus D24 at those checkpoints changes small character/edge regions; no missing surface restored. |
+| `cabin-down` | Six checkpoints at pitch -60; no large missing patches identified. Close foreground intersects the camera in some views. |
+| `cabin-xr-direct` | Actual XR output at 7000/8500/8800 inspected; no large black patches identified. |
+| `cabin-medium-foveation` | Four actual XR captures with the player's medium setting: coarse edge differences, no large patches reproduced. Metrics in comparison.json. |
+| `cabin-live`, `cabin-live-medium` | Two 25-second actual tracked-pose videos, foveation off/medium. Both reach active dining-car combat; no large holes identified in inspected frames. Live paths differ; neither pixel parity nor a performance A/B is claimed. |
+| `cabin-side` | Native, medium foveation, yaw 60/pitch -15 at 5300/6000/7000/8500; no large holes identified. |
+| `cabin-side-wide` | Guest frustum 4x4 changed camera timing and the replay path. Comparison is explicitly invalid for pixel parity; no culling fix established. |
+| `cabin-early` | Actual XR output at 2200/2800 (intro) and 3400/4000/4400/4800 (first train cabin), forward pose, medium foveation. Floor, seats and walls present in sampled views. |
+| `cabin-early-live` | Live timing, fixed pitch -10, native/medium, unlocked, 25 seconds of first-cabin gameplay. Thirteen actual XR captures include startup, zombies and damage effects; no large missing surfaces identified. Harness passed; no tracking or performance acceptance claim. |
+
+The missing-patch report still needs a matching reproduction. Do not turn these
+negative checks into a correctness claim or speculative default changes. The
+earlier pre-task `f-nohud-3s.png` contains obvious holes, but its old profile,
+unpaired live route and original refraction differ from the current build.
+Useful contact sheets, comparison metrics, APK hashes and logs are retained;
+redundant raw captures and per-run archives are pruned. All device operations
+use quest3-lock and isolated saves. Normal player saves are not used.
+
+Quest and host renderer builds and three focused CTests (post_effects, depth_efb,
+hud_layer) pass. Current diagnostic/API-correction APK:
+`c22b70bffa1780510f1b25e1e63c161106c038f4eb488d7856f0c07914420854`, preserved as
+`cabin-diagnostics.apk`. `cabin-installed-final.json` records installed readback,
+stopped app and absent private overrides; `cabin-cleanup*.json` records pruned
+captures. The accepted clarity APK remains preserved separately.
+
 ## Report and reproduction
 
 The owner clarified: blurry/low-resolution 3D; flickering or doubled edges remain

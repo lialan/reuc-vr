@@ -1,7 +1,59 @@
-# Latest continuation: native clarity and the confirmed doubled-edge glitch
+# Latest continuation: cabin missing surfaces are still unresolved
+
+Updated 2026-11-04 after the owner's follow-up. **Clarity is accepted; missing or
+black patches on cabin surfaces are not fixed or accepted.** Keep native
+2064x2208. Detailed evidence and failed controls are at the top of
+[S19](docs/spikes/S19-quest-clarity.md).
+
+- Current source adds actual XR swapchain capture (`UC_CAPTURE_XR=1`) and a fixed
+  diagnostic yaw (`UC_VR_TEST_YAW`). Ordinary screenshots take a different path
+  from normal direct XR presentation; earlier clean screenshots alone were
+  insufficient. Fixed-pose images still do not establish tracking correctness.
+- Corrected the XR screen pipeline's missing disabled depth/stencil state.
+  This is a confirmed Vulkan validity error, **not a confirmed cabin fix**.
+  Matched before/after scene pixels are unchanged except the stats display.
+- Inspected current actual-XR output in the first cabin, stairs and dining car,
+  forward/down/side views; two live dining-car recordings and a 25-second live
+  first-cabin check. No large missing patches were identified in the sampled
+  frames. This does not override the owner's report.
+- The normal player's settings were read without changing them: native eyes
+  and render scale, **medium foveation**, 90 Hz, scale 10, screen 3. A retained
+  normal-play log starts with foveation off, then switches to low/medium, and
+  reaches first-cabin room `r000c`. All 2,713 installed shader/data assets match
+  the APK byte-for-byte. Its 78 pipeline warm-up errors also occur in isolated
+  runs; no visual causality established. Temporary export code was removed.
+- Remaining information needed: identify a missing patch in
+  `priority-fix/cabin-early/sheet.jpg`, or get a short recording of the owner's
+  faulty view. Async questions about the exact scene and these captures have
+  not been answered yet. Do not repeat the same broad flag sweeps.
+- Evidence root: `/Users/lialan/workspace/reuc-vr-glitch/priority-fix/`.
+  `player-log-check/logs/player-uc.log` is the untouched normal-play log;
+  `cabin-early-live/sheet.jpg` covers the live first cabin and zombie attacks.
+- Current APK is preserved as `cabin-diagnostics.apk`, SHA256
+  `c22b70bffa1780510f1b25e1e63c161106c038f4eb488d7856f0c07914420854`.
+  Installed readback/cleanup is recorded in `cabin-installed-final.json`.
+  The accepted clarity build `clarity-fixed.apk` remains available.
+- Quest/host renderer builds, three focused CTests and diff checks passed.
+  Temporary archives, export code and private overrides were cleaned. Useful
+  contact sheets, selected raw images, logs and metrics remain; redundant new
+  captures were pruned. App/device automation stopped after verification.
+
+Quest authorization was given for this task and remains valid unless the owner
+takes over or revokes it. Use quest3-lock and isolated saves. Push only to
+`lialan`, never `origin`.
+
+---
+
+# Earlier continuation: native clarity and the confirmed doubled-edge glitch
 
 Updated 2026-11-04. This section supersedes the hypotheses and defaults in the
 historical handoff below. Detailed source/evidence notes: [S19](docs/spikes/S19-quest-clarity.md).
+
+**Owner follow-up: clarity is good, but cabin rendering is still incorrect.**
+The remaining symptom is missing or black patches on surfaces. The refraction
+comparison below establishes only that one effect was removed; overall 3D
+correctness is not accepted. Keep native clarity while investigating the missing
+surfaces.
 
 ## Owner's confirmed priorities
 

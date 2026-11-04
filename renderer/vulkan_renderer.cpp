@@ -4743,8 +4743,9 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     // The headset reads the presented EFB region in place: the copy into the slot image (2 x 2064x2208 at the native scale, 1.35 ms on the
     // Quest) is made only for a frame that may be captured (keep_frame), held for the reticle layer or blanked. UC_XR_VIA_SLOT=1: always copy.
     static const bool xr_via_slot=std::getenv("UC_XR_VIA_SLOT")!=nullptr;
+    const bool capture_xr=xr_ && keep_frame_ && std::getenv("UC_CAPTURE_XR");
 #ifdef UC_OPENXR
-    const bool xr_direct=xr_ && xr_frame_ && packet.present && display && !overlay_frame && !packet.black_output && !hold && !keep_frame_ && !xr_via_slot;
+    const bool xr_direct=xr_ && xr_frame_ && packet.present && display && !overlay_frame && !packet.black_output && !hold && (!keep_frame_ || capture_xr) && !xr_via_slot;
 #else
     const bool xr_direct=false; (void)xr_via_slot;
 #endif
@@ -4894,6 +4895,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     }
 #ifdef UC_OPENXR
     if (xr_ && xr_frame_ && packet.present && display && !xr_direct) xr_->record(slot.command, slot.image, slot.view, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, {0, 0, 1, 1}, fovea_level_ ? fovea_eye_.view : VK_NULL_HANDLE, fovea_texel_);
+    if (capture_xr && xr_frame_ && packet.present && display) xr_->copy_capture(slot.command,slot.image,extent_);
 #endif
     if(present_image) {
         const auto present_layout=fsr_presentation_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : streamline_swapchain() ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -4985,7 +4987,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     for (auto& texture : slot.textures) texture->initialized=true;
     if (packet.present && display) keep_frame_=false;
     if (packet.present && !overlay_frame) { frame_start_=true; ++frame_index_; scene_restore_copy_.reset(); dlss5_scene_.ready=false; frame_reticle_.clear(); }
-    slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display && !xr_direct; slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
+    slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display && (!xr_direct || capture_xr); slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
 #ifdef UC_OPENXR
     if (xr_ && packet.present && display && xr_->frame_open()) { xr_->end_frame(xr_frame_); if (xr_frame_) ++presentations_; xr_frame_ = false; }
 #endif

@@ -69,6 +69,9 @@ public:
     // hud: the HUD layer laid over both eyes (its images in SHADER_READ_ONLY_OPTIMAL), or none.
     void record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect = {0, 0, 1, 1},
                 VkImageView fovea = VK_NULL_HANDLE, VkExtent2D texel = {}, const XrHudLayer* hud = nullptr);
+    // UC_CAPTURE_XR: retain the actual eye output, including the direct EFB/HUD composite.
+    // Destination is a native-sized RGBA8 array in TRANSFER_SRC_OPTIMAL, left in that layout.
+    void copy_capture(VkCommandBuffer command, VkImage destination, VkExtent2D size);
     // Before attach(): the device can shade by a foveation map (the screen and overlay pipelines are made to accept one).
     void set_fovea_support(bool on) { fovea_support_ = on; }
     void end_frame(bool rendered);

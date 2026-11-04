@@ -227,6 +227,7 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
         // unchanged through a UNORM view of the sRGB swapchain, which the compositor then decodes once.
         render_format_ = format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : format;
         swap.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | (render_format_ != format ? XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT : 0);
+        if (std::getenv("UC_CAPTURE_XR")) swap.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
         swap.format = format; swap.sampleCount = 1; swap.width = width_; swap.height = height_; swap.faceCount = 1; swap.arraySize = 2; swap.mipCount = 1;
         xr_check(xrCreateSwapchain(session_, &swap, &swapchain_), "OpenXR stereo array swapchain");
         if (config_.require_foveation) {
@@ -290,6 +291,9 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.cullMode = VK_CULL_MODE_NONE; raster.lineWidth = 1;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    // The eye pass has a depth attachment for the controller models. Its screen
+    // quad must explicitly disable depth/stencil (VUID-renderPass-09033).
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState attachment{}; attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blend.attachmentCount = 1; blend.pAttachments = &attachment;
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -298,7 +302,7 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     rendering.depthAttachmentFormat = XrOverlay::kDepthFormat;   // the eye pass also draws the overlay (depth-tested guns)
     VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pipeline.pNext = &rendering;
     pipeline.stageCount = 2; pipeline.pStages = stages; pipeline.pVertexInputState = &vertices; pipeline.pInputAssemblyState = &assembly; pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster; pipeline.pMultisampleState = &multisample; pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic; pipeline.layout = layout_;
+    pipeline.pRasterizationState = &raster; pipeline.pMultisampleState = &multisample; pipeline.pDepthStencilState = &depth; pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic; pipeline.layout = layout_;
     // The renderer's foveation map, when bound, sets the screen pass's rate (REPLACE); the overlay's pipelines ignore it (no rate state: KEEP).
     VkPipelineFragmentShadingRateStateCreateInfoKHR rate{VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
     rate.fragmentSize = {1, 1}; rate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
@@ -397,6 +401,7 @@ bool XrCompositor::begin_frame() {
     // captures only; the compositor still receives the real tracked poses.
     static const bool fixed_pose = [] { const char* v = std::getenv("UC_VR_TEST_POSE"); return v && *v == '1'; }();
     static const float test_pitch = [] { const char* v = std::getenv("UC_VR_TEST_PITCH"); return v ? float(std::atof(v)) * .017453292f : 0.f; }();
+    static const float test_yaw = [] { const char* v = std::getenv("UC_VR_TEST_YAW"); return v ? float(std::atof(v)) * .017453292f : 0.f; }();
     const double phase = wobble ? double(frame_.predictedDisplayTime % 3000000000ll) / 3e9 * 6.283185307 : 0.0;
     const float yaw = wobble ? float(0.105 * std::sin(phase)) : 0.f, sway = wobble ? float(0.04 * std::sin(phase * 1.7)) : 0.f;
     const float qy[4] = {0, std::sin(yaw / 2), 0, std::cos(yaw / 2)};   // x y z w
@@ -405,8 +410,11 @@ bool XrCompositor::begin_frame() {
         eyes[i].orientation = {v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w};
         eyes[i].position = {v.pose.position.x, v.pose.position.y, v.pose.position.z};
         if (fixed_pose) {
-            eyes[i].orientation = {std::sin(test_pitch / 2), 0, 0, std::cos(test_pitch / 2)};
-            eyes[i].position = {i ? .032f : -.032f, 0, 0};
+            const float sx = std::sin(test_pitch / 2), cx = std::cos(test_pitch / 2);
+            const float sy = std::sin(test_yaw / 2), cy = std::cos(test_yaw / 2);
+            eyes[i].orientation = {cy * sx, sy * cx, -sy * sx, cy * cx};
+            const float eye_x = i ? .032f : -.032f;
+            eyes[i].position = {std::cos(test_yaw) * eye_x, 0, -std::sin(test_yaw) * eye_x};
         }
         if (wobble) {   // yaw about the head's vertical axis (q = qy * q, the position rotated with it), then the sideways sway
             const float x = eyes[i].orientation[0], y = eyes[i].orientation[1], z = eyes[i].orientation[2], w = eyes[i].orientation[3];
@@ -539,6 +547,33 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     vkCmdEndRendering(command);
     barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+}
+
+void XrCompositor::copy_capture(VkCommandBuffer command, VkImage destination, VkExtent2D size) {
+    if (!acquired_ || size.width!=width_ || size.height!=height_ || render_format_!=VK_FORMAT_R8G8B8A8_UNORM)
+        throw std::logic_error("UC_CAPTURE_XR requires native-sized RGBA8 eyes");
+    // Copy bytes: blitting from the runtime's sRGB image would decode colours that
+    // were deliberately written through its UNORM view.
+    const VkImage source=images_.at(image_);
+    const auto transition=[&](VkImage image,VkImageLayout from,VkImageLayout to,VkPipelineStageFlags2 src,VkAccessFlags2 read,
+                              VkPipelineStageFlags2 dst,VkAccessFlags2 write) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask=src; b.srcAccessMask=read; b.dstStageMask=dst; b.dstAccessMask=write;
+        b.oldLayout=from; b.newLayout=to; b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        b.image=image; b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,2};
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.imageMemoryBarrierCount=1; dependency.pImageMemoryBarriers=&b;
+        vkCmdPipelineBarrier2(command,&dependency);
+    };
+    transition(source,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
+    transition(destination,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy copy{}; copy.srcSubresource=copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,2}; copy.extent={width_,height_,1};
+    vkCmdCopyImage(command,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,destination,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+    transition(destination,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT);
+    transition(source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
 void XrCompositor::end_frame(bool rendered) {
