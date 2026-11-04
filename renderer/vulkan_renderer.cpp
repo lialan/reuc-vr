@@ -409,6 +409,11 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         // At most 1024 entries (a fight packet holds ~21): the Quest's driver charges a pool for the layout's whole array, whatever the variable
         // count of the set, so every slot's pool is sized to the limit (VK_ERROR_OUT_OF_POOL_MEMORY otherwise).
         table_limit_ = std::min<uint32_t>(1024, table_update_after_bind_ ? after_bind : plain);
+        // Diagnostics: UC_TEX_MERGE_MAX=<entries> a smaller table (256 at least), UC_TEX_MERGE_EAGER=1 every draw on the table (not only runs that
+        // join across textures), UC_TEX_MERGE_PX=<guest pixels> only draws whose screen box is at most that join across textures.
+        if (const char* max = std::getenv("UC_TEX_MERGE_MAX")) table_limit_ = std::min<uint32_t>(table_limit_, uint32_t(std::max(256, std::atoi(max))));
+        table_eager_ = std::getenv("UC_TEX_MERGE_EAGER") && std::strcmp(std::getenv("UC_TEX_MERGE_EAGER"), "0") != 0;
+        table_max_pixels_ = std::getenv("UC_TEX_MERGE_PX") ? std::max(0.f, float(std::atof(std::getenv("UC_TEX_MERGE_PX")))) : 0.f;
         const bool indexing = supported12.runtimeDescriptorArray && supported12.descriptorBindingPartiallyBound && supported12.descriptorBindingVariableDescriptorCount &&
                               supported12.shaderSampledImageArrayNonUniformIndexing;
         // The small-draw ubershader (UC_UBER_SMALL=1|scene|hud, uber_merge.h) reads its draws' textures from the table: it turns the table on.
@@ -424,8 +429,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
         if (uber_wanted)
             std::fprintf(stderr, "[vr] small-draw ubershader %s (draws up to %.0f guest pixels, %s)\n", tex_merge_ ? "on" : "unavailable (no texture table)", uber_max_pixels_,
                          uber_small_scene_ && uber_small_hud_ ? "EFB passes and HUD layer" : uber_small_scene_ ? "EFB passes" : "HUD layer");
-        std::fprintf(stderr, "[vr] texture table %s (%u entries a packet%s)\n", tex_merge_ ? "on" : !wanted ? "off (UC_TEX_MERGE=1 turns it on)" : !xform_ ? "unavailable (no vertex pre-pass)" :
-                     !indexing ? "unavailable (descriptor indexing features missing)" : "unavailable (descriptor limits too small)", table_limit_, table_update_after_bind_ ? ", update after bind" : "");
+        std::fprintf(stderr, "[vr] texture table %s (%u entries a packet%s%s)\n", tex_merge_ ? "on" : !wanted ? "off (UC_TEX_MERGE=1 turns it on)" : !xform_ ? "unavailable (no vertex pre-pass)" :
+                     !indexing ? "unavailable (descriptor indexing features missing)" : "unavailable (descriptor limits too small)", table_limit_, table_update_after_bind_ ? ", update after bind" : "",
+                     table_eager_ ? ", every draw" : ", runs that join across textures");
         if (tex_merge_) {
             features12.runtimeDescriptorArray = features12.descriptorBindingPartiallyBound = features12.descriptorBindingVariableDescriptorCount = VK_TRUE;
             features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -636,6 +642,14 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
             merge_vertex_module_=shader(device, shaders_ / "smoke.stereo.xform.uber.vert.spv");
             merge_fragment_module_=shader(device, shaders_ / "smoke.stereo.uber.merge.frag.spv"); merge_early_module_=shader(device, shaders_ / "smoke.stereo.uber.merge.early.frag.spv");
         } catch (const std::exception& error) { uber_small_scene_=uber_small_hud_=false; std::fprintf(stderr,"[vr] small-draw ubershader off: %s\n",error.what()); }
+        // its family of draws with few stages (uber_merge.h kUberFewStages); UC_UBER_FAMILY=0: every draw on the general module
+        uber_families_=uber_small_scene_ || uber_small_hud_;
+        if (const char* family=std::getenv("UC_UBER_FAMILY")) uber_families_=uber_families_ && std::strcmp(family,"0")!=0;
+        if (uber_families_) try {
+            few_vertex_module_=shader(device, shaders_ / "smoke.stereo.xform.uber2.vert.spv");
+            few_fragment_module_=shader(device, shaders_ / "smoke.stereo.uber2.merge.frag.spv"); few_early_module_=shader(device, shaders_ / "smoke.stereo.uber2.merge.early.frag.spv");
+        } catch (const std::exception& error) { uber_families_=false; std::fprintf(stderr,"[vr] small-draw ubershader families off: %s\n",error.what()); }
+        if (uber_small_scene_ || uber_small_hud_) std::fprintf(stderr,"[vr] small-draw ubershader families %s\n",uber_families_ ? "on (up to 2 stages, more)" : "off");
     }
     load_pipeline_cache();
     if (motion_outputs_ && sharpening_) rcas_.initialize(device, memory_, shaders_);
@@ -1010,11 +1024,14 @@ VkPipeline VulkanRenderer::table_pipeline(const PipelineKey& requested) {
 }
 // The small-draw ubershader pipeline of a draw's fixed-function state (uber_merge.h) when it is compiled; otherwise it is queued and the draw
 // keeps its own pipeline meanwhile.
-VkPipeline VulkanRenderer::uber_merge_pipeline(const PipelineKey& requested) {
-    if (last_merge_pipeline_ && requested==last_merge_key_) return last_merge_pipeline_;
-    const auto key=uber_merge_key(static_depth_ ? requested : static_key(requested));
+// few: the pipeline of the family of draws with few stages (uber_merge.h kUberFewStages; null when the draw has more or the families are off).
+// Runs join on the general pipeline; a run whose draws all have few stages is drawn with the family's.
+VkPipeline VulkanRenderer::uber_merge_pipeline(const PipelineKey& requested,bool few) {
+    if (few && (!uber_families_ || requested[1]>kUberFewStages)) return VK_NULL_HANDLE;
+    if (last_merge_pipeline_[few] && requested==last_merge_key_[few]) return last_merge_pipeline_[few];
+    const auto key=uber_merge_key(static_depth_ ? requested : static_key(requested),few);
     std::lock_guard lock(pipelines_mutex_);
-    if (const auto found=pipelines_.find(key); found!=pipelines_.end()) { last_merge_key_=requested; last_merge_pipeline_=found->second; return found->second; }
+    if (const auto found=pipelines_.find(key); found!=pipelines_.end()) { last_merge_key_[few]=requested; last_merge_pipeline_[few]=found->second; return found->second; }
     queue_pipeline(key,false);
     return VK_NULL_HANDLE;
 }
@@ -1249,8 +1266,10 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; input.vertexBindingDescriptionCount = 1; input.pVertexBindingDescriptions = &binding; input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
         if (xform_) { input.vertexBindingDescriptionCount = 0; input.vertexAttributeDescriptionCount = 0; stages[0].module = table ? table_vertex_module_ : xform_vertex_module_; }   // the pre-pass's draws read their vertices from its outputs
         if (merge) {   // the ubershader with and without the alpha test (key word 0 bit 16), constant 67 only
-            stages[0].module=merge_vertex_module_;
-            stages[1].module=(((key[0]>>16)&1) || late_z) ? merge_fragment_module_ : merge_early_module_;
+            const bool few=key[1]==kUberFewStages;   // the family of draws with few stages (uber_merge.h)
+            if (few && !few_vertex_module_) throw std::invalid_argument("small-draw ubershader family without its modules");
+            stages[0].module=few ? few_vertex_module_ : merge_vertex_module_;
+            stages[1].module=(((key[0]>>16)&1) || late_z) ? (few ? few_fragment_module_ : merge_fragment_module_) : (few ? few_early_module_ : merge_early_module_);
             stages[1].pSpecializationInfo=&uber_specialization;
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VkPrimitiveTopology(key[69]);
@@ -1390,7 +1409,10 @@ void VulkanRenderer::warm_pipelines(const std::function<void(size_t,size_t)>& pr
     if (tex_merge_)   // the texture-table variants of the EFB keys too (the HUD and particle layers draw without the table)
         for (auto key:warm_keys_) if (!(key[0]&(kHudLayerKeyBit|kParticleLayerKeyBit))) { key[0]|=kTexTableKeyBit; queue_pipeline(key,false); }
     if (uber_small_scene_ || uber_small_hud_)   // the small-draw ubershader: one pipeline per fixed-function state seen (EFB and HUD layer keys)
-        for (const auto& key:warm_keys_) if (!(key[0]&kParticleLayerKeyBit)) queue_pipeline(uber_merge_key(key),false);
+        for (auto key:warm_keys_) if (!(key[0]&kParticleLayerKeyBit)) {   // the general pipeline of each state and its family of few stages
+            queue_pipeline(uber_merge_key(key,false),false);
+            if (uber_families_) { key[1]=1; queue_pipeline(uber_merge_key(key,true),false); }
+        }
     const size_t base=jobs_done_, total=compile_queue_.size()+compiling_;
     while (!compile_queue_.empty() || compiling_) {
         const size_t done=jobs_done_-base;
@@ -3974,7 +3996,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         // uber: a small-draw ubershader run (uber_merge.h), draws: how many draws it holds; merge: the ubershader pipeline every draw of the run
         // may take (null: not all may); pixels: the guest pixels its draws' screen boxes cover (the ubershader's fragments, an upper bound).
         struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; bool fovea; bool table=false;
-                     bool uber=false; uint32_t draws=1; VkPipeline merge=VK_NULL_HANDLE; float pixels=0; };   // rate: the fragment shading rate, fovea: whether the foveation map applies (a run joins only draws of one rate and kind); table: textures from the packet's texture table
+                     bool uber=false; uint32_t draws=1; VkPipeline merge=VK_NULL_HANDLE; float pixels=0; VkPipeline table_pipeline=VK_NULL_HANDLE; VkPipeline few=VK_NULL_HANDLE; };   // rate: the fragment shading rate, fovea: whether the foveation map applies (a run joins only draws of one rate and kind); table: textures from the packet's texture table
         bool bound_fovea=false;
         // The rate of a draw: its own (pipeline rate), and with the foveation map the coarser of both (MAX), or the map's where the draw's own
         // is 1x1 (REPLACE) on a device without the non-trivial combiners.
@@ -3987,13 +4009,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         std::optional<Run> pending;
         size_t run_last=0;   // the pending run's last draw
         const auto issue_run=[&](const Run& run) {
-            if (run.uber) { ++uber_runs_; uber_draws_+=run.draws; uber_pixels_+=run.pixels; }
+            if (run.uber) { ++uber_runs_; uber_draws_+=run.draws; uber_pixels_+=run.pixels; uber_few_runs_+=run.few!=VK_NULL_HANDLE; }
             else if (run.merge) ++uber_singles_;   // small draws that stayed on their folded module (nothing to join through the ubershader)
             const auto& draw=packet.draws[run.d]; const auto& info=gpu_draws[run.d];
             if (no_dedup || std::memcmp(&run.viewport,&bound_viewport,sizeof run.viewport)) { vkCmdSetViewport(slot.command,0,1,&run.viewport); bound_viewport=run.viewport; }
             if (no_dedup || std::memcmp(&run.scissor,&bound_scissor,sizeof run.scissor)) { vkCmdSetScissor(slot.command,0,1,&run.scissor); bound_scissor=run.scissor; }
             if (bound_indices!=&slot.xform_indices) { vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32); bound_indices=&slot.xform_indices; bound_index_offset=0; }
-            bind_pipeline(run.pipeline);
+            bind_pipeline(run.uber && run.few ? run.few : run.pipeline);
             set_draw_state(info.key);
             if (layers_>1) bind_draw_set(run.set,true,run.table,run.uber);
             else vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&slot.texture_sets[run.set],0,nullptr);
@@ -4197,9 +4219,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                                      (unsigned long long)table_entries_,(unsigned long long)table_runs_,(unsigned long long)table_joins_,(unsigned long long)table_pending_);
                     table_packets_=table_overflows_=table_entries_=table_runs_=table_joins_=table_pending_=0;
                     if (uber_small_scene_ || uber_small_hud_ || frag_uniform_merge_)   // the small-draw ubershader and the fragment-only uniform test over the same 2 s
-                        std::fprintf(stderr,"[uber-merge] EFB: ubershader runs %llu holding %llu draws, joins %llu, runs of small draws left on their own pipeline %llu, big draws %llu, waiting %llu; HUD layer: %llu draws in %llu runs, %llu ubershader runs holding %llu draws; fragment-uniform joins %llu; ubershader guest pixels %.0f\n",
+                        std::fprintf(stderr,"[uber-merge] EFB: ubershader runs %llu holding %llu draws, joins %llu, runs of small draws left on their own pipeline %llu, big draws %llu, waiting %llu; HUD layer: %llu draws in %llu runs, %llu ubershader runs holding %llu draws; fragment-uniform joins %llu; ubershader guest pixels %.0f; EFB ubershader draws of 0/1/2/3+ stages %llu/%llu/%llu/%llu, runs on the few-stage family %llu\n",
                                      (unsigned long long)uber_runs_,(unsigned long long)uber_draws_,(unsigned long long)uber_joins_,(unsigned long long)uber_singles_,(unsigned long long)uber_big_,(unsigned long long)uber_pending_,
-                                     (unsigned long long)hud_layer_draws_,(unsigned long long)hud_layer_runs_,(unsigned long long)hud_uber_runs_,(unsigned long long)hud_uber_draws_,(unsigned long long)frag_uniform_joins_,uber_pixels_);
+                                     (unsigned long long)hud_layer_draws_,(unsigned long long)hud_layer_runs_,(unsigned long long)hud_uber_runs_,(unsigned long long)hud_uber_draws_,(unsigned long long)frag_uniform_joins_,uber_pixels_,
+                                     (unsigned long long)uber_stage_draws_[0],(unsigned long long)uber_stage_draws_[1],(unsigned long long)uber_stage_draws_[2],(unsigned long long)uber_stage_draws_[3],(unsigned long long)uber_few_runs_); uber_few_runs_=0;
+                    std::fill(std::begin(uber_stage_draws_),std::end(uber_stage_draws_),0);
                     uber_runs_=uber_draws_=uber_joins_=uber_singles_=uber_big_=uber_pending_=frag_uniform_joins_=hud_layer_draws_=hud_layer_runs_=hud_uber_runs_=hud_uber_draws_=0; uber_pixels_=0;
                     cull_tested=cull_draws=cull_indices=all_indices=0; issued_draws_=merged_draws_=set_binds_=pipeline_binds_=alpha_passes_=0; reach[0]=reach[1]=0; cull_since=std::chrono::steady_clock::now();
                 }
@@ -4225,13 +4249,22 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (table_ok && !particle_pass && std::find(table_skipped.begin(),table_skipped.end(),draw.callsite)==table_skipped.end()) {
                     const auto depth=draw.uniforms->pixel[1]&31;
                     const bool second_alpha=(draw.uniforms->pixel[2]&256) && draw.blend.alpha_write && !(depth&1 && ((depth>>1)&7)==0) && (fuse_off() || !fused_destination_alpha(draw));
-                    if (!second_alpha) { if (const VkPipeline table=table_pipeline(info.key)) { run.pipeline=table; run.table=true; } else ++table_pending_; }
+                    // Lazily (the default): the draw keeps its folded module and own set and only remembers its table variant (run.table_pipeline);
+                    // the run moves onto the table when a draw with other textures joins it. A single draw or a run of equal textures reading the
+                    // table cost the headset per fragment (non-uniform descriptor indexing: the full-screen glows, fades and sprites ~2x, S18
+                    // section 8). UC_TEX_MERGE_EAGER=1: every draw that can on the table, as before.
+                    if (!second_alpha) {
+                        if (const VkPipeline table=table_pipeline(info.key)) {
+                            if (table_eager_) { run.pipeline=table; run.table=true; }
+                            else if (!table_max_pixels_ || draw_pixels(d)<=table_max_pixels_) run.table_pipeline=table;
+                        } else ++table_pending_;
+                    }
                     // The small-draw ubershader (uber_merge.h): a small draw may move onto the ubershader of its fixed-function state, but only to
                     // join a run it cannot join otherwise (below): a run of one draw, or of draws that join anyway, keeps its folded module.
                     if (!second_alpha && uber_small_scene_ && !frag_dump_ && uber_merge_stages_ok(info.key)) {
                         if (draw_pixels(d)>uber_max_pixels_) ++uber_big_;
                         else if (!(run.merge=uber_merge_pipeline(info.key))) ++uber_pending_;
-                        else run.pixels=draw_pixels(d);
+                        else { run.pixels=draw_pixels(d); run.few=uber_merge_pipeline(info.key,true); }
                     }
                 }
                 const auto same_push=[](DrawPush a,DrawPush b) { a.palette=b.palette=0; a.indexed=b.indexed=0; return std::memcmp(&a,&b,sizeof a)==0; };
@@ -4242,9 +4275,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 const auto same_uniform=[&](size_t a,size_t b) { return set_keys[a][16]==set_keys[b][16] || (frag_uniform_merge_ && gx::fragment_uniforms_equal(*packet.draws[a].uniforms,*packet.draws[b].uniforms)); };
                 const bool same_textures=pending && std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin());
                 // the sets: equal (textures, samplers, uniform block), or for two table runs the uniform block alone (the textures are in the table)
-                const bool same_set=pending && (run.table ? pending->table && same_uniform(pending->set,run.set) : !pending->table && same_textures && same_uniform(pending->set,run.set));
+                // Lazily (run.table_pipeline): a run on its folded modules moves onto the table (table_moves) when the next draw has the same key and
+                // uniform block and other textures; a run already on the table takes a draw whose table variant it uses.
+                const bool table_moves=pending && !pending->table && !pending->uber && !run.table && run.table_pipeline && pending->table_pipeline==run.table_pipeline &&
+                                       !same_textures && gpu_draws[pending->d].key==info.key && same_uniform(pending->set,run.set);
+                const bool table_takes=pending && pending->table && !pending->uber && !run.table && run.table_pipeline && pending->pipeline==run.table_pipeline;
+                const bool same_set=pending && (run.table || table_takes ? pending->table && same_uniform(pending->set,run.set) :
+                                                table_moves || (!pending->table && same_textures && same_uniform(pending->set,run.set)));
                 const bool same_eye=pending && std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->set*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+run.set*stereo_stride_,kStereoBlockBytes)==0;
-                const bool same_pipeline=pending && !pending->uber && pending->pipeline==run.pipeline && gpu_draws[pending->d].key==info.key;
+                const bool same_pipeline=pending && !pending->uber && (pending->pipeline==run.pipeline || table_moves || table_takes) && gpu_draws[pending->d].key==info.key;
                 const bool same_view=pending && std::memcmp(&pending->viewport,&run.viewport,sizeof run.viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof run.scissor)==0;
                 const bool same_rate=pending && pending->first+pending->count==run.first && pending->rate.width==run.rate.width && pending->rate.height==run.rate.height && pending->fovea==run.fovea;
                 const bool plain_joins=pending && !no_merge && !frag_dump_ && same_pipeline && same_set && same_eye && same_push(pending->push,run.push) && same_view && same_rate &&
@@ -4260,7 +4299,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     static uint64_t reasons[8]{}; static auto since=std::chrono::steady_clock::now();
                     // the first test of the join that failed: textures only where the textures alone keep two runs apart (outside the table), the
                     // uniform block with UC_MERGE_FRAG_UNIFORM as that test; for two draws the ubershader could join, its tests
-                    const bool textures=!(pending->table && run.table) && !same_textures, uniform=!same_uniform(pending->set,run.set);
+                    const bool textures=!((pending->table || pending->table_pipeline) && (run.table || run.table_pipeline)) && !same_textures, uniform=!same_uniform(pending->set,run.set);
                     if (pending->merge && run.merge) ++reasons[!uber_state ? 0 : !same_eye ? 3 : !same_uber_push(pending->push,run.push) ? 4 : !same_view ? 5 : 6];
                     else ++reasons[!same_pipeline ? 0 : textures ? 1 : uniform ? 2 : !same_eye ? 3 : !same_push(pending->push,run.push) ? 4 : !same_view ? 5 : 6];
                     // what bindless textures alone would join: everything but the textures equal (pipeline, uniform block, eye block, push,
@@ -4274,16 +4313,18 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 }
                 if (joins) {
                     if (uber_joins) {
-                        if (!pending->uber) { pending->pipeline=pending->merge; pending->table=pending->uber=true; pending->push.palette=merge_map; }   // the run moves onto the ubershader
-                        ++uber_joins_;
+                        if (!pending->uber) { pending->pipeline=pending->merge; pending->table=pending->uber=true; pending->push.palette=merge_map; ++uber_stage_draws_[std::min<uint32_t>(gpu_draws[pending->d].key[1],3)]; }   // the run moves onto the ubershader
+                        ++uber_joins_; ++uber_stage_draws_[std::min<uint32_t>(info.key[1],3)];
                     } else {
+                        if (table_moves) { pending->pipeline=pending->table_pipeline; pending->table=true; }   // the run moves onto the texture table
                         if (pending->merge!=run.merge) pending->merge=VK_NULL_HANDLE;   // a draw that may not go on the ubershader: the run stays as it is
                         frag_uniform_joins_+=set_keys[run_last][16]!=set_keys[run.set][16];   // a block boundary only the fragment-only test removed (against the run's last draw)
                     }
                     run_last=d;
+                    if (pending->few!=run.few) pending->few=VK_NULL_HANDLE;   // a draw with more stages: the run takes the general ubershader
                     ++pending->draws; pending->pixels+=run.pixels;
                     pending->count+=run.count; pending->positions_end=run.positions_end; pending->attributes_end=run.attributes_end; ++merged_draws_;
-                    if (plain_joins && run.table && !same_textures) {   // joined only through the table
+                    if (plain_joins && pending->table && !same_textures) {   // joined only through the table
                         ++table_joins_;
                         static const bool log_joins=std::getenv("UC_TEX_MERGE_LOG")!=nullptr;   // diagnostics: each pair of callsites the table joins, once, with their maps
                         static std::set<std::pair<uint32_t,uint32_t>> logged;
@@ -4363,12 +4404,13 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         // The small-draw ubershader (UC_UBER_SMALL=1 or hud, uber_merge.h): consecutive small HUD draws of one fixed-function state, eye block,
         // viewport and scissor are one draw on the ubershader (their TEV setups, blocks and textures read per draw); a run left with one draw
         // is drawn as before.
-        struct LayerRun { size_t d; VkPipeline pipeline; bool uber; uint32_t first, count, draws; VkViewport viewport; VkRect2D scissor; DrawPush push; float pixels=0; };
+        struct LayerRun { size_t d; VkPipeline pipeline; bool uber; uint32_t first, count, draws; VkViewport viewport; VkRect2D scissor; DrawPush push; float pixels=0; VkPipeline few=VK_NULL_HANDLE; };
         std::optional<LayerRun> pending;
         const auto issue=[&](const LayerRun& run) {
             const auto& draw=packet.draws[run.d]; const auto& info=gpu_draws[run.d]; const auto& x=xform_draws[run.d];
             VkPipeline pipeline=run.pipeline; DrawPush push=run.push; bool uber=run.uber;
             if (uber && run.draws==1) { auto key=info.key; key[0]|=kHudLayerKeyBit; pipeline=pipeline_for(key).pipeline; push.palette=x.attributes; uber=false; }
+            else if (uber && run.few) pipeline=run.few;   // every draw of the run has few stages: the family's ubershader
             if (pipeline!=bound) { vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); bound=pipeline; ++pipeline_binds_; }
             if (!static_depth_ && int(cull_mode(info.key))!=bound_cull) { vkCmdSetCullMode(slot.command,cull_mode(info.key)); bound_cull=int(cull_mode(info.key)); }
             const uint32_t offsets[2]={draw_uniform_offset[run.d],uint32_t(run.d*stereo_stride_)};
@@ -4412,14 +4454,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             push.motion=0; push.viewport[0]=viewport.x; push.viewport[1]=viewport.y; push.viewport[2]=viewport.width; push.viewport[3]=viewport.height;
             LayerRun run{d,VK_NULL_HANDLE,false,x.first,info.index_count,1,viewport,scissor,push};
             if (uber_small_hud_ && table_ok && !frag_dump_ && uber_merge_stages_ok(info.key) && draw_pixels(d)<=uber_max_pixels_)
-                if (const VkPipeline merge=uber_merge_pipeline(key)) { run.pipeline=merge; run.uber=true; run.push.palette=merge_map; run.pixels=draw_pixels(d); }
+                if (const VkPipeline merge=uber_merge_pipeline(key)) { run.pipeline=merge; run.uber=true; run.push.palette=merge_map; run.pixels=draw_pixels(d); run.few=uber_merge_pipeline(key,true); }
             if (!run.uber) run.pipeline=pipeline_for(key).pipeline;
             const auto plain=[](DrawPush a) { a.projection={}; a.palette=a.current_row=a.indexed=a.alpha_pass=a.bank=0; return a; };
             const bool joins=pending && run.uber && pending->uber && !no_merge_hud && pending->pipeline==run.pipeline && same_uber_state(gpu_draws[pending->d].key,info.key) &&
                 std::memcmp(static_cast<std::byte*>(slot.motions.mapped)+pending->d*stereo_stride_,static_cast<std::byte*>(slot.motions.mapped)+d*stereo_stride_,kStereoBlockBytes)==0 &&
                 std::memcmp(&pending->viewport,&run.viewport,sizeof viewport)==0 && std::memcmp(&pending->scissor,&run.scissor,sizeof scissor)==0 &&
                 [&] { const DrawPush a=plain(pending->push), b=plain(run.push); return std::memcmp(&a,&b,sizeof a)==0; }() && pending->first+pending->count==run.first;
-            if (joins) { pending->count+=run.count; ++pending->draws; pending->pixels+=run.pixels; ++merged_draws_; }
+            if (joins) { pending->count+=run.count; ++pending->draws; pending->pixels+=run.pixels; ++merged_draws_; if (pending->few!=run.few) pending->few=VK_NULL_HANDLE; }
             else { if (pending) issue(*pending); pending=run; }
         }
         if (pending) issue(*pending);
@@ -4995,7 +5037,7 @@ void VulkanRenderer::shutdown() {
         stop_workers();
         for (auto [key,pipeline]:pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
         for (auto [key,pipeline]:uber_pipelines_) vkDestroyPipeline(device,pipeline,nullptr);
-        pipelines_.clear(); uber_pipelines_.clear(); last_pipeline_=VK_NULL_HANDLE; last_table_pipeline_=VK_NULL_HANDLE; last_merge_pipeline_=VK_NULL_HANDLE;
+        pipelines_.clear(); uber_pipelines_.clear(); last_pipeline_=VK_NULL_HANDLE; last_table_pipeline_=VK_NULL_HANDLE; last_merge_pipeline_[0]=last_merge_pipeline_[1]=VK_NULL_HANDLE;
         if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device,pipeline_cache_,nullptr); pipeline_cache_=VK_NULL_HANDLE; }
         if (shadow_pipeline_) vkDestroyPipeline(device,shadow_pipeline_,nullptr);
         shadow_pipeline_=VK_NULL_HANDLE; shadow_map_.shutdown();
@@ -5003,8 +5045,8 @@ void VulkanRenderer::shutdown() {
         xform_vertex_module_=xform_compute_module_=VK_NULL_HANDLE;
         for (auto module:{table_vertex_module_,table_fragment_module_,table_early_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
         table_vertex_module_=table_fragment_module_=table_early_module_=VK_NULL_HANDLE;
-        for (auto module:{merge_vertex_module_,merge_fragment_module_,merge_early_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
-        merge_vertex_module_=merge_fragment_module_=merge_early_module_=VK_NULL_HANDLE;
+        for (auto module:{merge_vertex_module_,merge_fragment_module_,merge_early_module_,few_vertex_module_,few_fragment_module_,few_early_module_}) if (module) vkDestroyShaderModule(device,module,nullptr);
+        merge_vertex_module_=merge_fragment_module_=merge_early_module_=few_vertex_module_=few_fragment_module_=few_early_module_=VK_NULL_HANDLE;
         if (merge_layout_) vkDestroyPipelineLayout(device,merge_layout_,nullptr);
         if (merge_set_layout_) vkDestroyDescriptorSetLayout(device,merge_set_layout_,nullptr);
         merge_layout_=VK_NULL_HANDLE; merge_set_layout_=VK_NULL_HANDLE;

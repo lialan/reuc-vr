@@ -134,6 +134,11 @@ TEV_CONST(65, konst15);
 #ifdef UC_SPEC
 // DirectX specialization (-DUBER -DUC_SPEC): the HLSL keeps UC_TEV(i); the renderer compiles it with a constant table of the draw's TEV words in front.
 uint tevWord(uint i) { __intrinsic_asm "UC_TEV($0)"; }
+#elif defined(UBER) && defined(UBER_MERGE) && defined(UBER_STAGES)
+// The family of draws with at most UBER_STAGES stages: the TEV words as flat inputs from the vertex stage (smoke.slang mergeWords) instead of
+// loads from the draw's block in every fragment: [0] = stage count, swap tables, key word 67 (destination alpha), [1 + s] = stage s's words.
+static uint4 mergeWords[1 + UBER_STAGES];
+uint tevWord(uint i) { return i == 0 ? mergeWords[0].x : i == 1 ? mergeWords[0].y : i == 66 ? mergeWords[0].z : mergeWords[1 + (i - 2) / 4][(i - 2) % 4]; }
 #elif defined(UBER)
 uint tevWord(uint i) { return drawState.tevWords[i / 4][i % 4]; }
 #endif
@@ -200,6 +205,22 @@ float3 colorSource(uint selector, float4 r[4], float4 tex, float4 ras, float3 k)
     case 14: return k;
     }
     return float3(0.0);
+}
+// The small-draw ubershader's inputs, colorSource and alphaSource as select trees. Colour selectors: bit 3 picks the second group, bits 2..1
+// the vector in it, bit 0 its alpha broadcast: 0..7 registers 0..3 (rgb, aaa), 8/9 texture, 10/11 raster, 12 one (rgb of (1, 1, 1, 0.5)),
+// 13 half (its aaa), 14 konst (rgb of (konst, 0)), 15 zero (its aaa). Alpha selectors 0..7: registers 0..3, texture, raster, konst, zero.
+float3 uberColorSource(uint selector, float4 r[4], float4 tex, float4 ras, float4 konst4) {
+    const bool b1 = (selector & 2u) != 0, b2 = (selector & 4u) != 0;
+    const float4 low = b2 ? (b1 ? r[3] : r[2]) : (b1 ? r[1] : r[0]);
+    const float4 high = b2 ? (b1 ? konst4 : float4(1.0, 1.0, 1.0, 0.5)) : (b1 ? ras : tex);
+    const float4 v = (selector & 8u) != 0 ? high : low;
+    return (selector & 1u) != 0 ? v.aaa : v.rgb;
+}
+float uberAlphaSource(uint selector, float4 r[4], float4 tex, float4 ras, float k) {
+    const bool b0 = (selector & 1u) != 0, b1 = (selector & 2u) != 0;
+    const float low = b1 ? (b0 ? r[3].a : r[2].a) : (b0 ? r[1].a : r[0].a);
+    const float high = b1 ? (b0 ? 0.0 : k) : (b0 ? ras.a : tex.a);
+    return (selector & 4u) != 0 ? high : low;
 }
 float alphaSource(uint selector, float4 r[4], float4 tex, float4 ras, float k) {
     switch (selector) {
@@ -358,7 +379,11 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
     uint command = (order & 0x10000u) != 0 ? 0u : drawState.indCmd[stageIndex / 4][stageIndex % 4];
 #endif
     if ((order & 64) != 0) {
+#if defined(UBER_MERGE) && defined(UBER) && defined(UBER_STAGES)
+        float2 coord = uvOf(uv[stageIndex]);   // the family's vertex stage passes each stage's own coordinate (smoke.slang)
+#else
         float2 coord = uvOf(uv[(order >> 3) & 7]);
+#endif
         if (command != 0) coord = indirectCoord(order & 7, coord, uv, command, previousCoord);
         tex = sampleImage(order & 7, coord);
     }
@@ -369,13 +394,15 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
     float3 kc = konstColor(konst & 31);
     float ka = konstAlpha((konst >> 5) & 31);
 #if defined(UBER_MERGE) && defined(UBER)
-    // the small-draw ubershader: the inputs as arrays indexed by the selectors (one indexed read each instead of a chain of selects)
-    const float alphaInputs[8] = { r[0].a, r[1].a, r[2].a, r[3].a, tex.a, ras.a, ka, 0.0 };
-    float3 a = colorSource((ce >> 12) & 15, r, tex, ras, kc);
-    float3 b = colorSource((ce >> 8) & 15, r, tex, ras, kc);
-    float3 c = colorSource((ce >> 4) & 15, r, tex, ras, kc);
-    float3 d = colorSource(ce & 15, r, tex, ras, kc);
-    float aa = alphaInputs[(ae >> 13) & 7], ab = alphaInputs[(ae >> 10) & 7], ac = alphaInputs[(ae >> 7) & 7], ad = alphaInputs[(ae >> 4) & 7];
+    // the small-draw ubershader: the inputs by a tree of selects on the selector's bits (uberColorSource), not a switch (which the compilers
+    // turn into a compare and a select per case: ~5 instructions a case, 60 cases a stage)
+    const float4 konst4 = float4(kc, 0.0);
+    float3 a = uberColorSource((ce >> 12) & 15, r, tex, ras, konst4);
+    float3 b = uberColorSource((ce >> 8) & 15, r, tex, ras, konst4);
+    float3 c = uberColorSource((ce >> 4) & 15, r, tex, ras, konst4);
+    float3 d = uberColorSource(ce & 15, r, tex, ras, konst4);
+    float aa = uberAlphaSource((ae >> 13) & 7, r, tex, ras, ka), ab = uberAlphaSource((ae >> 10) & 7, r, tex, ras, ka);
+    float ac = uberAlphaSource((ae >> 7) & 7, r, tex, ras, ka), ad = uberAlphaSource((ae >> 4) & 7, r, tex, ras, ka);
 #else
     float3 a = colorSource((ce >> 12) & 15, r, tex, ras, kc);
     float3 b = colorSource((ce >> 8) & 15, r, tex, ras, kc);
@@ -401,7 +428,11 @@ float4 evaluateTev(float3 uv[8], float4 color, float4 color1) {
     [unroll] for (uint i = 0; i < 4; ++i) r[i] = drawState.registers[i];
     int2 previousCoord = int2(0);
     float4 result = r[0];
+#ifdef UBER_STAGES
+    [unroll] for (uint stage = 0; stage < UBER_STAGES; ++stage) if (stage < stageCount) {
+#else
     [loop] for (uint stage = 0; stage < min(stageCount, 16u); ++stage) {
+#endif
         const uint ce = tevWord(2 + 4 * stage), ae = tevWord(3 + 4 * stage);
         tevStage(r, uv, color, color1, ce, ae, tevWord(4 + 4 * stage), tevWord(5 + 4 * stage), stage, previousCoord);
         result = float4(r[(ce >> 22) & 3].rgb, r[(ae >> 22) & 3].a);

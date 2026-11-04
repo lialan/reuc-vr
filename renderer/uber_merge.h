@@ -26,12 +26,20 @@ namespace uc {
 constexpr uint32_t kUberMergeKeyBit=1u<<21;
 constexpr uint32_t kBankKeyBit=1u<<17;   // per-vertex texture matrices: only the pre-pass reads them, so not part of a merge pipeline
 constexpr float kUberSmallPixels=1024.f;   // guest pixels (640x480 space): a 32x32 quad (S18 section 7: the ALU estimate and the sweep)
+// The ubershader's family of draws with at most this many stages (key word 1 of its pipeline key; 0: the general module, a loop over up
+// to 16 stages): the stages unrolled, the coordinates and TEV words chosen per vertex and passed flat. ir3 (Adreno 740): 24 instead of 32
+// vec4 registers (8 waves instead of 6). In the fight ~80% of the ubershader's draws have one or two stages. Runs join on the general
+// pipeline (so draws of any stage count still join); a run whose draws all have few stages is drawn with the family's.
+constexpr uint32_t kUberFewStages=2;
 
 // The pipeline key of a draw on the small-draw ubershader: the TEV words and the destination-alpha flag go (read per draw), the bank bit goes,
-// the texture-table and merge bits come; the blend, cull and alpha-test bits, the HUD layer bit, the depth word and the topology stay.
-inline PipelineKey uber_merge_key(PipelineKey key) {
+// the texture-table and merge bits come; the blend, cull and alpha-test bits, the HUD layer bit, the depth word and the topology stay; key
+// word 1 names the family (kUberFewStages for few=true and a draw with that many stages or fewer, else 0).
+inline PipelineKey uber_merge_key(PipelineKey key, bool few=false) {
+    few=few && key[1]<=kUberFewStages;
     key=uber_key(key);
     key[0]=(key[0]&~kBankKeyBit)|kTexTableKeyBit|kUberMergeKeyBit;
+    key[1]=few ? kUberFewStages : 0;
     return key;
 }
 // Whether a draw's TEV setup can go on the small-draw ubershader: every stage direct (the headset's keys mark them, kTevDirectStage). The
