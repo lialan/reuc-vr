@@ -546,3 +546,25 @@ on late Z (section 7).
 
 **Recommended defaults (the first two now in the code, headset only):** lazy texture table + small-draw ubershader at 1024 guest pixels
 with its families; no table size gate; `UC_MERGE_FRAG_UNIFORM=1` as the next candidate (-0.3 ms) once a native pair confirms it.
+
+## 9. Where the headset stands (2026-11-04, quest3-vr a1cc7d4)
+
+What is adopted from Dolphin and on by default on the headset: the copy's clear folded into the next EFB pass (`VKGfx::ClearRegion`),
+24-bit EFB depth (Dolphin's Adreno choice; captures show no z-fighting), the texture table with the ubershader for small draws (Dolphin
+batches by state; here the table only where a run joins different textures, section 8), EFB copies kept on the GPU (Dolphin's "store EFB
+copies to texture only"; the game reads nothing back in the fight: no EFB peeks, no copies to RAM). Ruled out from the fight's own GX state:
+the alpha-test pre-check, zcomploc, the RGB8 EFB format, dual-source blending (section "Done: depth and EFB").
+
+Headset defaults besides those: foveation high (vr.cfg version 6), render scale 1.0 into 1548x1656 eye images (version 7), the game's view
+widened 1.8 x 2.7 for culling (the top and bottom of the eyes no longer pop).
+
+GPU ms per presented frame, fightvr replay, 545 MHz (the runtime keeps that clock; UC_GPU_LEVEL=boost changes nothing):
+
+| | start of the session | now |
+|---|---|---|
+| native scene, native eyes, foveation off | 41.3 | 31.2 (with foveation high 24.2-24.4) |
+| render scale 1.0, foveation high | 12.6 (native eyes) | 10.7 (9.2 with 1656-row eyes before the table) |
+
+Live train fight (harness frame-rate summary): render scale 1.0 58.8 fps mean (p50 60, p5 40), 1.25 56.1, 1.5 54. Above 1.0 the GPU is
+75-80% busy yet frames miss their 120 Hz slot and land on 40 fps: pacing, not GPU load. Next (`/tmp/qgs/plan_pace.sh`): UC_XR_TIMING at 1.25,
+display refresh 90 and 72 against 120, and the fragment-uniform merge key (rec 4) at native.
