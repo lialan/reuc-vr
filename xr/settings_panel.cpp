@@ -4,6 +4,7 @@
 #include "cabinet_buttons.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 namespace uc::xr {
 SettingsPanel::SettingsPanel(int width,int height,const char *title,bool fake):width_(width),height_(height),fake_(fake),
     title_(std::string(title?title:"Lindbergh")+" - settings"),panel_pixels_(XM_W*XM_H*4),label_pixels_(XM_STATS_W*XM_STATS_H*4) {}
@@ -17,6 +18,16 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
     const bool dual=cfg.dual;
     const int main=input.select_hand(sample.buttons.trigger,cfg.dual),off=1-main;
     int hand=main;
+    // Explicit diagnostic control: consume one panel row through the same path
+    // as a trigger pull. Removing the file prevents reset loops after relaunch.
+    static const char* action_file=std::getenv("UC_XR_TEST_PANEL_FILE");
+    if(action_file) if(FILE* command=std::fopen(action_file,"r")) {
+        int row=-1;const bool read=std::fscanf(command,"%d",&row)==1;std::fclose(command);
+        if(std::remove(action_file)==0 && read) {
+            effects|=xp_choose(&panel_,&cfg,&hand,row,rates.data(),int(rates.size()));
+            std::fprintf(stderr,"[xr-panel-test] row %d effects %u scale %.3g foveation %d\n",row,effects,cfg.render_scale,cfg.foveation);
+        }
+    }
     float head[3];for(int i=0;i<3;++i)head[i]=.5f*(scene.overlay_eyes()[0][i]+scene.overlay_eyes()[1][i]);
     bool toggled=xp_menu_button(&panel_,sample.menu,previous_menu_);
     const bool held_toggle=xp_hold_button(&panel_,sample.buttons.upper[off],previous_upper_[off],cfg.dual,time,&held_);

@@ -3,6 +3,7 @@
 #include "xr_shot.h"
 #include "native_input.h"
 #include "controller_input.hpp"
+#include "../renderer/aim_geometry.h"
 #include <cmath>
 #include <limits>
 
@@ -72,6 +73,42 @@ static void overlay_and_projectile_use_identical_rays() {
         near(ray.direction,delta);
     }
 }
+static void shots_leave_the_rendered_barrel_even_at_close_range() {
+    uc::xr::StereoSettings settings;settings.scale=10;
+    uc::xr::StereoScene scene(settings);
+    std::array<uc::xr::StereoPose,2> eyes;scene.publish(eyes);
+    // Model metadata, checked independently through the same transform used to
+    // draw the gun. Include recoil, translated hands and an off-axis barrel.
+    for(int model:{XO_GUN_SMG,XO_GUN_TP9,XO_GUN_GHOST_SQUAD}) {
+        const float z=model==XO_GUN_TP9?-.2060f:model==XO_GUN_GHOST_SQUAD?-.3102f:-.2605f;
+        uc::xr::ControllerSettings controls;controls.gun_model=model;
+        uc::xr::ControllerInput input(controls);
+        for(float yaw:{0.f,.15f}) for(float x:{-.02f,.02f}) for(float reach:{.02f,.05f,1.f,15.f}) {
+            uc::xr::ControllerSample sample;sample.valid[1]=1;
+            sample.pose[1].position={x,0,-.15f};sample.pose[1].orientation={0,std::sin(yaw/2),0,std::cos(yaw/2)};
+            sample.buttons.trigger[1]=1;
+            sample.aim_depth[1]=.15f+(reach-z)*std::cos(yaw);
+            input.update(scene,sample,1000000000,true);
+            uc::xr::ControllerSnapshot snapshot;CHECK(input.consume(snapshot));CHECK(snapshot.valid[0]);
+            const auto& overlay=input.overlay_frames()[0];const auto& ray=snapshot.shot[0];
+            float matrix[16];xo_pose_matrix(overlay.gun_q,overlay.gun_p,matrix);
+            V expected{},forward{};
+            for(unsigned i=0;i<3;++i){expected[i]=(matrix[12+i]+matrix[8+i]*(z+overlay.recoil))*10;forward[i]=-matrix[8+i];}
+            near(ray.origin,expected);near(ray.direction,forward);
+            for(unsigned i=0;i<3;++i) CHECK(std::abs(overlay.end[i]-(sample.pose[1].position[i]+forward[i]*(reach-z)))<2e-5f);
+        }
+    }
+    // A wall between the grip and barrel must not make the forward ray reverse.
+    uc::xr::StereoPose hand;hand.position={0,0,-.15f};
+    const auto muzzle=uc::xr::gun_muzzle_pose(hand,XO_GUN_TP9);
+    uc::AimGeometry trace;trace.set_ray(1,muzzle,10);
+    const auto wall=[](float z) {
+        gx::DrawPacket d;d.primitive=0x90;d.vertices.resize(3);d.indices={0,1,2};
+        d.vertices[0].position={-1,-1,z};d.vertices[1].position={1,-1,z};d.vertices[2].position={0,1,z};return d;
+    };
+    trace.draw(wall(-3));CHECK(trace.depth(1,10)==0);
+    trace.draw(wall(-3.76f));CHECK(std::abs(trace.depth(1,10)-.376f)<1e-5f);
+}
 static void hook_uses_the_consumed_controller_ray_only_for_player_shots() {
     Fix f;auto& c=f.c;uc::NativeInput input;input.focus(true);uc::input_hle_init(&input);
     input.host_xr_pointer(0,0,uc::TrackedRay{{2,-1,-4},{0,0,-1}});input.consume();
@@ -88,4 +125,5 @@ static void hook_uses_the_consumed_controller_ray_only_for_player_shots() {
 int main() {
     hook_uses_the_consumed_controller_ray_only_for_player_shots();
     collision_and_trail_start_at_the_laser();spread_and_invalid_input();overlay_and_projectile_use_identical_rays();
+    shots_leave_the_rendered_barrel_even_at_close_range();
 }

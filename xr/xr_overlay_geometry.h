@@ -4,6 +4,7 @@
 extern "C" {
 #endif
 unsigned xo_gun_capacity(void); /* vertices, each position/normal/RGB: 9 floats */
+float xo_gun_muzzle_z(int model); /* barrel centre, in the same local metres as the mesh */
 int xo_gun_build(int model,int sight,float *mesh,unsigned capacity,float *rail_y);
 int xo_gun_glass(int sight,float glass[4]);
 void xo_pose_matrix(const float quaternion[4],const float position[3],float matrix[16]);

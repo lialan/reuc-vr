@@ -3,8 +3,17 @@
 #include "stereo_scene.hpp"
 #include "xr_controls.h"
 #include "xr_overlay.h"
+#include "xr_overlay_geometry.h"
 #include <mutex>
 namespace uc::xr {
+// Use the mesh's barrel centre for geometry tracing, the laser and the shot.
+// Recoil translates the rendered mesh along local +Z, keeping the barrel ray collinear.
+inline StereoPose gun_muzzle_pose(StereoPose pose,int model,float recoil=0) {
+    const float tip[]={0,0,xo_gun_muzzle_z(model)+recoil};float offset[3];
+    lg_stereo_rotate(pose.orientation.data(),tip,offset);
+    for(unsigned i=0;i<3;++i)pose.position[i]+=offset[i];
+    return pose;
+}
 struct ControllerSettings {
     int width=640,height=480;bool dual=false,auto_coins=true,left_handed=false,aim_on_hud=false;
     float aim_distance=15;

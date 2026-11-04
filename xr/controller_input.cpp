@@ -29,7 +29,7 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
             const int hand=pl?1-main:main;
             if(sample.valid[hand]) {
                 const float depth=sample.aim_depth[hand]>0 ? sample.aim_depth[hand] : settings_.aim_distance;
-                frame.aimed[pl]=scene.aim(sample.pose[hand],settings_.width,settings_.height,settings_.aim_on_hud,depth,next.ray[pl]);
+                frame.aimed[pl]=scene.aim(gun_muzzle_pose(sample.pose[hand],settings_.gun_model),settings_.width,settings_.height,settings_.aim_on_hud,depth,next.ray[pl]);
                 next.valid[pl]=1;
                 for(float v:next.ray[pl].origin)if(!std::isfinite(v))next.valid[pl]=0;
                 for(float v:next.ray[pl].direction)if(!std::isfinite(v))next.valid[pl]=0;
@@ -44,14 +44,14 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
                 std::copy(sample.pose[hand].orientation.begin(),sample.pose[hand].orientation.end(),f.gun_q);
                 std::copy(sample.pose[hand].position.begin(),sample.pose[hand].position.end(),f.gun_p);
                 f.recoil=firing?.018f*(1-phase)*(1-phase):0;f.flash=firing&&phase<.35f;
-                const float tip[]={0,-.006f,-.26f};float muzzle[3];
-                lg_stereo_rotate(f.gun_q,tip,muzzle);
+                const auto barrel=gun_muzzle_pose(sample.pose[hand],settings_.gun_model);
+                const auto muzzle=gun_muzzle_pose(sample.pose[hand],settings_.gun_model,f.recoil);
                 float reach=5;
                 if(frame.aimed[pl]) {
                     StereoRay world;
-                    reach=settings_.aim_on_hud&&scene.aim(sample.pose[hand],settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
+                    reach=settings_.aim_on_hud&&scene.aim(barrel,settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
                 }
-                for(int i=0;i<3;++i){f.muzzle[i]=f.gun_p[i]+muzzle[i];f.end[i]=f.gun_p[i]+next.ray[pl].direction[i]*reach;}
+                for(int i=0;i<3;++i){f.muzzle[i]=muzzle.position[i];f.end[i]=barrel.position[i]+next.ray[pl].direction[i]*reach;}
                 float length=0;
                 for(int i=0;i<3;++i) {
                     next.shot[pl].origin[i]=f.muzzle[i]*scene.settings().scale;

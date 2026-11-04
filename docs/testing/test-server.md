@@ -101,6 +101,8 @@ Harness scenarios and deterministic replays default to a 1280x720 window, overri
 
 The demo benchmark currently needs Python 3.12 or newer; on this machine use `py -3.13 -m uctest bench ...` because the bare `python` command selects 3.10.
 
+Quest VR panel diagnostics use `UC_XR_TEST_PANEL_FILE=panel-command` in the private harness environment. Atomically place one numeric `XP_*` row ID from `xr/xr_panel.h` in that file; the panel consumes and removes it through `xp_choose`, including normal persistence and renderer effects. Row 11 cycles render scale, row 12 cycles foveation, and row 14 must be sent twice to confirm Reset game. Run `scripts/quest/run.py --restart-grace 12` under `quest3-lock` for a reset test: it records each process ID and allows the relaunch gap. Reset preserves the private game/save launch extras. Remove the diagnostic environment and command file on completion.
+
 ## Known gaps
 
 - Hover item and button rectangles of menu pages are not read from RAM (only the scenario page showed a hover word at `804B96BC`). Targets are measured aim coordinates (`screen x = 640 + 800·aimX`, `y = 360 + 600·aimY` at 1280x720).

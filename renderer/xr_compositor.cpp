@@ -500,7 +500,7 @@ void XrCompositor::controller_frame(bool tracked) {
     controller_sample_=sample; input_focused_=focused; input_finished_=false; aim_world_=false;
     aim_geometry_.reset();
     if (focused && (controller_aim_enabled_ || test_aim)) for (unsigned h=0;h<2;++h) if (sample.valid[h])
-        aim_geometry_.set_ray(h,sample.pose[h],scene_.settings().scale);
+        aim_geometry_.set_ray(h,xr::gun_muzzle_pose(sample.pose[h],controls_.settings().gun_model),scene_.settings().scale);
     if (!focused) finish_input();
 }
 

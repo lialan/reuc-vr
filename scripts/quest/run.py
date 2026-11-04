@@ -28,6 +28,7 @@ def main():
     p.add_argument("--file", action="append", default=[], help="LOCAL=NAME: copy a file into the private folder (e.g. a demo)")
     p.add_argument("--saves", default=None, help="a saves directory to copy into the run's saves/ (replacing it) before the start")
     p.add_argument("--no-install", action="store_true")
+    p.add_argument("--restart-grace", type=float, default=0, help="allow this many seconds without a PID while testing Reset game")
     p.add_argument("--guardian-pause", action="store_true", help="pause Guardian for scripted runs (restored after)")
     args = p.parse_args()
     out = pathlib.Path(args.out or ROOT / "build-android/quest-runs" / time.strftime("%Y%m%d-%H%M%S"))
@@ -105,7 +106,7 @@ def main():
         launched = True
         save("launch.txt", shell("am", "start", "-n", f"{PACKAGE}/{ACTIVITY}", "--ez", "uc.require_private_game", "true",
                                  "--es", "uc.private_game", private))
-        start = time.monotonic(); pid = ""
+        start = time.monotonic(); pid = ""; missing_since = None
         stop = out / "STOP"
         if args.interactive:
             print("interactive session running; create", stop, "to end it", flush=True)
@@ -113,11 +114,17 @@ def main():
             if args.interactive and stop.exists():
                 break
             current = shell("pidof", PACKAGE, check=False).stdout.decode().strip()
-            if current and not pid:
-                pid = current.split()[0]; report["pid"] = pid
+            if current:
+                missing_since = None
+                current = current.split()[0]
+                if current != pid:
+                    pid = current; report["pid"] = pid
+                    report.setdefault("processes", []).append({"pid": pid, "seconds": round(time.monotonic()-start, 1)})
             if pid and not current:
-                report["early_process_exit"] = True
-                break
+                if missing_since is None: missing_since = time.monotonic()
+                if time.monotonic()-missing_since >= args.restart_grace:
+                    report["early_process_exit"] = True
+                    break
             time.sleep(1)
         report["seconds"] = round(time.monotonic() - start, 1)
         with (out / "screen.png").open("wb") as picture:

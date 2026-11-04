@@ -11,8 +11,20 @@
 #include <jni.h>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <functional>
 
 namespace uc {
+namespace {
+std::atomic<bool> restart_requested{false};
+std::function<void()> restart_activity;
+}
+bool complete_android_xr_restart() {
+    if (!restart_requested.load() || !restart_activity) return false;
+    std::fprintf(stderr,"[android] reset: native shutdown complete; relaunching\n");
+    restart_activity();
+    return true;
+}
 std::unique_ptr<XrCompositor> make_android_xr() {
     if (const char* v = std::getenv("UC_XR"); v && *v == '0') return nullptr;
     LgXrSettings settings = LG_XR_SETTINGS_DEFAULT;
@@ -40,12 +52,21 @@ std::unique_ptr<XrCompositor> make_android_xr() {
     jobject held = env->NewGlobalRef(activity);   // OpenXR keeps it for the process: never released
     env->DeleteLocalRef(activity);
     config.settings = settings;
-    config.restart = [vm, held] {   // the panel's "Reset game": UmbrellaChroniclesVR.restartGame() (HOTD4's Restart flow)
+    restart_activity = [vm, held] {
         JNIEnv* thread_env = nullptr;
         if (vm->AttachCurrentThread(&thread_env, nullptr) != JNI_OK || !thread_env) return;
         jclass cls = thread_env->GetObjectClass(held);
         if (jmethodID restart = thread_env->GetMethodID(cls, "restartGame", "()V")) thread_env->CallVoidMethod(held, restart);
+        if (thread_env->ExceptionCheck()) { thread_env->ExceptionDescribe(); thread_env->ExceptionClear(); }
         thread_env->DeleteLocalRef(cls);
+    };
+    config.restart = [] {
+        if (restart_requested.exchange(true)) return;
+        // Exit through the main loop so guest/file workers, audio, Vulkan and
+        // OpenXR finish before Android starts a fresh process.
+        SDL_Event quit{}; quit.type=SDL_EVENT_QUIT;
+        if (!SDL_PushEvent(&quit)) restart_requested=false;
+        else std::fprintf(stderr,"[android] reset: orderly shutdown requested\n");
     };
     std::fprintf(stderr, "[xr] vr.cfg: eye %dx%d, %d Hz, foveation %d, screen %.2f m, scale %.2f, aim %.1f m\n", settings.width, settings.resolution,
                  settings.refresh, settings.foveation, settings.screen, settings.scale, settings.aim);

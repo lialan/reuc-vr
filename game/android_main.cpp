@@ -24,6 +24,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "xr_android.h"
 
 int uc_game_main(int argc, char** argv);   // uc_main.cpp's main, renamed for Android
 
@@ -177,6 +178,9 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** 
     pthread_t thread;
     if (pthread_create(&thread, &attributes, run_game, &run) != 0) { std::fprintf(stderr, "[android] cannot start the game thread\n"); return 1; }
     pthread_join(thread, nullptr);
+#ifdef UC_OPENXR
+    if (uc::complete_android_xr_restart()) return run.rc;
+#endif
     std::fprintf(stderr, "[android] game exited %d\n", run.rc);
     return run.rc;
 }

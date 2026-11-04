@@ -26,6 +26,7 @@ import org.libsdl.app.SDLActivity;
 public class UmbrellaChroniclesVR extends SDLActivity {
     private static final String TAG = "UmbrellaChroniclesVR";
     private String problem;     /* null: the game is ready */
+    private boolean restarting;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -111,12 +112,19 @@ public class UmbrellaChroniclesVR extends SDLActivity {
 
     /* Called from the game: the settings panel's "Reset game". Restart starts it again once this process is gone. */
     public void restartGame() {
-        Log.i(TAG, "reset: starting the game again");
-        Intent again = new Intent(this, Restart.class);
-        again.putExtra(Restart.PID, android.os.Process.myPid());
-        again.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        startActivity(again);
-        android.os.Process.killProcess(android.os.Process.myPid());
+        runOnUiThread(() -> {
+            if (restarting) return;
+            restarting = true;
+            Log.i(TAG, "reset: starting the game again after native shutdown");
+            Intent again = new Intent(this, Restart.class);
+            again.putExtra(Restart.PID, android.os.Process.myPid());
+            // Preserve the private game/save tree during diagnostic resets.
+            again.putExtra(Restart.LAUNCH, new Intent(getIntent()));
+            again.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(again);
+            finish();
+            System.exit(0);
+        });
     }
 
     private void askForFileAccess() {

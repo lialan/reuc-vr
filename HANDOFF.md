@@ -1,3 +1,61 @@
+# Latest: mesh muzzle alignment, clean reset, expanded scales verified
+
+Updated 2026-11-04 21:29 UTC. The owner accepted audio and requested a commit.
+The accepted baseline is committed as `78e6c57`; this follow-up keeps that audio
+path. No push was requested or performed.
+
+- Laser and projectile now originate at the gun mesh's barrel centre, including
+  the rendered recoil translation. The TP9 muzzle is local Z -0.206 m; the old
+  hard-coded -0.260 m / Y -0.006 m put the ray ahead of and below its barrel.
+  Scene intersection also begins at the barrel, so geometry between the grip
+  and muzzle cannot turn a close-range shot backwards. Zero-spread shots follow
+  the laser; the game's original pellet spread remains intact.
+- Reset requests the ordinary SDL quit path, waits for guest/file/audio/Vulkan/
+  OpenXR teardown, then relaunches from the Android UI thread and exits with
+  status 0. It preserves the launch intent, including isolated diagnostic saves.
+  The helper no longer kills itself. The harness records changing PIDs and has
+  an explicit restart grace period so it does not stop a legitimate relaunch.
+- Added 2.75x, 2.5x and 2.25x to the live render-scale cycle.
+- Foveation was already active in the custom Vulkan renderer. Live panel changes
+  through High/Off/Low/Medium/High were verified on Quest at native 2064x2208 per
+  eye. Matched Off/High captures at retrace 9060 have a byte-identical 240x240
+  optical-centre RGB crop and different peripheral shading (400x400 corner crop
+  PSNR 30.246594 dB). No foveation algorithm change or FPS improvement is claimed.
+  Android's default remains Medium; the owner's saved High setting is preserved.
+
+Validation:
+- Ten focused CTests passed: xr_shot, input, aim_geometry, fovea_map,
+  stereo_projection, late_aim, audio_startup, audio_startup_restore, game_input,
+  hle_restore. The added aim cases cover all mesh models, translated/rotated
+  hands, recoil, 2 cm / 5 cm targets, and a wall behind the barrel.
+- Quest gameplay reset changed PID 24874 -> 25542. Log order is orderly shutdown,
+  all workers joined, native shutdown complete, System.exit(0), new private game
+  launch. Android exit-info records EXIT_SELF status 0, not a signal/crash.
+  The new process then reached gameplay and finished the replay normally.
+- The same new process applied every scale through the actual panel callback,
+  including 2.75x/2.5x/2.25x, returned to native, and exercised all foveation levels.
+- Close-range aiming feel with hand movement still needs owner headset feedback;
+  the tests establish ray/model/collision alignment, not subjective acceptance.
+
+Evidence: `/Users/lialan/workspace/reuc-vr-glitch/aim-reset-foveation/`.
+`validation.json`, `native-off/`, `native-panel-reset/`,
+`native-foveation-comparison.json` and `installed-final.json` hold the results.
+The final APK is preserved as `muzzle-reset-scales.apk`, SHA256
+`ca48788239e7ec0185f54d7e73901122004987a0a6db3fa73a2d963d6b568d22`.
+Installed APK was read back and matches exactly. The accepted baseline APK
+`b3fc5cc723e834733abcc024938e67b1cb9129aac4dc91af681e97a65f5a5724`
+is retained as `accepted-baseline.apk`.
+
+Quest released to owner: no test process/automation running; private env/args,
+demo/pose files and panel command removed; Guardian/proximity automation restored.
+Normal launch PID 26511 uses the owner's saved native-sized eyes, 2x render scale,
+High foveation, crosshair on, and HUD pitch -30. Shared env.txt/args.txt are absent.
+AAudio opened normally. PLAY_AUDIO is ignored while off-body, as in the earlier
+lifecycle diagnosis; do not undo Horizon's presence policy or reopen audio work
+without new owner evidence. Audio was explicitly accepted by the owner.
+
+---
+
 # Accepted baseline: audio good, tracked muzzle aiming mostly correct
 
 2026-11-04 owner feedback: **"audio is good now. commit"**. Aiming is mostly

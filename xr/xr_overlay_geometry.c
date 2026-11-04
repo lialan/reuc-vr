@@ -53,6 +53,7 @@ static void add_boxes(float *mesh,float rail_y,int *n,const Box *bx,int count)
 }
 
 unsigned xo_gun_capacity(void) {return MAX_VERTS+8*36;}
+float xo_gun_muzzle_z(int model) {return model==XO_GUN_TP9?TP9_MUZZLE_Z:model==XO_GUN_GHOST_SQUAD?GS_MUZZLE_Z:GUN_MUZZLE_Z;}
 int xo_gun_glass(int sight,float glass[4])
 {
     if(sight<XO_SIGHT_NONE||sight>XO_SIGHT_HOLO)return 0;

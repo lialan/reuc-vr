@@ -6,11 +6,11 @@ package org.uc.umbrellachronicles;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
-import android.os.Process;
 import java.io.File;
 
 public class Restart extends Activity {
     static final String PID = "pid";
+    static final String LAUNCH = "launch";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -19,10 +19,11 @@ public class Restart extends Activity {
         for (int i = 0; i < 50 && pid > 0 && new File("/proc/" + pid).exists(); i++) {
             try { Thread.sleep(100); } catch (InterruptedException e) { break; }
         }
-        Intent game = new Intent(this, UmbrellaChroniclesVR.class);
+        Intent game = getIntent().getParcelableExtra(LAUNCH);
+        if (game == null) game = new Intent(this, UmbrellaChroniclesVR.class);
+        game.setClass(this, UmbrellaChroniclesVR.class);
         game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
         startActivity(game);
         finish();
-        Process.killProcess(Process.myPid());
     }
 }

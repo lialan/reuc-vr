@@ -12,8 +12,8 @@ typedef struct {
     float render_scale;         /* Umbrella Chronicles: the eyes' scene scale (720p multiplier), 0 = native (the eye image's rows); applied live */
 } LgXrSettings;
 /* The settings panel's render scales after native, largest first */
-#define LG_XR_RENDER_SCALES {2.0f,1.5f,1.25f,1.0f}
-#define LG_XR_RENDER_SCALE_COUNT 4
+#define LG_XR_RENDER_SCALES {2.75f,2.5f,2.25f,2.0f,1.5f,1.25f,1.0f}
+#define LG_XR_RENDER_SCALE_COUNT 7
 /* Each eye's image by default: the headset's own panel, pixel for pixel.
  * OpenXR reports only a runtime-scaled recommendation, so the panel is the
  * build's: Quest 3 (Android) 2064x2208 per eye, Steam Frame (native Linux)
