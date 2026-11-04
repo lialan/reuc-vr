@@ -4132,8 +4132,14 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 if (const auto center=gx::draw_center_ndc(draw)) gx::scale_viewport_about(*center,crosshair_scale_,draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height);
             }
             float late_shift[2]{};   // clip-space translation of a late-aimed reticle quad, in NDC of the draw's viewport
+#ifdef UC_OPENXR
+            if (xr_ && (draw.reticle || draw.late_aim || draw.wake)) xr_->finish_input();
+#endif
             if (draw.late_aim && aim_source_ && !(draw.wake && aim_history_ && wake_seconds_.load()>0)) {
-                const auto latest=aim_source_();
+                auto latest=aim_source_();
+#ifdef UC_OPENXR
+                if (xr_) if (const auto aimed=xr_->aim_pointer()) latest=*aimed;
+#endif
                 const auto& from=draw.aim_exact ? draw.aim_ref : packet.aim_consumed;
                 const float dx=(latest[0]-from[0])*gx::aim_to_ndc_x()*0.5f*area.width, dy=(latest[1]-from[1])*gx::aim_to_ndc_y()*0.5f*area.height;
                 static const bool log_aim=std::getenv("UC_AIM_LOG")!=nullptr;   // diagnostics: one line per shifted reticle draw (consumed, latest, shift in aim units)
@@ -4219,6 +4225,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // The aim reticle (and its wake) marks a place in the world: it stays on HOTD4's world-locked screen when the HUD follows the head.
                 if (kind==LG_STEREO_HUD && (draw.reticle || draw.late_aim || draw.wake)) kind=xr::LG_STEREO_HUD_AIM;
                 stereo_kind=kind; draw_offscreen=facts.offscreen;
+#ifdef UC_OPENXR
+                if (xr_ && kind==LG_STEREO_WORLD && facts.perspective && !facts.offscreen &&
+                    !draw.reticle && !draw.late_aim && !draw.wake && !draw.layer && (info.key[68]&16))
+                    xr_->aim_draw(draw,info.box);
+#endif
                 if (post_dump) {   // UC_POST_DUMP: every draw's stereo class and blend (the HUD layer's question: which draws are separable)
                     const auto b=gx::draw_bounds_ndc(draw);
                     std::fprintf(stderr,"[post-class] draw %zu kind %d persp %d blend %u src %u dst %u logic %u cw %d aw %d depth %02X box %.2f,%.2f..%.2f,%.2f callsite %08X reticle %d layer %d idx %u\n",d,kind,int(facts.perspective),

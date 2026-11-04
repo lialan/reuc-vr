@@ -62,6 +62,7 @@ public:
     const std::array<float,2> &screen_lens() const { return lens_; }
     const std::array<std::array<float,4>,2> &tangents() const { return tangents_; }   // each eye's half-angle tangents (left, right, down, up); zero before the first publish
     void set_screen_lens(std::array<float,2> lens) { lens_=lens; }   // the game's own lens before any frame was observed
+    void set_aim_depth(float metres) { if (metres!=aim_depth_) { aim_depth_=metres; cache_.clear(); last_=0; } }
     // Whether the head-following HUD applies now (gameplay; settings().hud_fit): set once a frame before its draws.
     void set_hud_fit(bool on) { if(on!=fit_on_) { fit_on_=on; cache_.clear(); last_=0; } }
 private:
@@ -79,6 +80,7 @@ private:
     struct Lens {Matrix projection{};unsigned draws=0;};
     std::array<Lens,4> tally_{};
     float longest_=0;
+    float aim_depth_=0;
     unsigned zoom_frames_=0;
     Matrices identity_{};
 };

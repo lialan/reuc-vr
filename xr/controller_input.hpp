@@ -12,9 +12,11 @@ struct ControllerSettings {
 };
 struct ControllerSample {
     std::array<StereoPose,2> pose;std::array<int,2> valid{};LgXrControlFrame buttons{};int menu=0;unsigned extra_held=0;int extra_coins=0;
+    std::array<float,2> aim_depth{}; // metres along the guest camera's -Z, 0: fallback plane
 };
 struct ControllerSnapshot {
     bool dual=false;std::array<StereoRay,2> ray;std::array<int,2> valid{};
+    std::array<StereoRay,2> shot; // same muzzle and direction as the rendered laser, in guest camera units
     unsigned held=0;int coins=0;
 };
 struct ControllerHaptic {float amplitude=0;int milliseconds=0;};

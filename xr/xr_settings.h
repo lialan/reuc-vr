@@ -32,9 +32,9 @@ typedef struct {
  * rows are the eye image's), so nothing is resampled on the way to the display. */
 /* Version 11: restore image quality. The 1080-row scene, reduced eye images and
  * high foveation visibly blurred the 3D view. Native removes both resizes; lower
- * render scales and foveation remain explicit performance choices in the panel. */
+ * render scales remain explicit choices. Version 12 enables medium foveation. */
 #if defined(__ANDROID__)
-#define LG_XR_DEFAULT_FOVEATION 0
+#define LG_XR_DEFAULT_FOVEATION 2
 #else
 #define LG_XR_DEFAULT_FOVEATION 3
 #endif
@@ -52,7 +52,8 @@ typedef struct {
  * fight holds 60 */
 #define LG_XR_DEFAULT_REFRESH 90
 /* game crosshair shown again (version 10): with it hidden the owner could not aim properly by the laser alone */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,11,LG_XR_DEFAULT_RENDER_SCALE}
+/* Version 12: medium foveation by default, retaining native eye/scene size. */
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,12,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);

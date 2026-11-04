@@ -6,6 +6,7 @@
 #include "pointer_settings.h"
 #include "wiimote_config.h"
 #include "wiimote_target.h"
+#include "tracked_ray.h"
 #include <array>
 #include <cstdio>
 #include <filesystem>
@@ -55,6 +56,8 @@ public:
     // The Wii Remote: the IR pointer (smoothed, never a swing), the nunchuk stick as the analog camera, swings as knife and shake input, its buttons through host_button.
     void wiimote_settings(const WiimoteSettings&);   // smoothing and the binding table; throws std::invalid_argument for an invalid set
     void host_wii_pointer(float x,float y,uint64_t timestamp_ns) override;
+    void host_xr_pointer(float x,float y,std::optional<TrackedRay> ray={}); // normalized screen, no IR smoothing or swing gesture
+    std::optional<TrackedRay> consumed_xr_ray();
     void host_wii_stick(float x,float y) override;
     void host_wii_motion(float dx,float dy,uint64_t timestamp_ns) override;
     void wii_reset() override;
@@ -95,6 +98,7 @@ public:
     uint32_t demo_speed(uint32_t live);   // clock speed factor the game pacing uses in a deterministic run: recorded when it changes, replayed at the same pacing call
     ~NativeInput();
 private:
+    std::optional<TrackedRay> xr_ray_,consumed_xr_ray_;
     enum class Tag:uint8_t { sample=1,actions,host,generation,speed,camera };   // camera: 2 int8 after an actions record, written only while not (0,0); older demos have none
     void demo_put(Tag,const void*,size_t);
     // Playing: the i-th consume() returns the i-th recorded sample and the i-th consume_actions() the i-th recorded action frame, whatever order the
@@ -161,6 +165,7 @@ std::array<float,2> input_consumed_aim();   // the pointer the guest read last f
 std::optional<std::array<float,2>> input_consumed_aim_of(unsigned channel);   // the same for one pad; nullopt where there is none (single-player has no second)
 bool input_demo_playing();   // a demo replays the recorded samples: the live pointer is not what the game consumed
 bool input_aim_exact();   // true once a network session set the aim channel
+std::optional<TrackedRay> input_xr_ray(unsigned channel);
 unsigned input_aim_channel();   // the local player's pad (0 outside network play)
 void input_hle_set_aim_channel(unsigned channel);   // network play: the local player's pad (0 host, 1 client); reset to 0 by input_hle_init
 uint32_t input_demo_speed(uint32_t live);   // the clock speed factor the deterministic game pacing uses (recorded and replayed with the demo; live without input)

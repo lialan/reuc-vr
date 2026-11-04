@@ -108,7 +108,8 @@ const Matrices &StereoScene::transforms(const Matrix &p,int kind)
         if(kind==LG_STEREO_FILL) {std::memcpy(out,unit.data(),64);out[10]=0;out[14]=-.999f;continue;}
         // HUD_AIM: HOTD4's world-locked screen of the game's lens (the reticle stays over what it marks).
         const float *hud_view=kind==LG_STEREO_HUD_AIM ? view_[eye].data() : fitted ? head_view_[eye].data() : hud_view_[eye].data();
-        LgStereoProjection policy{view_[eye].data(),hud_view,tangents_[eye].data(),(fitted ? fit_lens : lens_).data(),settings_.screen*settings_.scale};
+        const float distance=kind==LG_STEREO_HUD_AIM && aim_depth_>0 ? aim_depth_ : settings_.screen;
+        LgStereoProjection policy{view_[eye].data(),hud_view,tangents_[eye].data(),(fitted ? fit_lens : lens_).data(),distance*settings_.scale};
         Matrix effective;
         // HUD maps guest clip space straight onto its screen plane. It is
         // independent of the original lens, so needs one transform per frame.

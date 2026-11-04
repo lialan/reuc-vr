@@ -55,12 +55,12 @@ std::unique_ptr<XrCompositor> make_android_xr() {
 void feed_xr_input(XrCompositor& xr, NativeInput& input) {
     xr::ControllerSnapshot snapshot;
     if (!xr.consume(snapshot)) return;
-    const auto now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    // The aim: where the gun's ray meets the screen plane, as the IR pointer (-1..1, y down). Off the screen the pointer stays put, as a
+    // The aim: the scene hit projected into the game's camera (-1..1, y down). Off the screen the pointer stays put, as a
     // remote pointing away from the sensor bar does.
     const auto& ray = snapshot.ray[0];
     if (snapshot.valid[0] && ray.x >= 0 && ray.y >= 0 && ray.x < XrCompositor::kAimWidth && ray.y < XrCompositor::kAimHeight)
-        input.host_wii_pointer(2.f * (ray.x + .5f) / XrCompositor::kAimWidth - 1, 2.f * (ray.y + .5f) / XrCompositor::kAimHeight - 1, now);
+        input.host_xr_pointer(2.f * (ray.x + .5f) / XrCompositor::kAimWidth - 1, 2.f * (ray.y + .5f) / XrCompositor::kAimHeight - 1,
+                             TrackedRay{snapshot.shot[0].origin,snapshot.shot[0].direction});
     // HOTD4's cabinet buttons as the remote's, by role (the original game's Wii layout, input_bindings.cpp default_wii_bindings):
     // trigger = B (fire), reload = 1, action (gun hand A/X) = A, fire mode (gun hand B/Y) = + (next weapon), start (stick click) = Home (pause).
     struct Map { unsigned cabinet; uint16_t wii; };

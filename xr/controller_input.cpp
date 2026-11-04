@@ -1,4 +1,4 @@
-// HOTD4 VR's ControllerInput (lindberghrecomp ef5cd20 renderer/vulkan/controller_input.cpp), unchanged but for the namespace and include paths.
+// Adapted from HOTD4 VR ControllerInput (lindberghrecomp ef5cd20); UC uses scene-hit aim depth.
 #include "controller_input.hpp"
 #include <algorithm>
 #include <cmath>
@@ -28,7 +28,8 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
         for(int pl=0;pl<(frame.dual?2:1);++pl) {
             const int hand=pl?1-main:main;
             if(sample.valid[hand]) {
-                frame.aimed[pl]=scene.aim(sample.pose[hand],settings_.width,settings_.height,settings_.aim_on_hud,settings_.aim_distance,next.ray[pl]);
+                const float depth=sample.aim_depth[hand]>0 ? sample.aim_depth[hand] : settings_.aim_distance;
+                frame.aimed[pl]=scene.aim(sample.pose[hand],settings_.width,settings_.height,settings_.aim_on_hud,depth,next.ray[pl]);
                 next.valid[pl]=1;
                 for(float v:next.ray[pl].origin)if(!std::isfinite(v))next.valid[pl]=0;
                 for(float v:next.ray[pl].direction)if(!std::isfinite(v))next.valid[pl]=0;
@@ -51,6 +52,13 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
                     reach=settings_.aim_on_hud&&scene.aim(sample.pose[hand],settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
                 }
                 for(int i=0;i<3;++i){f.muzzle[i]=f.gun_p[i]+muzzle[i];f.end[i]=f.gun_p[i]+next.ray[pl].direction[i]*reach;}
+                float length=0;
+                for(int i=0;i<3;++i) {
+                    next.shot[pl].origin[i]=f.muzzle[i]*scene.settings().scale;
+                    next.shot[pl].direction[i]=f.end[i]-f.muzzle[i];
+                    length+=next.shot[pl].direction[i]*next.shot[pl].direction[i];
+                }
+                if(length>1e-8f) for(float& v:next.shot[pl].direction) v/=std::sqrt(length);
                 f.beam=settings_.laser==LASER_ON;f.dot=frame.aimed[pl]&&settings_.laser!=LASER_OFF;
                 f.show_gun=settings_.show_gun;f.sight=f.show_gun?settings_.sight:XO_SIGHT_NONE;f.gun_model=settings_.gun_model;
             }

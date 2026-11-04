@@ -1,3 +1,147 @@
+# Accepted baseline: audio good, tracked muzzle aiming mostly correct
+
+2026-11-04 owner feedback: **"audio is good now. commit"**. Aiming is mostly
+correct, with some offset in narrow spaces. Installed APK was read back again
+and is `b3fc5cc723e834733abcc024938e67b1cb9129aac4dc91af681e97a65f5a5724`.
+It is preserved at `reuc-vr-glitch/aim-reset-foveation/accepted-baseline.apk`.
+This supersedes the provisional audio diagnosis below. The untested package
+attribution experiment was removed; the accepted build uses standard SDL audio.
+
+The pending follow-up covers near-wall muzzle/laser alignment, Reset game,
+actual foveation behavior, and 2.25x/2.5x/2.75x scale choices. Device access
+remains authorized and USB has returned. No new audio changes are needed.
+
+The baseline passes nine focused CTests and the 281-shot fixed-ray Quest
+replay; owner confirms audio and mostly-correct aiming. Medium is the default
+foveation setting; its rendering effect still needs investigation. No FPS claim.
+
+---
+
+# Latest continuation: projectile ray fixed; audio wake-up diagnosis pending USB
+
+Updated 2026-11-04, 21:07 UTC. Owner reported that the new crosshair helped but
+laser and bullets still differed, and sound was still missing. Owner authorized
+Quest use: **"Yes, available now."** USB disappeared during the final audio
+lifecycle diagnosis; ADB and mDNS currently show no device. An async request to
+reconnect USB is pending. No test is running. Do not claim audio fixed or final
+candidate installed yet.
+
+- Aiming: game projectiles used the original camera origin (`object+80`) and
+  direction (`+92`), while their visible trail added a flat-screen muzzle offset
+  (`+104`). `game/xr_shot.cpp` now hooks the return from RBUE08 initializer
+  `80069210` only for player-shot caller LR `8006B97C`. It transforms the consumed
+  tracked laser muzzle/direction through inverse camera `8044B4E0`, rotates the
+  original spread cone to that ray, and initializes collision/visible/history
+  positions together. Weapon speed, ammo, RNG and flags remain guest-owned.
+  NativeInput freezes the ray with the consumed pointer; demos/network input
+  disable live ray overrides. ControllerSnapshot takes the exact overlay
+  muzzle-to-end ray, including its small local muzzle offset.
+- Nine rebuilt focused CTests pass (`trajectory-audio/tests.txt`), including
+  translated/rotated camera, near/far points, preserved spread, invalid input,
+  consumed-pose timing, caller guard, and actual overlay/shot equality.
+- Quest fixed-ray replay completed, exit 0: 281 projectile initializations,
+  zero rejects, maximum normalized direction error 2e-7. Cabin and close-attack
+  captures were inspected in both eyes. This uses `UC_XR_TEST_SHOT` and is not
+  moving-controller acceptance or a matched laser/bullet video. No FPS claim.
+- Foveation remains medium by default (generation 12) and native 2064x2208.
+- **Audio diagnosis supersedes the earlier spatialization hypothesis below.**
+  Initial `PLAY_AUDIO: ignore` and `mutedState:appOps` were observed. Setting
+  allow and launching with the harness produced nonzero PCM and an unmuted
+  speaker stream, but normal off-body launch became ignored again. A proximity
+  close event made appOps allow while the existing AAudio player stayed muted.
+  Thus a manual appOps change alone is NOT the fix. Normal launch logs also
+  show AAudio `opPackageName=(null)` / empty package registration.
+- The speculative spatialization NEVER patch was removed. A new candidate
+  explicitly sets SDL application metadata to the Android applicationId and
+  patches pinned SDL AAudio to call optional API-31 `setPackageName` before
+  stream creation. This builds, but its wake-up behavior is **UNTESTED**.
+- `trajectory-audio/lifecycle.py` reuses the repository Quest harness and
+  isolated saves, starts with proximity automation disabled, then closes,
+  disables and closes proximity again. The first `lifecycle-baseline` used
+  `prox_open`, which did not change appOps and is **not lifecycle evidence**.
+  The revised baseline-real-proximity run failed before install because USB
+  disconnected. Run that revised baseline, then package-attribution candidate;
+  require on-body active streams to clear `mutedState:appOps` after both cycles.
+  If attribution alone fails, investigate reopening the physical audio device
+  on XR visible/focused transitions, with synchronization against audio writes.
+- Last installed artifact is the aim-only build (with standard SDL audio):
+  `trajectory-audio/trajectory-audio.apk`, SHA256
+  `b3fc5cc723e834733abcc024938e67b1cb9129aac4dc91af681e97a65f5a5724`.
+  It was hash-read back in finalize.py before the later baseline reinstall.
+- Pending APK: `trajectory-audio/package-attribution-candidate.apk`, SHA256
+  `fe0c815abf47cfec22ff25d2ecfb72a4ca51f3fdb6c0e725c494b2b025f5960b`.
+  `quest/reuc/build/outputs/apk/debug/reuc-debug.apk` is this same candidate.
+- The baseline lifecycle harness stopped the app and restored proximity and
+  Guardian. Its private `env.txt`/`args.txt` remain and need cleanup. The failed
+  `finalize.py` already removed earlier shot/pose overrides, but its assertion
+  failed on off-body appOps ignore; it did not write installed-final.json.
+  Revise final verification to distinguish off-body policy from stuck on-body
+  stream mute. Preserve the normal mute-when-off-body policy and user volume.
+- Source is uncommitted on `quest3-vr`, base `316e2f73`. Both older APKs remain:
+  crosshair build `0cc0d9ff...` and accepted cabin build `518fdfd6...`.
+
+Evidence root: `/Users/lialan/workspace/reuc-vr-glitch/trajectory-audio/`.
+Key files: `pending-audio.json`, `normal-onbody-check.json`,
+`normal-onbody-audio.txt`, `normal-logcat.txt`, `projectile-check/`,
+`final-standard-audio/`, `validation.json`, `tests.txt`.
+All Quest operations must use quest3-lock. Push only `lialan`, never `origin`.
+
+---
+
+# Latest continuation: close-range aim, stereo audio, medium foveation
+
+Updated 2026-11-04. Owner reported aim offset (especially nearby enemies), no
+sound, and foveation off. They authorized another Quest diagnostic/install:
+**"Yes, the Quest is available."** The candidate is now installed, normal play
+is open, and the Quest is **released to the owner**. Do not restart automation
+while they test. Listening and close-range controller acceptance remain pending.
+
+- Aim previously intersected a fixed 15 m plane while the reticle was shown at
+  3 m. It now intersects depth-writing scene triangles in guest view space and
+  uses the same hit depth for game pointer projection, laser and stereo reticle.
+  Cached mesh bounds reject misses before triangle tests; no GPU readback.
+  Tracked input bypasses Wii smoothing and Wii pointer-motion knife gestures.
+  Menus keep their HUD plane; a ray with no scene hit keeps the 15 m fallback.
+  This uses visible mesh surfaces, not enemy hitboxes or aim snapping. Alpha
+  cutout holes are not sampled by the CPU trace. Harness input stays authoritative.
+- Audio was already producing nonzero PCM; device music was unmuted. The AAudio
+  AUTO stream was marked spatializable by Horizon's 2D activity routing. The
+  pinned SDL dependency now requests optional API-32 spatialization NEVER for
+  the game's listener stereo (API-29 fallback retained). Candidate logs show
+  can_spatialize=false and the main speaker mixer; actual listening is pending.
+  `UC_AUDIO_SPATIALIZATION=1` restores AUTO for diagnosis.
+- Android defaults now use medium foveation (2), settings generation 12.
+  Generation-11 Off migrates once; an explicit Off saved afterward is retained.
+  Native 2064x2208 and native render scale are preserved. The normal player's
+  launch confirms native resolution, foveation 2, AAudio stereo, gain 1, paused 0.
+- Android APK and host targets build. Eight focused CTests passed, including
+  analytic close targets at 0.5/1/2/15 m, asymmetric eyes and translated head,
+  transformed/indexed meshes, pointer mapping, stereo projection and audio.
+  Six settings migration/override cases passed. `git diff --check` passes.
+- Isolated Quest replay `geometry-replay` completed at retrace 8811, exit 0.
+  Actual XR captures at 3400/4200/8100/8600 retain the repaired cabin floor/seats
+  and close-attack surfaces in the inspected frames. 104 world-depth samples
+  range 1.9332..9.7616 m. This fixed-ray replay leaves the game pointer owned by
+  the harness; it is not worn-headset aim acceptance or an FPS improvement claim.
+- `UC_VR_TEST_AIM=x,y,z,qx,qy,qz,qw` supplies a reproducible controller ray;
+  `UC_XR_AIM_LOG=1` logs depth/reach/pointer every 30 frames. Both are absent
+  from normal play. Private test env/args/demo/pose/logs/captures were cleaned.
+- Preserved candidate: `aim-audio-foveation.apk`, SHA256
+  `0cc0d9ff3c3ca43b28b2f6269946cd3e2e2d70219f59b5a1ac233e1e8810cfe0` (installed readback matches).
+  Prior accepted cabin APK is retained as `installed-baseline.apk`, SHA256
+  `518fdfd633dd85e95ecb4621b58c45bc8b5734d931da082dd823b810cf7508f2`.
+- Source changes are uncommitted on `quest3-vr`, based on `316e2f73`.
+  Evidence: `installed-final.json`, `validation.json`, `settings-check.json`,
+  `normal-launch.log`, `aaudio-routing`, `stereo-candidate`, `geometry-replay`.
+  Next: owner checks audible sound and close-range point/fire alignment. If aim
+  still differs, capture their ray/target depth and compare the visible mesh to
+  the game's hitbox before changing calibration. Preserve the cabin repair.
+
+Evidence root: `/Users/lialan/workspace/reuc-vr-glitch/aim-audio-foveation/`.
+Use quest3-lock for all device work. Push only to `lialan`, never `origin`.
+
+---
+
 # Latest continuation: cabin projection fix, owner taking over testing
 
 Updated 2026-11-04. The owner reports **"the texture issue is fixed"** and asks

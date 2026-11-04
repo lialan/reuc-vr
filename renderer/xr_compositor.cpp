@@ -484,8 +484,44 @@ void XrCompositor::controller_frame(bool tracked) {
         sample.buttons.lower[h] = input.lower[h]; sample.buttons.upper[h] = input.upper[h]; sample.buttons.stick[h] = input.stick[h];
     }
     sample.menu = input.menu;
+    // Fixed ray for a reproducible scene-geometry check. The harness still
+    // owns game input; this only replaces the traced controller pose.
+    static const auto test_aim=[]() -> std::optional<xr::StereoPose> {
+        const char* value=std::getenv("UC_VR_TEST_AIM"); if (!value) return std::nullopt;
+        xr::StereoPose pose; auto& p=pose.position; auto& q=pose.orientation;
+        if (std::sscanf(value,"%f,%f,%f,%f,%f,%f,%f",&p[0],&p[1],&p[2],&q[0],&q[1],&q[2],&q[3])!=7)
+            throw std::runtime_error("UC_VR_TEST_AIM needs position xyz and quaternion xyzw");
+        float norm=0; for (float v:q) norm+=v*v;
+        if (!std::isfinite(norm) || std::abs(norm-1.f)>.001f) throw std::runtime_error("Invalid UC_VR_TEST_AIM quaternion");
+        for (float v:p) if (!std::isfinite(v)) throw std::runtime_error("Invalid UC_VR_TEST_AIM position");
+        return pose;
+    }();
+    if (test_aim) { sample.pose[1]=*test_aim; sample.valid[1]=1; }
+    controller_sample_=sample; input_focused_=focused; input_finished_=false; aim_world_=false;
+    aim_geometry_.reset();
+    if (focused && (controller_aim_enabled_ || test_aim)) for (unsigned h=0;h<2;++h) if (sample.valid[h])
+        aim_geometry_.set_ray(h,sample.pose[h],scene_.settings().scale);
+    if (!focused) finish_input();
+}
+
+void XrCompositor::finish_input() {
+    if (input_finished_) return;
+    input_finished_=true;
+    auto sample=controller_sample_;
+    for (unsigned h=0;h<2;++h) sample.aim_depth[h]=aim_geometry_.depth(h,scene_.settings().scale);
+    auto control_settings=controls_.settings();
+    control_settings.aim_on_hud=!aim_world_;
+    controls_.configure(control_settings);
     auto& settings = config_.settings;
-    const unsigned effects = panel_.update(settings, scene_, controls_, focused ? sample : xr::ControllerSample{}, frame_.predictedDisplayTime, focused, refresh_rates_);
+    const unsigned effects = panel_.update(settings, scene_, controls_, input_focused_ ? sample : xr::ControllerSample{}, frame_.predictedDisplayTime, input_focused_, refresh_rates_);
+    const float depth=sample.aim_depth[controls_.gun_hand()];
+    scene_.set_aim_depth(controller_aim_enabled_ && aim_world_ ? (depth>0 ? depth : control_settings.aim_distance) : 0);
+    static const bool log_aim=std::getenv("UC_XR_AIM_LOG")!=nullptr;
+    static unsigned aim_frames=0;
+    if (log_aim && ++aim_frames%30==0) {
+        const auto& ray=controls_.aims().ray[0];
+        std::fprintf(stderr,"[xr-aim] world %d depth %.4f reach %.4f pointer %d,%d enabled %d\n",int(aim_world_),depth,ray.reach,ray.x,ray.y,int(controller_aim_enabled_));
+    }
     if (effects & XP_SAVE) xr_settings_save(&settings);
     if (effects & XP_RATE_CHANGED) request_refresh(float(settings.refresh));
     if (effects & XP_FOVEATION_CHANGED) set_foveation(settings.foveation);   // the runtime's (a swapchain made with foveation); the renderer's map reads foveation_level()
@@ -496,6 +532,13 @@ void XrCompositor::controller_frame(bool tracked) {
     for (int h = 0; h < 2; ++h) if (haptics[h].milliseconds) rumble(h, haptics[h].amplitude, haptics[h].milliseconds);
 }
 
+std::optional<std::array<float,2>> XrCompositor::aim_pointer() const {
+    if (!controller_aim_enabled_) return std::nullopt;
+    const auto& aims=controls_.aims(); const auto& ray=aims.ray[0];
+    if (!aims.valid[0] || ray.x<0 || ray.y<0 || ray.x>=kAimWidth || ray.y>=kAimHeight) return std::nullopt;
+    return std::array<float,2>{(2.f*(ray.x+.5f)/kAimWidth-1)*.8f,(2.f*(ray.y+.5f)/kAimHeight-1)*.6f};
+}
+
 void XrCompositor::observe(const gx::Projection& projection) {
     scene_.observe(gl_from_vulkan(projection), LG_STEREO_WORLD);
     lens_seen_ = true;
@@ -504,6 +547,7 @@ void XrCompositor::observe(const gx::Projection& projection) {
 void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView picture_view, VkImageLayout layout, const std::array<float,4>& rect, VkImageView fovea, VkExtent2D texel,
                           const XrHudLayer* hud) {
     if (!acquired_) throw std::logic_error("XR: record without an acquired eye array");
+    finish_input();
     VkDescriptorSet set = VK_NULL_HANDLE;
     // Without a HUD layer, bindings 2 and 3 hold the picture (any image of the declared kind: the shader does not read them then).
     const VkImageView light = hud && hud->light ? hud->light : picture_view, transmit = hud && hud->transmit ? hud->transmit : picture_view;

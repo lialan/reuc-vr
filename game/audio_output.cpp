@@ -23,6 +23,8 @@ AudioOutput::AudioOutput(bool muted) {
         const std::string message=SDL_GetError(); SDL_DestroyAudioStream(stream_); SDL_QuitSubSystem(SDL_INIT_AUDIO);
         throw std::runtime_error(message);
     }
+    std::fprintf(stderr,"[audio] driver %s, stereo 32000 Hz, gain %.2f, paused %d\n",
+                 SDL_GetCurrentAudioDriver(),SDL_GetAudioStreamGain(stream_),int(SDL_AudioStreamDevicePaused(stream_)));
 }
 AudioOutput::~AudioOutput() { SDL_DestroyAudioStream(stream_); SDL_QuitSubSystem(SDL_INIT_AUDIO); }
 void AudioOutput::pause(bool on) {

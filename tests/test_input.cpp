@@ -304,6 +304,22 @@ static void demo_records_the_converted_frame() {
 }
 
 int main() {
+    {
+        uc::NativeInput tracked; tracked.context(uc::InputContext::gameplay); tracked.focus(true);
+        const uc::TrackedRay first{{1,2,3},{0,0,-1}},second{{4,5,6},{1,0,0}};
+        tracked.host_xr_pointer(-.5f,.5f,first); tracked.host_xr_pointer(.5f,-.5f,first);
+        const auto ray=tracked.consume();
+        CHECK(std::abs(ray.x-.4f)<1e-6f && std::abs(ray.y+.3f)<1e-6f);
+        CHECK(tracked.consume_actions().held==0); // moving aim must not synthesize a knife swing
+        CHECK(tracked.consumed_xr_ray()->origin==first.origin);
+        tracked.host_xr_pointer(0,0,second);
+        CHECK(tracked.consumed_xr_ray()->origin==first.origin); // frozen with the consumed pointer
+        tracked.consume();CHECK(tracked.consumed_xr_ray()->origin==second.origin);
+        tracked.focus(false); tracked.host_xr_pointer(0,0); CHECK(!tracked.consume().valid);
+        CHECK(!tracked.consumed_xr_ray());tracked.focus(true);tracked.consume();CHECK(!tracked.consumed_xr_ray());
+        tracked.host_xr_pointer(0,0,first);uc::InputFrame network;network.sample.valid=true;tracked.install_frame(network);
+        tracked.consume();CHECK(!tracked.consumed_xr_ray());
+    }
     corner_zone_turns_fire_into_reload();
     corner_zone_ignores_edge_middle_and_centre();
     edge_zone_triggers_on_any_edge();

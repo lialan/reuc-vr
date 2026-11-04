@@ -66,8 +66,10 @@ void xr_settings_load(LgXrSettings *c)
         if (c->render_scale == 1.5f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
         if (c->foveation == 3) c->foveation = LG_XR_DEFAULT_FOVEATION;
     }
+    /* Upgrade the old off default once; a subsequent explicit Off is retained. */
+    if (c->version < 12 && c->foveation == 0) c->foveation = LG_XR_DEFAULT_FOVEATION;
 #endif
-    c->version = 11;
+    c->version = 12;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

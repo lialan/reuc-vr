@@ -190,6 +190,16 @@ void NativeInput::set_wii_pointer(float x,float y) {
     aim_toward(x*kAimEdgeX,y*kAimEdgeY,wii_.smoothing,!have_wii_pointer_);   // x/y are -1..1 of the window: the game's pointer ends at .8 / .6 there
     have_wii_pointer_=true;
 }
+void NativeInput::host_xr_pointer(float x,float y,std::optional<TrackedRay> ray) {
+    if(!std::isfinite(x) || !std::isfinite(y) || std::abs(x)>1 || std::abs(y)>1)throw std::invalid_argument("invalid XR pointer");
+    std::lock_guard lock(mutex_);
+    if(state_.valid) { aim_toward(x*kAimEdgeX,y*kAimEdgeY,0,true); xr_ray_=ray; }
+}
+std::optional<TrackedRay> NativeInput::consumed_xr_ray() { std::lock_guard lock(mutex_); return consumed_xr_ray_; }
+std::optional<TrackedRay> input_xr_ray(unsigned channel) {
+    auto* source=channel==0 ? input : channel==1 ? second_input : nullptr;
+    return source ? source->consumed_xr_ray() : std::nullopt;
+}
 // The pointer goes to (x,y): at once, or with `smoothing` (0..0.9, the share of the distance that is left after one 60 Hz step) eased over time. The easing runs on the
 // clock, not on the arrival of events: a gun or a camera that stops sending still brings the pointer all the way.
 void NativeInput::aim_toward(float x,float y,float smoothing,bool take_now) {
@@ -295,6 +305,7 @@ void NativeInput::host_camera(std::array<int8_t,2> camera) {
     std::lock_guard lock(mutex_); camera_=camera;
 }
 void NativeInput::cancel_host() {
+    xr_ray_.reset(); consumed_xr_ray_.reset();
     ++generation_; camera_={}; sticks_={}; wii_stick_={}; gyro_ns_=0; have_absolute_=have_wii_pointer_=target_on_=false;
     actions_.focus(false); services_.focus(false);
     state_.valid=false; state_.released|=state_.held; state_.held=state_.pressed=0;
@@ -339,7 +350,7 @@ void NativeInput::focus(bool focused) {
     std::lock_guard lock(mutex_);
     state_.valid=focused; have_absolute_=have_wii_pointer_=target_on_=false;
     actions_.focus(focused); services_.focus(focused);
-    if(!focused) {++generation_;gyro_ns_=0;}   // the sticks keep their state (GamepadInput releases them when the window loses focus): they act again when focus is back
+    if(!focused) {++generation_;gyro_ns_=0;xr_ray_.reset();consumed_xr_ray_.reset();}   // the sticks keep their state (GamepadInput releases them when the window loses focus): they act again when focus is back
     update_camera();
     if (!focused) { state_.released|=state_.held; state_.held=0; state_.pressed=0; }
 }
@@ -441,6 +452,7 @@ unsigned input_aim_channel() { return aim_channel; }
 InputSample NativeInput::consume() { return consume_at(motion_time()); }
 InputSample NativeInput::consume_at(uint64_t now_ns) {
     std::lock_guard lock(mutex_);
+    consumed_xr_ray_=state_.valid && !network_frame_ && !replaying_ ? xr_ray_ : std::nullopt;
     if(network_frame_)return network_frame_->sample;
     if(replaying_) {
         if(demo_sample_at_>=demo_samples_.size()) { InputSample idle; idle.valid=true; return idle; }   // the demo is over: an idle pad

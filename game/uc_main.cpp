@@ -494,6 +494,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
 #ifdef UC_OPENXR
     // The headset (Quest): one OpenXR instance for the process; every renderer (restart_renderer) draws into it.
     const std::unique_ptr<uc::XrCompositor> xr=options.headless ? nullptr : uc::make_android_xr();
+    if(xr) xr->set_controller_aim_enabled(!controlled);
     if(xr) std::fprintf(stderr,"[xr] headset output on\n");
 #endif
     {   // VR (headset or UC_VR_PREVIEW): the game culls to a frustum that covers the eyes (wide_view.h vr_fov_scale; UC_VR_FOV_SCALE, 1 = off)

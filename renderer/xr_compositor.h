@@ -15,6 +15,7 @@
 #include <functional>
 #include "gx_transforms.h"
 #include "gl_clip.h"
+#include "aim_geometry.h"
 #include <vulkan/vulkan.h>
 #ifdef __ANDROID__
 #include <jni.h>
@@ -80,6 +81,12 @@ public:
     XrSessionState session_state() const { return session_state_; }
     // The game's projection of a perspective draw, every frame (HOTD4's lens tally: the screen plane matches the game's field of view).
     void observe(const gx::Projection& projection);
+    void aim_draw(const gx::DrawPacket& draw,const std::array<float,6>* box) {
+        if (!input_finished_) { aim_world_=true; aim_geometry_.draw(draw,box); }
+    }
+    void finish_input(); // once, after world geometry and before the reticle
+    std::optional<std::array<float,2>> aim_pointer() const;
+    void set_controller_aim_enabled(bool on) { controller_aim_enabled_=on; } // before rendering; harness owns its pointer
     // The game thread: the latest controller state (HOTD4's cabinet bits and aim rays), false when nothing new arrived.
     bool consume(xr::ControllerSnapshot& snapshot) { return controls_.consume(snapshot); }
     // The aim's coordinate range: ray x/y are pixels of a kAimWidth x kAimHeight picture of the screen plane.
@@ -152,6 +159,10 @@ private:
     xr::SettingsPanel panel_;
     XrOverlay overlay_;
     void controller_frame(bool tracked);
+    AimGeometry aim_geometry_;
+    xr::ControllerSample controller_sample_;
+    bool input_focused_=false,input_finished_=true,aim_world_=false;
+    bool controller_aim_enabled_=true;
     VkImage overlay_depth_image_ = VK_NULL_HANDLE;
 };
 }  // namespace uc
