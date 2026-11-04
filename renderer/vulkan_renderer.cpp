@@ -429,7 +429,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
 #endif
         const char* tex_env = std::getenv("UC_TEX_MERGE");
         const char* uber_small = std::getenv("UC_UBER_SMALL");
-        if (!uber_small) uber_small = tex_env && std::strcmp(tex_env, "0") == 0 ? "0" : kTableDefault;
+        // Default: the EFB passes only. On the HUD layer the merged draws showed a panel of garbage texels in the middle of both eyes on the
+        // headset (screen recordings; HUD layer off or table off: clean), so UC_UBER_SMALL=1 / hud there stays opt-in until that is fixed.
+        if (!uber_small) uber_small = tex_env && std::strcmp(tex_env, "0") == 0 ? "0" : std::strcmp(kTableDefault, "0") == 0 ? "0" : "scene";
         const bool uber_wanted = std::strcmp(uber_small, "0") != 0;
         const bool wanted = std::strcmp(tex_env ? tex_env : kTableDefault, "0") != 0 || uber_wanted;
         tex_merge_ = wanted && xform_ && indexing && table_limit_ >= 256;
