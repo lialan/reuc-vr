@@ -44,7 +44,12 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 5) c->crosshair = 0;
     /* written before version 6, foveation was off by default: now high (it foveates the game's scene passes, most of the GPU time; 60 fps first) */
     if (c->version < 6) c->foveation = 3;
-    c->version = 6;
+    /* written before version 7, the defaults were native eye images and the native scene: now the 60 fps defaults (render scale 1.5, 0.75 eye images) */
+    if (c->version < 7) {
+        if (c->render_scale == 0.0f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
+        if (c->resolution == LG_XR_NATIVE_HEIGHT && (c->width == LG_XR_NATIVE_WIDTH || c->width == 0)) { c->resolution = LG_XR_DEFAULT_HEIGHT; c->width = LG_XR_DEFAULT_WIDTH; }
+    }
+    c->version = 7;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

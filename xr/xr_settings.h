@@ -30,15 +30,26 @@ typedef struct {
 #endif
 /* Umbrella Chronicles on the Quest (version 4): native eye images, and the game renders each eye at that size (VulkanRenderer: the scene's
  * rows are the eye image's), so nothing is resampled on the way to the display. */
+/* Version 7 on the Quest: the scene at render scale 1.5 (1080 rows an eye) into 1548x1656 eye images (0.75 of the panel; the runtime
+ * scales them to the panel). Headset A/B, fightvr replay, foveation high: 11.4 ms GPU per frame against 24.5 at native / native, room for
+ * 60 fps. The eye images' size also sets the HUD and glow layers and the screen pass, ~2.8 ms of the native size at render scale 1. */
+#if defined(__ANDROID__)
+#define LG_XR_DEFAULT_WIDTH  1548
+#define LG_XR_DEFAULT_HEIGHT 1656
+#define LG_XR_DEFAULT_RENDER_SCALE 1.5f
+#else
 #define LG_XR_DEFAULT_WIDTH  LG_XR_NATIVE_WIDTH
 #define LG_XR_DEFAULT_HEIGHT LG_XR_NATIVE_HEIGHT
+#define LG_XR_DEFAULT_RENDER_SCALE 0.0f
+#endif
 #define LG_XR_OLD_QUEST_HEIGHT 1440   /* the version 2-3 default eye height on the Quest: moves to native */
 /* ... dual off, stats panel on (vr.cfg "stats off" hides it), medium foveation */
 /* foveation off (version 3): the game draws its own picture and only the screen pass renders into the eye image, so foveating it saved
  * nothing and coarsened the picture's edges */
 /* game crosshair hidden (version 5): the laser is the aim; the game's reticle sat a little off it in the headset */
 /* high foveation (version 6): the game's own scene passes are foveated (renderer/fovea_map.h), most of the GPU time; 60 fps first */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,0,1,0,0,1,3,6,0.0f}
+/* render scale 1.5 and 1548x1656 eye images on the Quest (version 7): 60 fps (see LG_XR_DEFAULT_WIDTH) */
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,120,0,LASER_ON,1,0,0,1,0,0,1,3,7,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
