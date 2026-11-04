@@ -59,10 +59,16 @@ void hle_MTXPerspective(ppc::Ctx& c) {
             c.f[1]=fov; c.f[2]=aspect;
         }
         const float vr=gx::vr_fov_scale().load(std::memory_order_relaxed);
+        const float vr_y_set=gx::vr_fov_scale_y().load(std::memory_order_relaxed);
+        const float vr_y=vr_y_set>0.f ? vr_y_set : vr;
         fov=float(c.f[1]);
-        if(vr>1.f && std::isfinite(fov) && fov>0 && fov<180) {   // VR: both tangents grow (the aspect stays), culling covers the headset's view
-            const double tangent=std::tan(double(fov)*3.14159265358979323846/360.0)*vr;
+        aspect=float(c.f[2]);
+        if((vr>1.f || vr_y>1.f) && std::isfinite(fov) && fov>0 && fov<180 && std::isfinite(aspect) && aspect>0) {
+            // VR: the vertical tangent grows by vr_y and the horizontal one by vr (tan_x = tan_y * aspect, so the aspect takes vr / vr_y);
+            // culling then covers the headset's view. Each eye is reprojected from the world, so only the culled objects come back.
+            const double tangent=std::tan(double(fov)*3.14159265358979323846/360.0)*std::max(1.f,vr_y);
             c.f[1]=std::min(170.0,std::atan(tangent)*360.0/3.14159265358979323846);
+            c.f[2]=aspect*std::max(1.f,vr)/std::max(1.f,vr_y);
         }
     }
     uc::call_indirect(c,0x80265468);

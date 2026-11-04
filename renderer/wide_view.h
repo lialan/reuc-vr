@@ -24,6 +24,10 @@ inline std::atomic<bool>& view_edges_state() { static std::atomic<bool> edges{fa
 // to a frustum that covers the headset's eyes rather than its own picture. Each eye is reprojected from the world, so only the culled objects come
 // back; the pixels drawn stay the same. 1 (off) unless VR sets it. 2D is not touched (unlike the factors above).
 inline std::atomic<float>& vr_fov_scale() { static std::atomic<float> scale{1.f}; return scale; }
+// The vertical tangent's own factor (0: the same as vr_fov_scale). The Quest 3's eyes reach much further beyond the game's 16:9 view vertically
+// than horizontally (about 1.6 x 2.6 of it, S17 "Culling and the game's widened view"), so one factor for both either misses the top and bottom
+// (objects culled there pop in and out as the head turns) or widens the sides for nothing.
+inline std::atomic<float>& vr_fov_scale_y() { static std::atomic<float> scale{0.f}; return scale; }
 inline void set_view_factors(ViewFactors factors) {
     uint32_t x, y; std::memcpy(&x, &factors.x, 4); std::memcpy(&y, &factors.y, 4);
     view_state().store(uint64_t(x) | uint64_t(y) << 32); view_edges_state().store(factors.edges);

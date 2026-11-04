@@ -502,11 +502,14 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         vr=vr || xr!=nullptr;
 #endif
         if(vr) {
-            float scale=1.6f;
-            if(const char* v=std::getenv("UC_VR_FOV_SCALE")) scale=float(std::atof(v));
-            if(!(scale>=1.f && scale<=4.f)) throw std::invalid_argument("UC_VR_FOV_SCALE must be 1..4");
-            gx::vr_fov_scale().store(scale);
-            std::fprintf(stderr,"[vr] game view widened %.2fx (culling covers the headset's eyes)\n",scale);
+            // Horizontal and vertical apart: the Quest 3's eyes reach about 1.75 x 2.6 of the game's own view (S17), so the old 1.6 x 1.6 culled
+            // objects at the top and bottom of the eyes, which popped in and out as the head turned. A little margin on both for head motion.
+            float scale=1.8f, scale_y=2.7f;
+            if(const char* v=std::getenv("UC_VR_FOV_SCALE")) { scale=float(std::atof(v)); scale_y=scale; }
+            if(const char* v=std::getenv("UC_VR_FOV_SCALE_Y")) scale_y=float(std::atof(v));
+            if(!(scale>=1.f && scale<=4.f) || !(scale_y>=1.f && scale_y<=4.f)) throw std::invalid_argument("UC_VR_FOV_SCALE and UC_VR_FOV_SCALE_Y must be 1..4");
+            gx::vr_fov_scale().store(scale); gx::vr_fov_scale_y().store(scale_y);
+            std::fprintf(stderr,"[vr] game view widened %.2fx horizontally, %.2fx vertically (culling covers the headset's eyes)\n",scale,scale_y);
         }
     }
     double render_aspect=16.0/9;
