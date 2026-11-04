@@ -54,7 +54,9 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 8 && c->refresh == 120) c->refresh = LG_XR_DEFAULT_REFRESH;
     /* written before version 9, render scale 1.0 was the default: now 1.5 (GPU room after the merge key and 90 Hz; live fight still 60) */
     if (c->version < 9 && c->render_scale == 1.0f) c->render_scale = LG_XR_DEFAULT_RENDER_SCALE;
-    c->version = 9;
+    /* written before version 10, the game crosshair was hidden by default: shown again (aiming by the laser alone was not enough) */
+    if (c->version < 10) c->crosshair = 1;
+    c->version = 10;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {

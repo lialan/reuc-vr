@@ -53,7 +53,8 @@ typedef struct {
 /* display refresh 90 Hz (version 8): at 120 Hz the compositor's work per refresh left frames missing their slot (40 fps); at 90 the live
  * fight holds 60 */
 #define LG_XR_DEFAULT_REFRESH 90
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,0,1,0,0,1,3,9,LG_XR_DEFAULT_RENDER_SCALE}
+/* game crosshair shown again (version 10): with it hidden the owner could not aim properly by the laser alone */
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,3,10,LG_XR_DEFAULT_RENDER_SCALE}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
