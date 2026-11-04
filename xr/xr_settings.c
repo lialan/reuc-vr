@@ -42,7 +42,9 @@ void xr_settings_load(LgXrSettings *c)
     if (c->version < 4 && c->resolution == LG_XR_OLD_QUEST_HEIGHT && c->width == 0) { c->resolution = LG_XR_NATIVE_HEIGHT; c->width = LG_XR_NATIVE_WIDTH; }
     /* written before version 5, the game's crosshair was shown: now hidden (the laser aims; the reticle sat a little off it) */
     if (c->version < 5) c->crosshair = 0;
-    c->version = 5;
+    /* written before version 6, foveation was off by default: now high (it foveates the game's scene passes, most of the GPU time; 60 fps first) */
+    if (c->version < 6) c->foveation = 3;
+    c->version = 6;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {
