@@ -168,11 +168,13 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
         }
         if (performance_control_) {
             // The GPU otherwise stays at the runtime's default clock level; a full-resolution stereo frame needs the sustained-high level.
+            // UC_GPU_LEVEL=boost asks for the boost level instead (the fight replays ran at 545 MHz under sustained high); 0 = no request.
             const char* v = std::getenv("UC_GPU_LEVEL");
             if (!v || *v != '0') {
+                const bool boost = v && std::string(v) == "boost";
                 auto set = function<PFN_xrPerfSettingsSetPerformanceLevelEXT>(instance_, "xrPerfSettingsSetPerformanceLevelEXT");
-                const auto result = set(session_, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
-                std::fprintf(stderr, "[vulkan-xr] GPU sustained high performance request: %d\n", int(result));
+                const auto result = set(session_, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, boost ? XR_PERF_SETTINGS_LEVEL_BOOST_EXT : XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+                std::fprintf(stderr, "[vulkan-xr] GPU %s performance request: %d\n", boost ? "boost" : "sustained high", int(result));
             }
         }
 #ifdef __ANDROID__
