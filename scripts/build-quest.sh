@@ -5,6 +5,7 @@
 # Needs: the translated game in generated/ (scripts/build.sh --translate-only), the Android SDK + NDK 27.3, JDK 17, the OpenXR loader
 # AAR unpacked (UC_OPENXR_DIR, default ~/Downloads/VR/deps/oxr), slangc (UC_SLANGC), Vulkan headers newer than the NDK's
 # (UC_VULKAN_HEADERS, default Homebrew's vulkan-headers). Settings may come from local.env.
+# ThinLTO is on by default (UC_THINLTO=OFF turns it off): with the PGO profile, the fight replay's guest CPU -1.5% more on the Quest.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/local.sh"
@@ -14,7 +15,13 @@ OXR="${UC_OPENXR_DIR:-$HOME/Downloads/VR/deps/oxr}"
 VKH="${UC_VULKAN_HEADERS:-/opt/homebrew/opt/vulkan-headers/include}"
 JDK="${UC_JAVA_HOME:-/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home}"
 SLANGC="${UC_SLANGC:-$(command -v slangc || true)}"
-BUILD="$ROOT/build-android"
+# PGO (CMakeLists.txt): UC_QUEST_PGO=generate builds an instrumented app in build-android-pgo (scripts/quest_pgo.sh records the profile
+# with the fight replay); otherwise project/pgo/uc-quest.profdata, when present, is the optimizer's profile. UC_QUEST_PGO=off: neither.
+PGO_MODE="${UC_QUEST_PGO:-use}"
+PGO_PROFILE="$ROOT/project/pgo/uc-quest.profdata"
+BUILD="$ROOT/build-android"; PGO_ARGS=(-DUC_PGO_GENERATE=OFF -DUC_PGO_PROFILE="$PGO_PROFILE")
+if [ "$PGO_MODE" = generate ]; then BUILD="$ROOT/build-android-pgo"; PGO_ARGS=(-DUC_PGO_GENERATE=ON)
+elif [ "$PGO_MODE" = off ]; then PGO_ARGS=(-DUC_PGO_GENERATE=OFF -DUC_PGO_PROFILE="$ROOT/project/pgo/none.profdata"); fi
 APP="$ROOT/quest/reuc/src/main"
 for need in "$NDK/build/cmake/android.toolchain.cmake" "$OXR/jni/arm64-v8a/libopenxr_loader.so" "$VKH/vulkan/vulkan_core.h" "$JDK/bin/java" "$SLANGC"; do
   [ -e "$need" ] || { echo "ERROR: missing $need (see the header of $0)" >&2; exit 1; }
@@ -23,10 +30,11 @@ done
 
 echo "[1/4] Configure and build libmain.so (arm64-v8a)"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DUC_SLANGC="$SLANGC" -DUC_THINLTO="${UC_THINLTO:-OFF}" \
-  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" > "$BUILD.configure.log" 2>&1 \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DUC_SLANGC="$SLANGC" -DUC_THINLTO="${UC_THINLTO:-ON}" \
+  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" "${PGO_ARGS[@]}" > "$BUILD.configure.log" 2>&1 \
   || { echo "ERROR: configure failed (see $BUILD.configure.log)" >&2; tail -20 "$BUILD.configure.log" >&2; exit 1; }
 cmake --build "$BUILD" --target uc || { echo "ERROR: build failed" >&2; exit 1; }
+grep -h "PGO profile" "$BUILD.configure.log" || echo "PGO: $PGO_MODE (no profile in use)"
 
 echo "[2/4] Stage libraries, assets and SDL's Java sources"
 rm -rf "$APP/libs" "$APP/assets" "$APP/sdl-java"

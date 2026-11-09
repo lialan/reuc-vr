@@ -1004,7 +1004,17 @@ void request_finish(ppc::Ctx& ctx) {
             if(queue.threaded()) { det_early.erase(det_early.begin(),det_early.lower_bound(serial)); det_finishes.emplace(serial,sched.async_begin()); }
         }
         back([inputs=seal_inputs()] { submit_batch(inputs,false,false); });
-        if(packets->detached()) {
+        // Live play on the headset (UC_DRAW_DONE_AT_BUILD=1 elsewhere, =0 off): the draw-done once the builder has sealed this frame's packet,
+        // which then owns everything the GPU reads (as network play does), instead of once the render thread has submitted it: the render
+        // thread's recording leaves the guest's critical path. Quest live train fight, two alternating pairs: 46.9 / 47.5 -> 49.7 / 49.9 fps,
+        // worst frame 42.6 / 39.8 -> 25.8 / 29.4 ms. Deterministic runs keep the submit (replays unchanged).
+#ifdef __ANDROID__
+        constexpr bool kAtBuildDefault=true;
+#else
+        constexpr bool kAtBuildDefault=false;
+#endif
+        static const bool at_build=[] { const char* v=std::getenv("UC_DRAW_DONE_AT_BUILD"); return v && *v ? std::strcmp(v,"0")!=0 : kAtBuildDefault; }();
+        if(packets->detached() || (at_build && !sched.deterministic())) {
             drain();   // network play delivers the draw-done at once: the builder must have read what this frame drew before the guest reuses it
             post_finish(&sched,serial,sched.generation());
         } else if(sched.deterministic() && !queue.threaded()) {

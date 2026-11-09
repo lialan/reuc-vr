@@ -9,6 +9,10 @@
 //
 // Everything the game prints goes to logcat (tag "uc") and to uc.log in the app's folder. env.txt there, one NAME=value per line, sets
 // environment options without rebuilding; args.txt, one argument per line, adds command-line options.
+#ifdef UC_PGO_GENERATE
+extern "C" void __llvm_profile_set_filename(const char*);   // compiler-rt's profile runtime, linked by -fprofile-instr-generate
+extern "C" int __llvm_profile_write_file(void);
+#endif
 #include <SDL3/SDL.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
@@ -180,6 +184,14 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** 
     pthread_join(thread, nullptr);
 #ifdef UC_OPENXR
     if (uc::complete_android_xr_restart()) return run.rc;
+#endif
+#ifdef UC_PGO_GENERATE
+    // An instrumented build (scripts/build-quest.sh with UC_QUEST_PGO=generate): the app's process outlives the game, so its exit-time
+    // profile write would never run; write it here, into the app folder (scripts/quest_pgo.sh pulls it).
+    {
+        __llvm_profile_set_filename((own + "/uc.profraw").c_str());
+        std::fprintf(stderr, "[android] PGO profile %s: %d\n", (own + "/uc.profraw").c_str(), __llvm_profile_write_file());
+    }
 #endif
     std::fprintf(stderr, "[android] game exited %d\n", run.rc);
     return run.rc;
