@@ -18,7 +18,7 @@ static void controls_items(XmItem *it)
 }
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
-    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Post-effect shading", "Draw merging", "Back" };
+    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Post-effect shading", "Draw merging", "Glow", "Back" };
     for (int i = 0; i < XD_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     char res[24];
     if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
@@ -36,6 +36,7 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
     snprintf(it[XD_FXAA].value, 40, "%s", cfg->fxaa ? "FXAA" : "Off");
     snprintf(it[XD_POST].value, 40, "%s", cfg->post_shading ? "Coarse (faster)" : "Full");
     snprintf(it[XD_MERGE].value, 40, "%s", cfg->merge ? "On" : "Off");
+    snprintf(it[XD_GLOW].value, 40, "%s", cfg->glow ? "On" : "Off (faster)");
 }
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
@@ -81,6 +82,7 @@ static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
     case XD_FXAA:cfg->fxaa=!cfg->fxaa;break;
     case XD_POST:cfg->post_shading=!cfg->post_shading;break;
     case XD_MERGE:cfg->merge=!cfg->merge;break;
+    case XD_GLOW:cfg->glow=!cfg->glow;break;
     case XD_BACK:p->page=0;p->hover=-1;effects=0;break;
     default:return 0;
     }

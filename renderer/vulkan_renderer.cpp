@@ -2809,6 +2809,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     const auto& display_source=packet.display_source;
     if(packet.present && (!display_source[2] || !display_source[3] || display_source[0]>=640 || display_source[2]>640-display_source[0] || display_source[1]>=480 || display_source[3]>480-display_source[1])) throw std::invalid_argument("invalid native display source rectangle");
 #ifdef UC_OPENXR
+    if (xr_ && bloom_.enabled!=xr_->glow_on()) {   // the settings panel's Glow, applied at the next frame (the headset's menu owns the bloom switch)
+        BloomSettings bloom=bloom_; bloom.enabled=xr_->glow_on(); set_bloom(bloom);
+        std::fprintf(stderr,"[vr] glow %s from the settings panel\n",bloom.enabled ? "on" : "off");
+    }
     if (xr_ && xr_->take_render_scale_change()) {   // the settings panel's Render scale: the EFB is remade at the next rebuild (below), no restart
         const float chosen=xr_->render_scale();
         native_eye_scale_=!(chosen>0);

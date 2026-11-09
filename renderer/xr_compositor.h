@@ -103,7 +103,8 @@ public:
     // passes over the scene copy (UC_POST_SHADING=full|coarse forces it), the fragment-only uniform identity for merging.
     bool fxaa_on() const;
     bool post_shading_coarse() const;
-    bool merge_frag_uniform() const { return config_.settings.merge != 0; }   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
+    bool merge_frag_uniform() const { return config_.settings.merge != 0; }
+    bool glow_on() const { return config_.settings.glow != 0; }   // vr.cfg / the panel's Glow: the renderer's bloom, read live   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
     // The panel changed the render scale since the last call: the renderer applies it at its next frame (no restart).
     bool take_render_scale_change() { const bool changed = render_scale_changed_; render_scale_changed_ = false; return changed; }
     void request_refresh(float hz);

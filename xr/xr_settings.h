@@ -14,6 +14,7 @@ typedef struct {
     int fxaa;                   /* vr.cfg "fxaa on|off": edge smoothing in the screen pass that puts the picture into the eye images */
     int post_shading;           /* vr.cfg "post_shading full|coarse": coarse (2x2) shading of the full-screen post passes over the scene copy */
     int merge;                  /* vr.cfg "merge on|off": draws whose uniform blocks differ only where no fragment reads them join one draw */
+    int glow;                   /* vr.cfg "glow on|off": the glow around lights (the renderer's bloom); off saves GPU time (r020: ~0.7 ms a frame) */
 } LgXrSettings;
 /* The settings panel's render scales after native, largest first */
 #define LG_XR_RENDER_SCALES {2.75f,2.5f,2.25f,2.0f,1.5f,1.25f,1.0f}
@@ -67,7 +68,7 @@ typedef struct {
 #define LG_XR_DEFAULT_SHOW_GUN 1
 #endif
 #define LG_XR_SETTINGS_VERSION 14
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,LG_XR_DEFAULT_SHOW_GUN,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1}
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,LG_XR_DEFAULT_SHOW_GUN,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1,1}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
