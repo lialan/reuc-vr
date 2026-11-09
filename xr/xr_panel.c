@@ -24,6 +24,9 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
     if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
     else snprintf(res, sizeof res, "%d", cfg->resolution);
     if (cfg->resolution == running_resolution && cfg->width == running_width) snprintf(it[XD_RES].value, 40, "%s", res);
+    /* an explicit render scale caps the eyes at the picture's rows (game/xr_android.cpp): the size in use */
+    else if (cfg->render_scale > 0 && running_resolution == (int)(720 * cfg->render_scale + .5f) && running_resolution < cfg->resolution)
+        snprintf(it[XD_RES].value, 40, "%d (picture size)", running_resolution);
     else snprintf(it[XD_RES].value, 40, "%s (on restart)", res);
     /* the eyes' scene: native is the eye image's rows (720 at 1x), e.g. 3.07x for the Quest 3's 2208 */
     if (cfg->render_scale > 0) snprintf(it[XD_SCALE].value, 40, "%.3gx", cfg->render_scale);

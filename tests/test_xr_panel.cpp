@@ -48,6 +48,16 @@ int main() {
     CHECK(xp_menu_button(&panel, 1, 0) && !panel.open);
     CHECK(xp_menu_button(&panel, 1, 0) && panel.open && panel.page == 0);
 
+    // an explicit render scale caps the eyes at the picture's rows (xr_android.cpp): the Display page shows the size in use
+    {
+        XpPanel shown{}; shown.open = 1; shown.page = 1; LgXrSettings capped = cfg;
+        capped.render_scale = 2.25f; capped.resolution = 2208; capped.width = 2064;
+        xp_items(&shown, &capped, hand, 1, 1620, 1514, items);
+        CHECK(std::strcmp(items[XD_RES].value, "1620 (picture size)") == 0);
+        xp_items(&shown, &capped, hand, 1, 2208, 2064, items);
+        CHECK(std::strcmp(items[XD_RES].value, "2064 x 2208") == 0);
+    }
+
     // Controls opens a read-only page: its rows change nothing, Back returns
     const LgXrSettings before = cfg;
     CHECK(xp_choose(&panel, &cfg, &hand, XP_CONTROLS, nullptr, 0) == 0);

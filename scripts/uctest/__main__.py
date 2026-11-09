@@ -67,9 +67,10 @@ def run_on_quest(name, args):
         args.reach_fps_limit = 30   # the original pacing (else the headset's default, 60)
         if args.fight_fps_limit is None:
             args.fight_fps_limit = 60
+    saves = resolve_saves(args.saves_from) or SAVE_SOURCE   # --from a checkpoint (e.g. one that unlocks a later chapter) as on the desktop
     runner = subprocess.Popen(["python3", "-I", str(root / "scripts/quest/run.py"), "--interactive", "--guardian-pause", "--out", str(run_dir / "app")] + (["--no-install"] if os.environ.get("UC_QUEST_NO_INSTALL") else [])   # UC_QUEST_NO_INSTALL: keep the installed app (a GPU trace needs the app started after ovrgpuprofiler -e)
                               + [f"--arg={a}" for a in game_args] + [f"--set={s}" for s in getattr(args, "quest_set", [])]
-                              + ([f"--saves={SAVE_SOURCE}"] if SAVE_SOURCE and Path(SAVE_SOURCE).is_dir() else []),   # the desktop runs' save snapshot: the menu route needs slot 1
+                              + ([f"--saves={saves}"] if saves and Path(saves).is_dir() else []),   # --from, else the desktop runs' save snapshot: the menu route needs slot 1
                               stdout=open(run_dir / "runner.log", "wb"), stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 300

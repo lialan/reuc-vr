@@ -378,9 +378,13 @@ def gamepad_prompts(g, args):
 
 
 def perf(g, args):
+    if getattr(args, "reach_fps_limit", None) is not None:   # the Quest runner: menus at the original pacing, as in fight (else the opening never reaches the title)
+        g.set_options(fps_limit=args.reach_fps_limit)
     g.set_speed(8)   # menus and loading at 8x; the measurement itself runs at speed 1
     reach_gameplay(g, args.chapter)
     with g.step("normal_speed"):
+        if getattr(args, "fight_fps_limit", None) is not None:   # the Quest runner: measured at the headset's default limit
+            g.set_options(fps_limit=args.fight_fps_limit)
         g.set_speed(1)
         g.wait(lambda f: f.get("speed") == 1 and f.get("context") == "gameplay", seconds=10, awaited="speed 1 in gameplay")
     result = {"capture": g.capture()}

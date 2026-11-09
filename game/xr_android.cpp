@@ -41,6 +41,18 @@ std::unique_ptr<XrCompositor> make_android_xr() {
     if (settings.scale == 1.0f) settings.scale = 10.0f;
     XrConfig config;
     config.width = uint32_t(settings.width); config.height = uint32_t(settings.resolution);   // HOTD4: resolution is the eye height
+    // With an explicit render scale the game's picture has 720 x scale rows: eye images taller than that only upscale it, and that pass costs
+    // GPU time in every frame (r020 at 2.25: 2064x2208 eyes 3.0 ms, 1603x1680 1.9 ms; slowest 5% 40 -> 60 fps). The eyes take the picture's
+    // size then (the headset's compositor scales to the display anyway); Native keeps the chosen eye size, which the scene follows.
+    if (settings.render_scale > 0) {
+        const int rows = int(720 * settings.render_scale + .5f);
+        if (rows < settings.resolution) {
+            if (settings.width > 0) config.width = uint32_t(float(settings.width) * rows / settings.resolution + .5f);
+            config.height = uint32_t(rows);
+            std::fprintf(stderr, "[xr] eye images %ux%u: the picture's size at render scale %.3g (chosen %d rows)\n", config.width, config.height,
+                         settings.render_scale, settings.resolution);
+        }
+    }
     config.refresh = float(settings.refresh);
     config.foveation_level = settings.foveation;
     // UC_CPU_BOOST=1: the runtime's boost CPU level (2.36 GHz on the Quest 3's fast cores) instead of sustained high (2.21 GHz); the
