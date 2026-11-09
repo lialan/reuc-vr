@@ -75,7 +75,7 @@ bool StereoScene::aim(const StereoPose &controller,int width,int height,bool on_
     float x,y,reach;
     if(!lg_stereo_ray_to_plane(o.data(),d.data(),lens_.data(),settings_.screen*settings_.scale,width,height,&x,&y,&reach) ||
        !std::isfinite(x)||!std::isfinite(y))return false;
-    ray.on_screen=x>=0&&y>=0&&x<width&&y<height;
+    ray.on_screen=x>=0&&y>=0&&x<width&&y<height;ray.px=x;ray.py=y;
     if(!ray.on_screen&&on_hud)return false;   // menus keep HOTD4's screen: off it the trigger is not a press there
     ray.x=int(std::clamp(x,0.f,float(width-1)));ray.y=int(std::clamp(y,0.f,float(height-1)));ray.reach=on_hud?reach/settings_.scale:world_reach;return true;
 }

@@ -42,7 +42,8 @@ static void close_target(float metres) {
     xr::StereoPose aside=gun; const float a=1.2f; aside.orientation={0,-std::sin(a/2),0,std::cos(a/2)};
     xr::StereoRay off;
     CHECK(scene.aim(aside,1280,720,false,metres,off));
-    CHECK(!off.on_screen && off.x==1279 && off.y>=0 && off.y<720);
+    CHECK(!off.on_screen && off.x==1279 && off.y>=0 && off.y<720 && off.px>1280);
+    CHECK(std::abs(ray.px-ray.x)<1 && std::abs(ray.py-ray.y)<1);
     CHECK(!scene.aim(aside,1280,720,true,metres,off));
     geometry.reset(); CHECK(!geometry.active() && geometry.depth(1,10)==0);
 }

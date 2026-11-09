@@ -545,7 +545,10 @@ std::optional<std::array<float,2>> XrCompositor::aim_pointer() const {
     if (!controller_aim_enabled_) return std::nullopt;
     const auto& aims=controls_.aims(); const auto& ray=aims.ray[0];
     if (!aims.valid[0] || ray.x<0 || ray.y<0 || ray.x>=kAimWidth || ray.y>=kAimHeight) return std::nullopt;
-    return std::array<float,2>{(2.f*(ray.x+.5f)/kAimWidth-1)*.8f,(2.f*(ray.y+.5f)/kAimHeight-1)*.6f};
+    // Past the picture the game's pointer stays at its edge (xr_android.cpp), but its reticle is drawn where the laser points: the late-aim
+    // shift moves it by the difference. Bounded to three pictures either way (a ray almost along the screen plane).
+    const float x=std::clamp(ray.px,-1.f*kAimWidth,2.f*kAimWidth),y=std::clamp(ray.py,-1.f*kAimHeight,2.f*kAimHeight);
+    return std::array<float,2>{(2.f*(x+.5f)/kAimWidth-1)*.8f,(2.f*(y+.5f)/kAimHeight-1)*.6f};
 }
 
 void XrCompositor::observe(const gx::Projection& projection) {

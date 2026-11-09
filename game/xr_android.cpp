@@ -6,6 +6,10 @@
 #include "xr_settings.h"
 #include "cabinet_buttons.h"
 #include "native_input.h"
+#include "gamepad_math.h"
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <chrono>
 #include <SDL3/SDL.h>
 #include <jni.h>
@@ -82,6 +86,25 @@ void feed_xr_input(XrCompositor& xr, NativeInput& input) {
     if (snapshot.valid[0] && ray.x >= 0 && ray.y >= 0 && ray.x < XrCompositor::kAimWidth && ray.y < XrCompositor::kAimHeight)
         input.host_xr_pointer(2.f * (ray.x + .5f) / XrCompositor::kAimWidth - 1, 2.f * (ray.y + .5f) / XrCompositor::kAimHeight - 1,
                              TrackedRay{snapshot.shot[0].origin,snapshot.shot[0].direction});
+    // Swings: the knife (hold A and swing) and the shake prompts read the Wii Remote's pushes as mouse counts (host_wii_motion). The gun's turn
+    // since the last sample, as yaw right / pitch down in kGyroCountsPerRadian (a gyro pad's scale): a flick of ~2 rad/s reaches kKnifeSpeed,
+    // careful aiming (under 1 rad/s) does not. The first sample after the ray was lost only sets the start.
+    static std::array<float,3> last_direction{};
+    static bool have_direction = false;
+    if (snapshot.valid[0]) {
+        const auto& d = ray.direction;
+        if (have_direction) {
+            const auto& p = last_direction;
+            float yaw = std::atan2(d[0], -d[2]) - std::atan2(p[0], -p[2]);
+            if (yaw > 3.14159265f) yaw -= 6.2831853f; else if (yaw < -3.14159265f) yaw += 6.2831853f;
+            const float pitch = std::asin(std::clamp(d[1], -1.f, 1.f)) - std::asin(std::clamp(p[1], -1.f, 1.f));
+            const float dx = yaw * kGyroCountsPerRadian, dy = -pitch * kGyroCountsPerRadian;
+            if (dx != 0 || dy != 0) input.host_wii_motion(dx, dy, 0);
+        }
+        last_direction = d; have_direction = true;
+    } else {
+        have_direction = false;
+    }
     // HOTD4's cabinet buttons as the remote's, by role (the original game's Wii layout, input_bindings.cpp default_wii_bindings):
     // trigger = B (fire), reload = 1, action (gun hand A/X) = A, fire mode (gun hand B/Y) = + (next weapon), start (stick click) = Home (pause).
     struct Map { unsigned cabinet; uint16_t wii; };

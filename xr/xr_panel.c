@@ -4,7 +4,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-int xp_count(const XpPanel *menu) { return menu->page ? XD_COUNT : XP_COUNT; }
+int xp_count(const XpPanel *menu) { return menu->page == 2 ? XC_COUNT : menu->page ? XD_COUNT : XP_COUNT; }
+/* The game's controls on the Touch controllers (game/xr_android.cpp maps them to the Wii Remote's buttons; the knife and the shakes
+ * come from the gun's swings). The gun hand's lower face button is A on the right controller, X on the left. */
+static void controls_items(XmItem *it)
+{
+    static const char *const rows[XC_COUNT][2] = {
+        { "Fire / confirm", "Trigger" }, { "Reload", "Grip" }, { "Action / pick up", "A (X on the left)" },
+        { "Knife", "Hold A, swing the gun" }, { "Grenade", "Hold A, pull trigger" }, { "Next weapon", "B (Y on the left)" },
+        { "Shake prompts", "Shake the gun" }, { "Pause", "Thumbstick click" }, { "This menu", "Menu button" },
+        { "Switch gun hand", "Trigger, other hand" }, { "Back", "" } };
+    for (int i = 0; i < XC_COUNT; i++) { it[i].label = rows[i][0]; snprintf(it[i].value, 40, "%s", rows[i][1]); }
+}
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
     static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Post-effect shading", "Draw merging", "Back" };
@@ -25,12 +36,13 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
 }
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
+    if (menu->page == 2) { controls_items(it); return; }
     if (menu->page) { display_items(cfg, running_resolution, running_width, it); return; }
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[XP_COUNT] = {
         "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show stats", "Screen distance", "HUD position", "Display rate", "Display",
-        "Recentre view", "Reset game", "Close" };
+        "Controls", "Recentre view", "Reset game", "Close" };
     for (int i = 0; i < XP_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     snprintf(it[XP_SIGHT].value, 40, "%s", sight[cfg->sight]);
     snprintf(it[XP_LASER].value, 40, "%s", laser[cfg->laser]);
@@ -46,6 +58,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     else snprintf(it[XP_HUD].value, 40, "%s %d deg", cfg->hud_pitch < 0 ? "Down" : "Up", abs(cfg->hud_pitch));
     snprintf(it[XP_RATE].value, 40, "%d Hz", cfg->refresh);
     snprintf(it[XP_DISPLAY].value, 40, ">");
+    snprintf(it[XP_CONTROLS].value, 40, ">");
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }
 
@@ -73,6 +86,7 @@ static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
 unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *rates,int nrates)
 {
     if(item<0||item>=xp_count(p))return 0;
+    if(p->page==2){if(item==XC_BACK){p->page=0;p->hover=-1;p->dirty=1;}return 0;}
     if(p->page){p->reset_armed=0;return display_choose(p,cfg,item);}
     static const float screens[]={2,2.5f,3,4,5};const int armed=p->reset_armed;
     unsigned effects=XP_SAVE;p->reset_armed=0;
@@ -88,6 +102,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     case XP_HUD:{static const int pitches[]={0,-10,-20,-30,10};int k=0;while(k<5&&pitches[k]!=cfg->hud_pitch)++k;cfg->hud_pitch=pitches[(k+1)%5];effects|=XP_HUD_CHANGED;break;}
     case XP_RATE:if(nrates){int k=0;while(k<nrates&&rates[k]<=cfg->refresh+.5f)++k;cfg->refresh=(int)(rates[k%nrates]+.5f);effects|=XP_RATE_CHANGED;}break;
     case XP_DISPLAY:p->page=1;p->hover=-1;effects=0;break;
+    case XP_CONTROLS:p->page=2;p->hover=-1;effects=0;break;
     case XP_RECENTRE:effects|=XP_RECENTER;break;
     case XP_RESET:if(!armed)p->reset_armed=1;else effects|=XP_RESTART;break;
     case XP_CLOSE:p->open=0;break;

@@ -5,10 +5,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_DISPLAY,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
+enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_DISPLAY,XP_CONTROLS,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
 /* The Display page (XP_DISPLAY opens it): the picture's size and what the GPU spends on it, all but the eye size applied live. */
 enum { XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_POST,XD_MERGE,XD_BACK,XD_COUNT };
-#define XP_MAX_ROWS ((int)XP_COUNT>(int)XD_COUNT?(int)XP_COUNT:(int)XD_COUNT)
+/* The Controls page (XP_CONTROLS opens it): what each Touch input does in the game, read only. */
+enum { XC_FIRE,XC_RELOAD,XC_ACTION,XC_KNIFE,XC_GRENADE,XC_WEAPON,XC_SHAKE,XC_PAUSE,XC_MENU,XC_HAND,XC_BACK,XC_COUNT };
+#define XP_MAX2(a,b) ((int)(a)>(int)(b)?(int)(a):(int)(b))
+#define XP_MAX_ROWS XP_MAX2(XP_COUNT,XP_MAX2(XD_COUNT,XC_COUNT))
 /* Umbrella Chronicles: HOTD4's arcade rows (Coins, Insert a coin, Arcade Test, Arcade Service) are left out - a Wii game has no coin
  * slot or cabinet buttons. Every other row is HOTD4's, in its order, but HOTD4's "Resolution per eye" and "Foveation" moved to the
  * Display page with "Render scale" (the game's own picture per eye; HOTD4 draws into the eye image directly and has none), "Edge
@@ -17,7 +20,7 @@ enum { XP_SAVE=1,XP_CROSSHAIR_CHANGED=2,XP_SCREEN_CHANGED=4,XP_HUD_CHANGED=8,XP_
 typedef struct {
     int open,hover,dirty;float c[3],right[3],up[3],n[3],hw,hh;
     int test_frames,service_frames,coin,reset_armed;
-    int page;   /* 0 the main rows, 1 the Display page */
+    int page;   /* 0 the main rows, 1 the Display page, 2 the Controls page */
 } XpPanel;
 int xp_count(const XpPanel *panel);   /* rows on the shown page */
 void xp_items(const XpPanel *panel,const LgXrSettings *settings,int hand,int hud_locked,int running_resolution,int running_width,XmItem *items);

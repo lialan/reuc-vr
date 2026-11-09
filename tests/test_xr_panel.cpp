@@ -48,6 +48,17 @@ int main() {
     CHECK(xp_menu_button(&panel, 1, 0) && !panel.open);
     CHECK(xp_menu_button(&panel, 1, 0) && panel.open && panel.page == 0);
 
+    // Controls opens a read-only page: its rows change nothing, Back returns
+    const LgXrSettings before = cfg;
+    CHECK(xp_choose(&panel, &cfg, &hand, XP_CONTROLS, nullptr, 0) == 0);
+    CHECK(panel.page == 2 && xp_count(&panel) == XC_COUNT);
+    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
+    CHECK(std::strcmp(items[XC_KNIFE].label, "Knife") == 0 && std::strcmp(items[XC_KNIFE].value, "Hold A, swing the gun") == 0);
+    CHECK(std::strcmp(items[XC_BACK].label, "Back") == 0 && items[XC_BACK].value[0] == 0);
+    for (int i = 0; i < XC_BACK; i++) CHECK(items[i].value[0] != 0 && xp_choose(&panel, &cfg, &hand, i, nullptr, 0) == 0 && panel.page == 2);
+    CHECK(std::memcmp(&before, &cfg, sizeof cfg) == 0);
+    CHECK(xp_choose(&panel, &cfg, &hand, XC_BACK, nullptr, 0) == 0 && panel.page == 0);
+
     // the new keys survive vr.cfg
     xr_settings_save(&cfg);
     LgXrSettings loaded = LG_XR_SETTINGS_DEFAULT;
