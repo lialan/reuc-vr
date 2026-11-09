@@ -147,7 +147,7 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
         if (target > pc) return s.edge(target) + "goto L_" + hex8(target) + ";";
         // a loop polls for interrupts; what runs there (events on the interrupt context, another thread) does not read this thread's
         // registers, so the poll syncs only r2/r13 (the interrupt context copies them) and keeps the local copy
-        if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + "} goto L_" + hex8(target) + ";";
+        if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + (s.h ? s.h->frame_note : std::string()) + "} goto L_" + hex8(target) + ";";
         return "ppc::poll(c); goto L_" + hex8(target) + ";";
     }
     if (tk.kind == Target::Outside || (tk.kind == Target::Internal && lk && target != f.entry)) {
@@ -252,7 +252,7 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
-    const std::string text = "ppc::op_" + name + (hints && hints->io ? "<true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
+    const std::string text = "ppc::op_" + name + (hints && hints->io ? "<true>" : hints && hints->framed ? "<false, true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
     if (hints && hints->fifo) {   // a store of a FIFO run (mark_fifo_runs)
         const std::string t = num(ppc::t(w));
         const std::string value = name == "stfs" ? "ppc::single_bits(c.f[" + t + "])" : "c.r[" + t + "]";
@@ -818,6 +818,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     RegSet entry_load;
     std::vector<RegSet> dirty_after(n + 1), live_in(n + 1);
     std::vector<std::string> fall_flush(n);   // flush on the fall-through edge into the next instruction
+    std::vector<std::string> frame_at(n);     // a frame note at the start of the instruction (after its label)
     if (local) {
         std::vector<RegNode> nodes(n);
         for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
@@ -906,6 +907,47 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             else hints[size_t(e.from)].edge[f.entry + uint32_t(e.to) * 4] = text;   // on the jump (a jump table: in its case)
         }
         st.reg_entry_loads += entry_load.count();
+        // Frame notes. The r1-based D-form stores skip the per-store write barrier; the function marks the pages of [r1 + lo, r1 + hi) (every
+        // such store lies in it) instead: at its entry and its secondary entries, after every call (a closed callee still polls), after every
+        // instruction that writes r1, and in its polls' slow path. A rollback capture runs only while this thread sits at a safe point (a call
+        // or a poll), so every page such a store writes is marked within the same stretch between two safe points, as the per-store barrier
+        // did. stwu, stmw and the indexed forms keep their own barrier.
+        int32_t lo = INT32_MAX, hi = INT32_MIN;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t w = words[i], opcd = w >> 26;
+            if (!comment[i].empty() || hints[i].io || hints[i].fifo || ppc::a(w) != 1) continue;
+            const int32_t size = opcd == 36 || opcd == 52 ? 4 : opcd == 38 ? 1 : opcd == 44 ? 2 : opcd == 54 || opcd == 60 ? 8 : 0;
+            if (!size) continue;
+            const int32_t d = opcd == 60 ? int32_t(w << 20) >> 20 : ppc::simm(w);   // psq_st: a 12-bit displacement
+            hints[i].framed = true;
+            lo = std::min(lo, d); hi = std::max(hi, d + size);
+            ++st.framed_stores;
+        }
+        if (lo < hi) {
+            // ahead[i]: a framed store can run from i on before the stretch ends (a call or a write of r1, after which the next instruction
+            // marks again, or an exit); a mark is written only where one is. A loop's back edge continues the stretch when its poll does not fire.
+            std::vector<char> ahead(n + 1, 0);
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (size_t k = n; k-- > 0;) {
+                    const RegNode& nd = nodes[k];
+                    bool a = hints[k].framed;
+                    const bool ends = nd.call || nd.eff.may.test(1);
+                    if (!a && nd.fall && !ends) a = ahead[k + 1];
+                    if (!a && nd.target >= 0) a = ahead[size_t(nd.target)];
+                    for (int t : nd.table) if (!a && t >= 0) a = ahead[size_t(t)];
+                    if (a && !ahead[k]) { ahead[k] = 1; changed = true; }
+                }
+            }
+            const std::string note = "ppc::frame_note(c, " + num(lo) + ", " + num(hi) + "); ";
+            for (size_t i = 0; i < n; ++i) {
+                if (nodes[i].poll && nodes[i].target >= 0 && ahead[size_t(nodes[i].target)]) hints[i].frame_note = note;
+                if (!ahead[i]) continue;
+                const uint32_t pc = f.entry + uint32_t(i) * 4;
+                const bool entry = i == 0 || (has_sec && std::count(sit->second.begin(), sit->second.end(), pc));
+                if (entry || nodes[i - 1].call || nodes[i - 1].eff.may.test(1)) { frame_at[i] = note; ++st.frame_notes; }
+            }
+        }
     }
 
     // pass 3: text
@@ -938,6 +980,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         std::string code = comment[i];
         if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
         else ++st.instructions;
+        code = frame_at[i] + code;
         if (p.count_insns) code = "++ppc::g_guest_insns; " + code;
         o << "  /*" << hex8(pc) << "*/ { " << code << " }" << (fall_flush[i].empty() ? "" : " { " + fall_flush[i] + "}") << "\n";
     }

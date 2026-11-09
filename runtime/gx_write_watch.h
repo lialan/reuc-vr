@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include "host_compat.h"
 
 namespace gx {
@@ -22,6 +23,12 @@ inline void note_access(uint32_t address, uint32_t size) {
     page_epoch[first] = write_epoch;
     if ((address & 0xFFFu) + size - 1 > 0xFFFu && first + 1 < kWatchPages) [[unlikely]] page_epoch[first + 1] = write_epoch;   // ends in the next page
 }
+// A write of 1..4096 bytes (a stack frame, a register save area): its first and last page, the one or two it touches.
+inline void note_small(uint32_t address, uint32_t size) {
+    const uint32_t at = address & 0x3FFFFFFFu, first = at >> 12, last = (at + size - 1) >> 12;
+    page_epoch[first] = write_epoch;
+    if (last < kWatchPages) page_epoch[last] = write_epoch;
+}
 inline void note_write_range(uint32_t address, size_t size) {
     if (!size) return;
     const uint64_t first = (address & 0x3FFFFFFFu) >> 12, last = ((address & 0x3FFFFFFFu) + uint64_t(size) - 1) >> 12;
@@ -41,5 +48,23 @@ inline bool written_since(uint32_t address, size_t size, uint32_t stamp) {
 }
 // The epoch counter is 32 bit; callers drop their stamps and call this long before it wraps.
 inline bool watch_exhausted() { return write_epoch > 0xF0000000u; }
+#ifdef UC_DIAG_CHECK_FRAMES
+// A check build of the frame notes: every thread switch and scheduler safe point counts as a rollback capture (frame_check_cut), and a
+// framed stack store (ppc_rt.h) must find its pages marked since the last one; frame_check_fail reports the ones that do not.
+UC_IMAGE_LOCAL inline uint32_t frame_check_cap = 0;
+UC_IMAGE_LOCAL inline uint64_t frame_check_failures = 0;
+inline void frame_check_cut() { frame_check_cap = write_epoch++; }
+[[gnu::noinline, gnu::cold]] inline void frame_check_fail(uint32_t address) {
+    if (++frame_check_failures <= 20 || frame_check_failures % 100000 == 0)
+        std::fprintf(stderr, "[frame-check] unmarked framed store at %08X (%llu so far)\n", address, (unsigned long long)frame_check_failures);
+}
+inline void frame_check(uint32_t address, uint32_t size) {
+    const uint32_t at = address & 0x3FFFFFFFu;
+    if (page_epoch[at >> 12] <= frame_check_cap || page_epoch[(at + size - 1) >> 12] <= frame_check_cap) [[unlikely]] frame_check_fail(address);
+}
+inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; ++watch_generation; frame_check_cap = 0; }
+#else
+inline void frame_check(uint32_t, uint32_t) {}
 inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; ++watch_generation; }
+#endif
 }

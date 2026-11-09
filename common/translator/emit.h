@@ -17,6 +17,7 @@ struct EmitStats {
     size_t reg_entry_loads = 0, reg_flushes = 0, reg_reloads = 0;                  // register-cache copies emitted
     size_t reg_leaf_calls = 0, reg_leaves = 0;                                     // calls that sync only what a leaf callee touches, such callees
     size_t mmio_sites = 0;                                                         // loads/stores from a hardware-register base (explicit MMIO test)
+    size_t framed_stores = 0, frame_notes = 0;                                    // r1 stores without a per-store barrier, the frame notes that cover them
     size_t fifo_runs = 0, fifo_run_stores = 0;                                     // runs of FIFO stores decided once (uc::gx_fifo_burst), their stores
 };
 
@@ -60,6 +61,10 @@ struct CrHints {
     uint32_t leaf_tree = 0;
     std::string full_flush, full_reload, after_call;
     bool io = false;   // a load/store whose base register may hold a hardware-register address: ppc::op_*<true> (explicit MMIO test)
+    // An r1-based D-form store of a function that marks its frame (emit_function, frame notes): ppc::op_*<false, true>, no per-store barrier.
+    // frame_note: the mark (ppc::frame_note) the instruction's interrupt poll writes after the poll's slow path.
+    bool framed = false;
+    std::string frame_note;
     // A store of a FIFO run (emit.cpp, fifo_runs): 1 = the run's first store, which decides the whole run (uc::gx_fifo_burst over
     // fifo_bytes bytes in fifo_stores stores), 2 = a later one; each appends in place when the run was taken.
     int fifo = 0;

@@ -1,4 +1,5 @@
 #include "guest_sched.h"
+#include "gx_write_watch.h"
 #include "clock.h"
 #include "crash_report.h"
 #include "fatal.h"
@@ -439,6 +440,9 @@ void Sched::deliver_events() {
 
 void Sched::safe_point() {
     if (shutdown_) throw ThreadExit{};
+#ifdef UC_DIAG_CHECK_FRAMES
+    gx::frame_check_cut();
+#endif
     deliver_events();
     preempt_check();
 }
@@ -562,6 +566,9 @@ uint64_t Sched::thread_cycles() { return host_thread_cpu_time(); }
 uint64_t Sched::steady_ns() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
 
 void Sched::handoff(Thread* self, Thread* next) {
+#ifdef UC_DIAG_CHECK_FRAMES
+    gx::frame_check_cut();
+#endif
     if (next == self) { self->state = Thread::State::Running; ee_ = self->ee; return; }
     const uint64_t now = steady_ns();
     if (self->id < 32 && run_started_ns_) run_ns_[self->id] += now - run_started_ns_;

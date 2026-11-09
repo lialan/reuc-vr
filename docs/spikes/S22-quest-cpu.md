@@ -88,3 +88,30 @@ owner's 1603x1680 (`--quest-set LINDBERGH_XR_SET=width=1603,resolution=1680`) bo
 GPU 81-84%). The owner's slowdown (session s2, chapter 1 room r002, t=65-70 s) is draw-bound: draws go from ~28k to ~73k a second and the
 guest main thread's baton time from ~9 to ~14 ms a present (all guest threads share the baton, ~19 ms with the others). The per-draw guest
 work (GX recording, the Res* HLEs, the material apply) is what is left to shrink there.
+
+## 7. Frame notes: no write barrier on the stack stores (2026-11-09)
+
+Every guest store marks its 4 KiB page in the write watch (`gx_write_watch.h`); for the stack (r1-based) stores only rollback reads those
+marks (no texture, mesh or display list lives on the stack). The mark is a load, a store into the page table and a page-crossing test, and
+the page-table store may alias guest memory as far as clang knows, so it also blocks the compiler from keeping stack values in registers:
+compiled out, the hot functions shrink by 14-44% (fn_800581A8 1347 -> 760 instructions) and Mac guest Mcycles drop 4.8%.
+
+Rollback captures only while every guest thread sits at a safe point (a call that switches threads, a poll's slow path). So a stack page
+written by translated code only has to be marked once in each stretch between two safe points. The translator now marks the function's
+frame (`ppc::frame_note(c, lo, hi)`, the pages of [r1 + lo, r1 + hi), which hold every r1-based D-form store of the function) at its entry
+and secondary entries, after every call (a closed callee still polls), after every write of r1 and in its polls' slow path, wherever a
+framed store can follow before the stretch ends (a backward dataflow over the function), and those stores (`op_*<false, true>`) skip the
+per-store mark. stwu, stmw, the indexed forms, the register save helpers and all native code keep theirs. 55,547 stores framed, 17,105
+marks (100,977 before the reachability filter).
+
+Checks: `test_emit` (the framed form, the mark range and every placement rule); fightmac guest memory identical over 307 retraces; the
+in-game rollback probe passes at retraces 1500, 5000 and 8600 (it also passed with the marks compiled out: the remaining stwu and
+register-save marks cover most frame pages, so it cannot prove this). A check build (`UC_DIAG_CHECK_FRAMES`) treats every thread switch and
+scheduler safe point as a capture and reports any framed store whose pages were not marked since the last one: 0 over the whole fightmac
+replay, 2.2 million with the marks compiled out (`UC_DIAG_NO_FRAME_NOTE`).
+
+Quest fightvr replay (alternating, same draws): 21223 / 21371 Mcycles with the collision natives, 20830 / 20792 with frame notes
+(**-2.3%**); together with section 5, -4.9% since d7b2e40 (21892 -> 20811).
+
+Tried and dropped: plain instead of volatile accesses for the non-stack guest loads and stores (no change in the hot functions' code), and a
+two-page mark for the register save areas (fewer instructions, Quest replay +0.6%, inside the noise).

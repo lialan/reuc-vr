@@ -291,5 +291,24 @@ int main() {
         CHECK(has("ppc::op_stw<true>(c, 4, 3, 4096);"));
         CHECK(st.mmio_sites - before == 5);
     }
+    {   // frame notes: the r1-based D-form stores skip their barrier (op_*<false, true>) and the function marks [r1 + lo, r1 + hi) at its entry,
+        // after every call and every write of r1, and in its poll's slow path, where a framed store can follow; stwu keeps its own barrier
+        auto q = make_prog({stwu(1, -32, 1), mflr(0), stw(0, 36, 1), stw(31, 28, 1), psq_st(1, -8, 1, 0, 0), bl(32), stfs(1, 8, 1), mtctr(4),
+                            addi(3, 3, 1), stw(3, 12, 1), bdnz(-8), addi(1, 1, 32), blr, blr});
+        uc::EmitStats s3{};
+        const std::string t = uc::emit_function(q, q.an.functions[0], s3);
+        auto has = [&](const char* text) { return t.find(text) != std::string::npos; };
+        auto count = [&](const char* text) { size_t k = 0; for (size_t at = t.find(text); at != std::string::npos; at = t.find(text, at + 1)) ++k; return k; };
+        CHECK(has("ppc::op_stw<false, true>(c, 0, 1, 36);") && has("ppc::op_stw<false, true>(c, 31, 1, 28);"));
+        CHECK(has("ppc::op_psq_st<false, true>(c, 1, 1, -8, 0, 0);") && has("ppc::op_stfs<false, true>(c, 1, 1, 8);"));
+        CHECK(has("ppc::op_stw<false, true>(c, 3, 1, 12);"));
+        CHECK(has("/*80003100*/ { ppc::op_stwu(c, 1, 1, -32); }"));   // stwu keeps its barrier and writes r1: no framed store before it
+        CHECK(has("/*80003104*/ { ppc::frame_note(c, -8, 40); "));   // after the write of r1
+        CHECK(has("/*80003118*/ { ppc::frame_note(c, -8, 40); ppc::op_stfs<false, true>"));         // after the call
+        CHECK(has("ppc::poll_slow(ctx); ppc::frame_note(c, -8, 40); }"));                           // the poll's slow path
+        const size_t epilogue = t.find("/*80003130*/");   // after addi r1 (the epilogue): no framed store follows, no mark
+        CHECK(epilogue != std::string::npos && t.substr(epilogue, t.find('\n', epilogue) - epilogue).find("frame_note") == std::string::npos);
+        CHECK(count("frame_note") == 3 && s3.frame_notes == 2 && s3.framed_stores == 5);
+    }
     return 0;
 }
