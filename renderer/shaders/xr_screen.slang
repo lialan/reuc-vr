@@ -70,8 +70,26 @@ float3 hud(float3 color, float2 uv, uint view) {
     return saturate(color * transmit + light);
 }
 
+// Sharpening (the Display page's "Sharpening", vr.cfg sharpen): AMD's RCAS reduced to its core, on the picture's own texels: the centre
+// against its four neighbours, with the lobe limited per pixel so the result never leaves the neighbourhood's range (no halos, no
+// clipping). Restores what the eye compositor's resampling and FXAA soften; adds no detail. Constant 1: 0 off, 1 low, 2 medium, 3 high.
+[[vk::constant_id(1)]] const uint sharpenLevel = 0;
+float3 sharpen(float3 e, float2 uv, float layer) {
+    uint width, height, layers; picture.GetDimensions(width, height, layers);
+    const float2 texel = float2(1.0 / width, 1.0 / height);
+    const float3 b = tap(uv + float2(0, -1) * texel, layer), d = tap(uv + float2(-1, 0) * texel, layer);
+    const float3 f = tap(uv + float2(1, 0) * texel, layer), h = tap(uv + float2(0, 1) * texel, layer);
+    const float3 mn = min(min(b, d), min(f, h)), mx = max(max(b, d), max(f, h));
+    const float3 hitMin = mn / (4.0 * mx + 1e-5), hitMax = (1.0 - mx) / (4.0 * mn - 4.0 - 1e-5);
+    const float3 lobe3 = max(-hitMin, hitMax);
+    const float amount = sharpenLevel == 1 ? 0.25 : (sharpenLevel == 2 ? 0.5 : 1.0);
+    const float lobe = max(-0.1875, min(max(lobe3.r, max(lobe3.g, lobe3.b)), 0.0)) * amount;
+    return saturate((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0));
+}
+
 [shader("fragment")]
 float4 fragmentMain(VOut i, uint view : SV_ViewID) : SV_Target0 {
-    if (fxaaOn != 0) return float4(hud(fxaa(i.uv, float(view)), i.uv, view), 1);
-    return float4(hud(picture.Sample(linear, float3(i.uv, float(view))).rgb, i.uv, view), 1);
+    float3 color = fxaaOn != 0 ? fxaa(i.uv, float(view)) : (sharpenLevel != 0 ? tap(i.uv, float(view)) : picture.Sample(linear, float3(i.uv, float(view))).rgb);
+    if (sharpenLevel != 0) color = sharpen(color, i.uv, float(view));
+    return float4(hud(color, i.uv, view), 1);
 }

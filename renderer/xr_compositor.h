@@ -102,6 +102,7 @@ public:
     // The Display page, read live: edge smoothing in the screen pass (UC_XR_FXAA=0/1 forces it), coarse shading of the full-screen post
     // passes over the scene copy (UC_POST_SHADING=full|coarse forces it), the fragment-only uniform identity for merging.
     bool fxaa_on() const;
+    int sharpen_level() const;   // the Display page's "Sharpening": 0 off .. 3 high (UC_XR_SHARPEN forces it)
     bool post_shading_coarse() const;
     bool merge_frag_uniform() const { return config_.settings.merge != 0; }
     bool glow_on() const { return config_.settings.glow != 0; }   // vr.cfg / the panel's Glow: the renderer's bloom, read live   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
@@ -155,7 +156,7 @@ private:
     VkSampler sampler_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipelines_[2]{};   // the screen pass without / with edge smoothing (fxaa_on)
+    VkPipeline pipelines_[8]{};   // the screen pass: [fxaa_on * 4 + sharpen_level]
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     struct Bound { VkImageView view, light, transmit, glow_light, glow_transmit; VkDescriptorSet set; };
     std::vector<Bound> bound_;

@@ -18,7 +18,7 @@ int main() {
 
     LgXrSettings cfg = LG_XR_SETTINGS_DEFAULT;
     CHECK(cfg.version == LG_XR_SETTINGS_VERSION);
-    CHECK(cfg.fxaa == LG_XR_DEFAULT_FXAA && cfg.post_shading == 0 && cfg.merge == 1 && cfg.glow == 1);
+    CHECK(cfg.fxaa == LG_XR_DEFAULT_FXAA && cfg.post_shading == 0 && cfg.merge == 1 && cfg.glow == 1 && cfg.sharpen == 0);
 
     XpPanel panel{}; panel.open = 1; int hand = 1;
     XmItem items[XP_MAX_ROWS];
@@ -38,6 +38,8 @@ int main() {
     CHECK(std::strcmp(items[XD_POST].value, "Coarse (faster)") == 0);
     CHECK(xp_choose(&panel, &cfg, &hand, XD_MERGE, nullptr, 0) == XP_SAVE && cfg.merge == 0);
     CHECK(xp_choose(&panel, &cfg, &hand, XD_GLOW, nullptr, 0) == XP_SAVE && cfg.glow == 0);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_SHARPEN, nullptr, 0) == XP_SAVE && cfg.sharpen == 1);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_SHARPEN, nullptr, 0) == XP_SAVE && cfg.sharpen == 2);
     xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
     CHECK(std::strcmp(items[XD_GLOW].label, "Glow") == 0 && std::strcmp(items[XD_GLOW].value, "Off (faster)") == 0);
     const int level = cfg.foveation;
@@ -76,10 +78,10 @@ int main() {
     xr_settings_save(&cfg);
     LgXrSettings loaded = LG_XR_SETTINGS_DEFAULT;
     xr_settings_load(&loaded);
-    CHECK(loaded.fxaa == cfg.fxaa && loaded.post_shading == 1 && loaded.merge == 0 && loaded.glow == 0 && loaded.foveation == cfg.foveation);
+    CHECK(loaded.fxaa == cfg.fxaa && loaded.post_shading == 1 && loaded.merge == 0 && loaded.glow == 0 && loaded.sharpen == 2 && loaded.foveation == cfg.foveation);
     LgXrSettings parsed = LG_XR_SETTINGS_DEFAULT;
-    xr_settings_set(&parsed, "fxaa", "off"); xr_settings_set(&parsed, "post_shading", "coarse"); xr_settings_set(&parsed, "merge", "off"); xr_settings_set(&parsed, "glow", "off");
-    CHECK(parsed.fxaa == 0 && parsed.post_shading == 1 && parsed.merge == 0 && parsed.glow == 0);
+    xr_settings_set(&parsed, "fxaa", "off"); xr_settings_set(&parsed, "post_shading", "coarse"); xr_settings_set(&parsed, "merge", "off"); xr_settings_set(&parsed, "glow", "off"); xr_settings_set(&parsed, "sharpen", "high");
+    CHECK(parsed.fxaa == 0 && parsed.post_shading == 1 && parsed.merge == 0 && parsed.glow == 0 && parsed.sharpen == 3);
     xr_settings_set(&parsed, "fxaa", "on"); xr_settings_set(&parsed, "post_shading", "full"); xr_settings_set(&parsed, "merge", "on");
     CHECK(parsed.fxaa == 1 && parsed.post_shading == 0 && parsed.merge == 1);
 

@@ -7,7 +7,7 @@ extern "C" {
 #endif
 enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_DISPLAY,XP_CONTROLS,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
 /* The Display page (XP_DISPLAY opens it): the picture's size and what the GPU spends on it, all but the eye size applied live. */
-enum { XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_POST,XD_MERGE,XD_GLOW,XD_BACK,XD_COUNT };
+enum { XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_SHARPEN,XD_POST,XD_MERGE,XD_GLOW,XD_BACK,XD_COUNT };
 /* The Controls page (XP_CONTROLS opens it): what each Touch input does in the game, read only. */
 enum { XC_FIRE,XC_RELOAD,XC_ACTION,XC_KNIFE,XC_GRENADE,XC_WEAPON,XC_SHAKE,XC_PAUSE,XC_MENU,XC_HAND,XC_BACK,XC_COUNT };
 #define XP_MAX2(a,b) ((int)(a)>(int)(b)?(int)(a):(int)(b))
