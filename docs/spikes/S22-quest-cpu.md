@@ -115,3 +115,12 @@ Quest fightvr replay (alternating, same draws): 21223 / 21371 Mcycles with the c
 
 Tried and dropped: plain instead of volatile accesses for the non-stack guest loads and stores (no change in the hot functions' code), and a
 two-page mark for the register save areas (fewer instructions, Quest replay +0.6%, inside the noise).
+
+## 8. GX command publish without a store-load barrier, framed `stmw` (2026-11-09, c4088b9)
+
+- **GX queue:** the guest thread publishes a command with a release store and a relaxed check of `sleeping_` (the seq_cst pair stalled it
+  after every SDK block copy, 1.65% of the thread in `ResMeshDraw`); the builder sleeps with a 500 us timeout, so a missed wake-up costs at
+  most that. New wake-up test in `test_gx_queue` (worst 0.05 ms). Not measured on the Quest yet.
+- **Framed `stmw`:** store-multiple from `r1` is a framed store like the single stores. Checked: `UC_DIAG_CHECK_FRAMES` build over the
+  fightmac replay reports 0 unmarked framed stores (with the notes compiled out: 2.2 million, so the check sees the mistake); guest memory
+  identical at all 307 checkpoints; 209/209 tests. Translation: 56917 framed stack stores, 17141 frame notes.
