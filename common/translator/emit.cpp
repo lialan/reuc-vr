@@ -4,6 +4,7 @@
 #include "ppc/isa.h"
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <set>
 #include <sstream>
 
@@ -13,20 +14,8 @@ static std::string hex8(uint32_t v) { char b[16]; std::snprintf(b, sizeof b, "%0
 static std::string num(long long v) { return std::to_string(v); }
 static std::string fn_name(uint32_t a) { return "fn_" + hex8(a); }
 static std::string sec_name(uint32_t owner, uint32_t t) { return "fn_" + hex8(owner) + "_" + hex8(t); }
-
-void add_resume_entries(Program& p) {
-    for (const auto& f:p.an.functions) {
-        if(p.cfg.hle.count(f.entry)) continue;
-        for(uint32_t pc=f.entry;pc+4<f.end;pc+=4) {
-            uint32_t word=0;
-            if(!p.img.word(pc,word) || !ppc::lk(word)) continue;
-            const auto* op=ppc::decode(word);
-            if(op && (op->kind==ppc::Kind::BR || op->kind==ppc::Kind::BC ||
-                      op->kind==ppc::Kind::BCLR || op->kind==ppc::Kind::BCCTR))
-                p.an.secondary[f.entry].insert(pc+4);
-        }
-    }
-}
+// game_decl.h: true when no native code runs at the entry of any function in the call tree of a closed function (one per component)
+static std::string plain_tree_name(uint32_t tree) { return "uc_plain_tree_" + hex8(tree); }
 
 static std::string callee(const Program& p, uint32_t target) {
     auto it = p.cfg.hle.find(target);
@@ -156,7 +145,8 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
     }
     if (tk.kind == Target::Internal && !lk) {
         if (target > pc) return s.edge(target) + "goto L_" + hex8(target) + ";";
-        // a loop is a safe point; the interrupts that may run there see the registers in the real context
+        // a loop polls for interrupts; what runs there (events on the interrupt context, another thread) does not read this thread's
+        // registers, so the poll syncs only r2/r13 (the interrupt context copies them) and keeps the local copy
         if (s.local()) return "if ((++c.poll_count & 0x7FFu) == 0) [[unlikely]] { " + s.flush + "ppc::poll_slow(ctx); " + s.reload + "} goto L_" + hex8(target) + ";";
         return "ppc::poll(c); goto L_" + hex8(target) + ";";
     }
@@ -165,9 +155,9 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
         return s.flush + trap_str(pc, "branch target " + hex8(target) + " is not inside any translated function");
     }
     std::string fn = tk.kind == Target::Secondary ? sec_name(tk.owner, target) : callee(p, target);
-    if (lk && s.h && s.h->leaf_call) {   // partial sync unless native code runs at the callee's entry
+    if (lk && s.h && s.h->leaf_call) {   // partial sync unless native code runs at the entry of a function in the callee's call tree
         const std::string lr = "c.lr = 0x" + hex8(pc + 4) + "u; ";
-        return "if constexpr (UC_PLAIN_ENTRY(0x" + hex8(target) + "u)) { " + lr + s.flush + fn + "(ctx); " + s.reload + "} else { " + lr + s.h->full_flush +
+        return "if constexpr (" + plain_tree_name(s.h->leaf_tree) + ") { " + lr + s.flush + fn + "(ctx); " + s.reload + "} else { " + lr + s.h->full_flush +
                fn + "(ctx); " + s.h->full_reload + s.h->after_call + "}";
     }
     if (lk) return "c.lr = 0x" + hex8(pc + 4) + "u; " + s.flush + fn + "(" + s.cx + ");" + (s.reload.empty() ? "" : " " + s.reload);
@@ -262,7 +252,15 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
-    return "ppc::op_" + name + (hints && hints->io ? "<true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
+    const std::string text = "ppc::op_" + name + (hints && hints->io ? "<true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
+    if (hints && hints->fifo) {   // a store of a FIFO run (mark_fifo_runs)
+        const std::string t = num(ppc::t(w));
+        const std::string value = name == "stfs" ? "ppc::single_bits(c.f[" + t + "])" : "c.r[" + t + "]";
+        const std::string decide = hints->fifo == 1 ? "fifo_ = uc::gx_fifo_burst(c.r[" + num(ppc::a(w)) + "] + uint32_t(" + num(ppc::simm(w)) + "), " +
+                                                          num(hints->fifo_bytes) + "u, " + num(hints->fifo_stores) + "u); " : "";
+        return decide + "if (fifo_) uc::gx_fifo_put(" + std::string(name == "stb" ? "1" : name == "sth" ? "2" : "4") + ", " + value + "); else " + text;
+    }
+    return text;
 }
 
 static bool is_terminator_word(uint32_t w) { return w == 0x4E800020u || w == 0x4E800420u || ((w >> 26) == 18 && !(w & 1)); }
@@ -475,12 +473,17 @@ struct RegNode {
     int target = -1;           // internal branch target (instruction index; n = past the end)
     bool poll = false;         // the internal branch is a loop back edge (an interrupt poll on its slow path)
     std::vector<int> table;    // jump table targets
-    RegSet pass;               // a call of a leaf function: dirty registers it neither loads nor stores (they stay dirty across it)
-    RegSet call_writes;        // the registers the call can change in the real context (all, unless a leaf)
+    RegSet pass;               // a call of a closed function: dirty registers its call tree neither loads nor stores (they stay dirty across it)
+    RegSet call_writes;        // the registers the call can change in the real context (all, unless a closed function)
     bool tail = false;         // the exit is a jump into another function
+    uint32_t callee = 0;       // the entry a direct call or tail jump goes to (0: indirect, sc, or not a function entry)
 };
 
 RegSet cached_mask() { RegSet m; for (int i = 0; i < res::COUNT; ++i) m.set(size_t(i)); return m; }
+// What an interrupt poll stores: the small-data bases the interrupt context takes from the interrupted thread (Sched::deliver_events).
+// Interrupts run on their own context and a thread switch keeps this thread's host stack, so no other register needs to be current there
+// (a rollback checkpoint takes other threads only while they are parked in an SDK call, a full sync point).
+RegSet poll_mask() { RegSet m; m.set(size_t(res::R + 2)); m.set(size_t(res::R + 13)); return m; }
 
 std::string copy_text(const RegSet& set, bool to_ctx) {
     std::string s;
@@ -525,6 +528,7 @@ RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, c
                 return false;
             }
         }
+        if (tk.kind == Target::Entry || (tk.kind == Target::Internal && target == f.entry)) nd.callee = target;
         if (lk) {
             def(res::LR, always); nd.call = true;
             auto leaf = leaves && tk.kind == Target::Entry ? leaves->find(target) : decltype(leaves->end()){};
@@ -738,6 +742,56 @@ static void plan_function(const Program& p, const Function& f, const CrLive* liv
 
 
 
+// FIFO runs: two or more FIFO stores (stb/sth/stw/stfs from a hardware-register base, all with the same base register and offset) in one
+// block, with only register operations and plain loads between them (no label, branch, call, trap, other store, cache operation, MMIO
+// access, SPR write but LR/CTR/XER, or write of the base register). The run's first store decides all of them once (uc::gx_fifo_burst:
+// the FIFO port with room for every byte of the run); nothing between the stores can reach the FIFO or move its window, so each store then
+// appends in place what its own store would have appended. Returns whether the function has a run (it declares the decision variable).
+static bool mark_fifo_runs(const Function& f, FnPlan& plan, EmitStats& st) {
+    auto fifo_store = [&](size_t i) -> uint32_t {   // the store's size when it is a FIFO candidate
+        if (!plan.comment[i].empty() || !plan.hints[i].io) return 0;
+        const uint32_t w = plan.words[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        if (!op || ppc::a(w) == 0) return 0;
+        const std::string n = op->name;
+        return n == "stb" ? 1 : n == "sth" ? 2 : n == "stw" || n == "stfs" ? 4 : 0;
+    };
+    auto between = [&](size_t i, uint32_t base) {
+        if (!plan.comment[i].empty()) return true;   // a folded compare: no code
+        const uint32_t w = plan.words[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        using ppc::Kind;
+        if (!op || plan.hints[i].io || op->kind == Kind::BR || op->kind == Kind::BC || op->kind == Kind::BCLR || op->kind == Kind::BCCTR ||
+            op->kind == Kind::SC || op->kind == Kind::UNSUP || (op->sub == ppc::Sub::X9 && ppc::oe(w))) return false;
+        const std::string n = op->name;
+        if (n == "tw" || n == "twi" || n.compare(0, 2, "st") == 0 || n.compare(0, 6, "psq_st") == 0 || n.compare(0, 2, "dc") == 0 ||
+            n.compare(0, 2, "ic") == 0 || n == "mtmsr" || (n == "mtspr" && ppc::spr(w) != 1 && ppc::spr(w) != 8 && ppc::spr(w) != 9)) return false;
+        bool ok = false;
+        const RegEffect e = reg_effect(*op, w, op->rc && ppc::rc(w) && !plan.hints[i].drop_rc, ok);
+        return ok && !e.may.test(size_t(res::R + int(base)));
+    };
+    bool any = false;
+    for (size_t i = 0; i < plan.n;) {
+        const uint32_t first = fifo_store(i);
+        if (!first) { ++i; continue; }
+        const uint32_t base = ppc::a(plan.words[i]);
+        const int32_t disp = ppc::simm(plan.words[i]);
+        std::vector<size_t> run{i};
+        uint32_t bytes = first;
+        for (size_t j = i + 1; j < plan.n && !plan.labels.count(f.entry + uint32_t(j) * 4); ++j) {
+            if (const uint32_t s = fifo_store(j); s && ppc::a(plan.words[j]) == base && ppc::simm(plan.words[j]) == disp) { run.push_back(j); bytes += s; continue; }
+            if (!between(j, base)) break;
+        }
+        if (run.size() >= 2) {
+            for (size_t k : run) { plan.hints[k].fifo = k == run.front() ? 1 : 2; plan.hints[k].fifo_bytes = bytes; plan.hints[k].fifo_stores = uint32_t(run.size()); }
+            ++st.fifo_runs; st.fifo_run_stores += run.size();
+            any = true;
+        }
+        i = run.back() + 1;
+    }
+    return any;
+}
+
 std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live, const std::unordered_map<uint32_t, LeafRegs>* leaves) {
     FnPlan plan;
     plan_function(p, f, live, st, plan);
@@ -757,6 +811,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
         st.mmio_sites += mark_mmio_bases({&words, &comment}, nodes, hints);
     }
+    const bool fifo_fn = mark_fifo_runs(f, plan, st);
 
     // pass 2: register cache dataflow
     const bool local = p.reg_cache;
@@ -813,7 +868,8 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             for (size_t i = n; i-- > 0;) {
                 const RegNode& nd = nodes[i];
                 RegSet x;
-                if (nd.exit || nd.poll) x |= dirty_after[i];
+                if (nd.exit) x |= dirty_after[i];
+                if (nd.poll) x |= dirty_after[i] & poll_mask();
                 // a call flushes what the callee may touch; the copies it cannot change must be current before it
                 if (nd.call) x |= (dirty_after[i] & ~nd.pass) | (live_in[i + 1] & ~nd.call_writes);
                 for (int k : out[i]) x |= (edges[size_t(k)].sync ? RegSet() : live_in[size_t(edges[size_t(k)].to)]) | edge_flush[size_t(k)];
@@ -825,16 +881,16 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         for (size_t i = 0; i < n; ++i) {
             const RegNode& nd = nodes[i];
             hints[i].local = true;
-            const RegSet flush = nd.call ? dirty_after[i] & ~nd.pass : dirty_after[i];
+            const RegSet flush = nd.call ? dirty_after[i] & ~nd.pass : nd.poll ? dirty_after[i] & poll_mask() : dirty_after[i];
             if (nd.call || nd.exit || nd.poll) { hints[i].flush = copy_text(flush, true); st.reg_flushes += flush.count(); }
             if (nd.call) { hints[i].reload = copy_text(live_in[i + 1] & nd.call_writes, false); st.reg_reloads += (live_in[i + 1] & nd.call_writes).count(); }
             if (nd.call && nd.pass.any()) {
                 ++st.reg_leaf_calls;
                 hints[i].leaf_call = true;
+                hints[i].leaf_tree = leaves->at(nd.callee).tree;
                 hints[i].full_flush = copy_text(dirty_after[i], true);
-                hints[i].full_reload = copy_text(live_in[i + 1] | (dirty_after[i] & nd.pass), false);   // copies the leaf path keeps must stay current
+                hints[i].full_reload = copy_text(live_in[i + 1] | (dirty_after[i] & nd.pass), false);   // copies the closed path keeps must stay current
             }
-            else if (nd.poll) { hints[i].reload = copy_text(live_in[size_t(nd.target)], false); st.reg_reloads += live_in[size_t(nd.target)].count(); }
         }
         for (size_t k = 0; k < edges.size(); ++k) {
             const Edge& e = edges[size_t(k)];
@@ -859,6 +915,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     if (local) {
         // a resume through a secondary entry (rare) loads what is read from there on; the normal entry only what the entry reads
         o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n";
+        if (fifo_fn) o << "  bool fifo_ = false;\n";
         if (has_sec) {
             o << "  if (at != 0) [[unlikely]] switch (at) { ";
             for (uint32_t t : sit->second) {
@@ -869,7 +926,8 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             o << "default: break; }\n";
         }
         o << "  " << copy_text(entry_load, false) << "\n";
-    } else if (has_sec) {
+    } else if (fifo_fn) o << "  bool fifo_ = false;\n";
+    if (!local && has_sec) {
         o << "  switch (at) { ";
         for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
         o << "default: break; }\n";
@@ -903,36 +961,92 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     return o.str();
 }
 
-// The translated functions a call may sync with partially: no call (the save/restore helpers are written in place), no loop (so no
-// interrupt poll: no safe point where the scheduler or an interrupt could look at the context), no jump table, no tail or indirect jump
-// and no fall into the next function. Their loads and stores of the real context are their entry loads and flushes, all within the
-// registers they read or write. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very
-// instructions) qualify the same way: they copy in and out only registers their guest code uses. So do the native SDK matrix/vector
-// routines below: they read the guest routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both).
+// The functions a call may sync with partially ("closed"): their whole call tree reaches no point where code other than this thread's
+// translated code reads or replaces its context. Such points are an HLE call (an SDK call may park the thread for a rollback checkpoint,
+// and the resume rebuilds the frames from the context through the guest LR chain; the main thread reloads after the call that restored a
+// checkpoint), an indirect call, sc, and a jump into the middle of another function. A loop does not count (its poll, see poll_mask),
+// nor a jump table, a direct tail jump or the fall into the next function when that function is closed too. A closed function's loads
+// and stores of the real context are its entry loads, its flushes and those of its callees, all within the registers the tree reads or
+// writes. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very instructions) qualify the same
+// way: they copy in and out only registers their guest code uses. So do the native SDK matrix/vector routines below: they read the guest
+// routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both).
 static bool leaf_hle(const std::string& name) {
     static const std::set<std::string> math = {"PSMTXIdentity", "PSMTXCopy", "PSMTXConcat", "PSMTXTransApply", "PSMTXScaleApply", "PSMTXMultVec",
         "PSVECAdd", "PSVECSubtract", "PSVECScale", "PSVECNormalize", "PSVECSquareMag", "PSVECMag", "PSQUATDotProduct", "PSVECCrossProduct"};
     return name.compare(0, 5, "Leaf_") == 0 || math.count(name);
 }
-static std::unordered_map<uint32_t, LeafRegs> analyze_leaves(const Program& p, const CrLive* live) {
-    std::unordered_map<uint32_t, LeafRegs> out;
+struct Closed {
+    std::unordered_map<uint32_t, LeafRegs> fns;
+    std::string plain;   // game_decl.h: uc_plain_tree_<component> = no native code at the entry of any function the component reaches
+};
+static Closed analyze_closed(const Program& p, const CrLive* live) {
+    struct Candidate { LeafRegs regs; std::vector<uint32_t> callees; };
+    std::map<uint32_t, Candidate> cand;   // ordered: deterministic output
     EmitStats scratch;
     for (const auto& f : p.an.functions) {
         if (f.end <= f.entry) continue;
         if (auto h = p.cfg.hle.find(f.entry); h != p.cfg.hle.end() && !leaf_hle(h->second)) continue;
         FnPlan plan;
         plan_function(p, f, live, scratch, plan);
-        if (plan.tail_end) continue;
-        LeafRegs regs;
-        bool leaf = true;
-        for (size_t i = 0; i < plan.n && leaf; ++i) {
+        Candidate c;
+        bool ok = true;
+        if (plan.tail_end) { if (p.cfg.hle.count(f.entry) || !p.an.is_entry(f.end)) ok = false; else c.callees.push_back(f.end); }
+        for (size_t i = 0; i < plan.n && ok; ++i) {
             const RegNode nd = reg_node(p, f, f.entry + uint32_t(i) * 4, plan.words[i], plan.hints[i], plan.fused_use[i], !plan.comment[i].empty(), nullptr);
-            if (nd.call || nd.poll || nd.tail || !nd.table.empty()) leaf = false;
-            regs.touched |= nd.eff.use | nd.eff.may;
-            regs.written |= nd.eff.may;
+            if (nd.call || nd.tail) { if (nd.callee) c.callees.push_back(nd.callee); else ok = false; }
+            c.regs.touched |= nd.eff.use | nd.eff.may;
+            c.regs.written |= nd.eff.may;
         }
-        if (leaf) out[f.entry] = regs;
+        if (ok) cand.emplace(f.entry, std::move(c));
     }
+    // drop every function that reaches one that is not closed
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto it = cand.begin(); it != cand.end();) {
+            const bool open = std::any_of(it->second.callees.begin(), it->second.callees.end(), [&](uint32_t t) { return !cand.count(t); });
+            if (open) { it = cand.erase(it); changed = true; } else ++it;
+        }
+    }
+    for (bool changed = true; changed;) {   // summaries over the call tree
+        changed = false;
+        for (auto& [entry, c] : cand)
+            for (uint32_t t : c.callees) {
+                const LeafRegs& d = cand.at(t).regs;
+                const LeafRegs before = c.regs;
+                c.regs.touched |= d.touched; c.regs.written |= d.written;
+                changed |= before.touched != c.regs.touched || before.written != c.regs.written;
+            }
+    }
+    // components of the closed call graph (Tarjan: a component comes out after every component it calls), one plain constant each
+    Closed out;
+    std::unordered_map<uint32_t, int> index, low;
+    std::unordered_map<uint32_t, uint32_t> comp;   // function -> component (its smallest member)
+    std::vector<uint32_t> stack;
+    std::unordered_map<uint32_t, bool> on;
+    int next = 0;
+    std::function<void(uint32_t)> visit = [&](uint32_t v) {
+        index[v] = low[v] = next++;
+        stack.push_back(v); on[v] = true;
+        for (uint32_t w : cand.at(v).callees) {
+            if (!index.count(w)) { visit(w); low[v] = std::min(low[v], low[w]); }
+            else if (on[w]) low[v] = std::min(low[v], index[w]);
+        }
+        if (low[v] != index[v]) return;
+        std::vector<uint32_t> members;
+        for (uint32_t w = 0; w != v;) { w = stack.back(); stack.pop_back(); on[w] = false; members.push_back(w); }
+        std::sort(members.begin(), members.end());
+        for (uint32_t m : members) comp[m] = members.front();
+        std::set<uint32_t> reached;
+        std::string e;
+        for (uint32_t m : members) {
+            e += (e.empty() ? "" : " && ") + std::string("UC_PLAIN_ENTRY(0x") + hex8(m) + "u)";
+            for (uint32_t w : cand.at(m).callees) if (comp.at(w) != members.front()) reached.insert(comp.at(w));
+        }
+        for (uint32_t r : reached) e += " && " + plain_tree_name(r);
+        out.plain += "inline constexpr bool " + plain_tree_name(members.front()) + " = " + e + ";\n";
+    };
+    for (const auto& [entry, c] : cand) if (!index.count(entry)) visit(entry);
+    for (auto& [entry, c] : cand) { c.regs.tree = comp.at(entry); out.fns.emplace(entry, c.regs); }
     return out;
 }
 
@@ -949,6 +1063,11 @@ Output emit_program(const Program& p, size_t shard, EmitStats& st) {
         if (it != p.an.secondary.end()) for (uint32_t t : it->second) decl += "void " + sec_name(f.entry, t) + "(ppc::Ctx&);\n";
     }
     for (const auto& n : hle_names) decl += "void hle_" + n + "(ppc::Ctx&);\n";
+    const CrLive live = p.cr_opt ? analyze_cr(p) : CrLive{};
+    const Closed closed = p.reg_cache ? analyze_closed(p, p.cr_opt ? &live : nullptr) : Closed{};
+    const auto& leaves = closed.fns;
+    st.reg_leaves = leaves.size();
+    decl += closed.plain;
     out.files.push_back({"game_decl.h", decl});
 
     size_t idx = 0, in_cur = 0;
@@ -959,9 +1078,6 @@ Output emit_program(const Program& p, size_t shard, EmitStats& st) {
         out.files.push_back({nm, "#include \"game_decl.h\"\n" + cur});
         cur.clear(); in_cur = 0;
     };
-    const CrLive live = p.cr_opt ? analyze_cr(p) : CrLive{};
-    const auto leaves = p.reg_cache ? analyze_leaves(p, p.cr_opt ? &live : nullptr) : std::unordered_map<uint32_t, LeafRegs>{};
-    st.reg_leaves = leaves.size();
     for (const auto& f : p.an.functions) {
         if (p.cfg.hle.count(f.entry)) continue;
         cur += emit_function(p, f, st, p.cr_opt ? &live : nullptr, &leaves);
@@ -984,6 +1100,38 @@ Output emit_program(const Program& p, size_t shard, EmitStats& st) {
     table += "extern const uint32_t uc_text_begin = 0x" + hex8(tb) + "u;\nextern const uint32_t uc_text_end = 0x" + hex8(te) + "u;\n";
     out.files.push_back({"game_table.cpp", table});
     return out;
+}
+
+// Resume points: the return address of every call a parked SDK call can be inside (Sched::restore rebuilds such a thread from its context
+// through the guest LR chain, calling these entries). A call of a closed function or of a save/restore helper cannot park, so its return
+// address gets none, unless the analyzer already made it an entry (a jump from another function).
+void add_resume_entries(Program& p) {
+    const auto jumped = p.an.secondary;
+    struct Call { uint32_t owner, ret, target; };
+    std::vector<Call> direct;
+    for (const auto& f : p.an.functions) {
+        if (p.cfg.hle.count(f.entry)) continue;
+        for (uint32_t pc = f.entry; pc + 4 < f.end; pc += 4) {
+            uint32_t w = 0;
+            if (!p.img.word(pc, w) || !ppc::lk(w)) continue;
+            const auto* op = ppc::decode(w);
+            if (!op || (op->kind != ppc::Kind::BR && op->kind != ppc::Kind::BC && op->kind != ppc::Kind::BCLR && op->kind != ppc::Kind::BCCTR)) continue;
+            p.an.secondary[f.entry].insert(pc + 4);
+            if (op->kind == ppc::Kind::BR || op->kind == ppc::Kind::BC) {
+                const int32_t d = op->kind == ppc::Kind::BR ? ppc::li(w) : ppc::bd(w);
+                direct.push_back({f.entry, pc + 4, ppc::aa(w) ? uint32_t(d) : pc + uint32_t(d)});
+            }
+        }
+    }
+    const CrLive live = p.cr_opt ? analyze_cr(p) : CrLive{};
+    const Closed closed = analyze_closed(p, p.cr_opt ? &live : nullptr);
+    for (const Call& c : direct) {
+        if (!closed.fns.count(c.target) && !reg_helper(p, c.target).kind) continue;
+        if (auto j = jumped.find(c.owner); j != jumped.end() && j->second.count(c.ret)) continue;
+        auto& entries = p.an.secondary[c.owner];
+        entries.erase(c.ret);
+        if (entries.empty()) p.an.secondary.erase(c.owner);
+    }
 }
 
 }  // namespace uc

@@ -17,6 +17,7 @@ struct EmitStats {
     size_t reg_entry_loads = 0, reg_flushes = 0, reg_reloads = 0;                  // register-cache copies emitted
     size_t reg_leaf_calls = 0, reg_leaves = 0;                                     // calls that sync only what a leaf callee touches, such callees
     size_t mmio_sites = 0;                                                         // loads/stores from a hardware-register base (explicit MMIO test)
+    size_t fifo_runs = 0, fifo_run_stores = 0;                                     // runs of FIFO stores decided once (uc::gx_fifo_burst), their stores
 };
 
 struct Program {
@@ -52,11 +53,17 @@ struct CrHints {
     std::string flush, reload;
     std::map<uint32_t, std::string> edge;   // flush on the taken edge to an internal label (where the paths that meet there disagree)
     std::string not_taken;                  // a conditional call: flush on the path that skips the call
-    // A call of a leaf function: flush/reload sync only what it touches; when native code runs at its entry (UC_PLAIN_ENTRY false) the
-    // call takes the full_flush/full_reload form instead. after_call: an edge flush on the call's own path (both forms).
+    // A call of a closed function: flush/reload sync only what its call tree touches; when native code runs at the entry of a function in
+    // that tree (game_decl.h's uc_plain_tree_<leaf_tree> false) the call takes the full_flush/full_reload form instead. after_call: an edge
+    // flush on the call's own path (both forms).
     bool leaf_call = false;
+    uint32_t leaf_tree = 0;
     std::string full_flush, full_reload, after_call;
     bool io = false;   // a load/store whose base register may hold a hardware-register address: ppc::op_*<true> (explicit MMIO test)
+    // A store of a FIFO run (emit.cpp, fifo_runs): 1 = the run's first store, which decides the whole run (uc::gx_fifo_burst over
+    // fifo_bytes bytes in fifo_stores stores), 2 = a later one; each appends in place when the run was taken.
+    int fifo = 0;
+    uint32_t fifo_bytes = 0, fifo_stores = 0;
 };
 
 std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t word, EmitStats& st, const CrHints* hints = nullptr);

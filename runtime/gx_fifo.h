@@ -19,15 +19,30 @@ inline GxFifoWindow gx_fifo_window;
 inline bool gx_fifo_outside = true;
 inline uint8_t gx_fifo_raw_state = 0;
 inline uint64_t gx_fifo_outside_bytes = 0;   // guest baton writes; the statistics read it racily
-inline void gx_fifo_store(int size, uint32_t value) {
+// ppc::mmio_write's FIFO branch (platform.cpp): direct = the stores go to gx_fifo_store (no audit device watches them); the counts are
+// statistics ([detbench], the FIFO byte snapshot). Guest baton writes; readers read racily.
+inline bool gx_fifo_direct = false;
+inline uint64_t gx_fifo_direct_bytes = 0, gx_fifo_writes = 0;
+// Appends the size low bytes of value, most significant first; the window must have more than size bytes left.
+inline void gx_fifo_put(int size, uint32_t value) {
     auto& window = gx_fifo_window;
-    if (window.end - window.at > size) [[likely]] {
-        const uint32_t big = uc_bswap32(value << ((32 - 8 * size) & 31));   // the size low bytes of value, most significant first
-        std::memcpy(window.at, &big, 4);
-        window.at += size;
-        return;
-    }
+    const uint32_t big = uc_bswap32(value << ((32 - 8 * size) & 31));
+    std::memcpy(window.at, &big, 4);
+    window.at += size;
+}
+inline void gx_fifo_store(int size, uint32_t value) {
+    if (gx_fifo_window.end - gx_fifo_window.at > size) [[likely]] { gx_fifo_put(size, value); return; }
     if (gx_fifo_outside && !gx_fifo_raw_state && !(size == 1 && value == 0x40)) { gx_fifo_outside_bytes += uint32_t(size); return; }
     gx_fifo_write(size, value);
+}
+// A run of `stores` FIFO stores of `bytes` bytes in all that the translator found in one block (translator/emit.cpp, fifo runs), at its
+// first store: true when ea is the FIFO port, no audit watches it and the open window takes every byte of the run without a decision. The
+// run then appends each store with gx_fifo_put in place of the store, which is what mmio_write would do for each of them one at a time;
+// false: every store of the run takes the store path.
+inline bool gx_fifo_burst(uint32_t ea, uint32_t bytes, uint32_t stores) {
+    if (ea != 0xCC008000u || !gx_fifo_direct || gx_fifo_window.end - gx_fifo_window.at <= std::ptrdiff_t(bytes)) return false;
+    gx_fifo_writes += stores;
+    gx_fifo_direct_bytes += bytes;
+    return true;
 }
 }

@@ -31,7 +31,8 @@ std::string reg_field(int i, const std::string& ctx);
 }  // namespace uc
 
 namespace uc {
-// A translated function that cannot reach a safe point or another function (no calls, no loops, no indirect or tail branches): every
-// guest register it can load or store in the real context, and those it can store. A call of one only syncs those (translator/emit.cpp).
-struct LeafRegs { RegSet touched, written; };
+// A closed translated function: its whole call tree reaches no point where other code reads or replaces the thread's context (no HLE but
+// the leaf ones, no indirect call, no sc; loops are fine): every guest register the tree can load or store in the real context, and those
+// it can store. A call of one only syncs those (translator/emit.cpp). tree: the call-graph component whose uc_plain_tree_ constant guards it.
+struct LeafRegs { RegSet touched, written; uint32_t tree = 0; };
 }  // namespace uc

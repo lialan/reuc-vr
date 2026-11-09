@@ -5,6 +5,7 @@
 #include <utility>
 #include <cstring>
 #include "host_compat.h"
+#include "gx_fifo.h"
 #include "gx_write_watch.h"
 
 #define PPC_INLINE __attribute__((always_inline)) inline
@@ -372,7 +373,8 @@ template <bool IO = false> PPC_INLINE void op_lfd(Ctx& c, int t, int a, int32_t 
 template <bool IO = false> PPC_INLINE void op_lfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); c.f[t] = rdf64<IO>(c, e); c.r[a] = e; }
 template <bool IO = false> PPC_INLINE void op_lfdx(Ctx& c, int t, int a, int b) { c.f[t] = rdf64<IO>(c, ea_x(c, a, b)); }
 template <bool IO = false> PPC_INLINE void op_lfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.f[t] = rdf64<IO>(c, e); c.r[a] = e; }
-template <bool IO = false> PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4); if (stack_base(a)) wr32_stack(c, e, bits); else if (ram_base(a)) wr32_ram(c, e, bits); else wr32<IO>(c, e, bits); }
+PPC_INLINE uint32_t single_bits(double v) { const float f = float(v); uint32_t bits; std::memcpy(&bits, &f, 4); return bits; }   // stfs's value
+template <bool IO = false> PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const uint32_t bits = single_bits(c.f[t]); if (stack_base(a)) wr32_stack(c, e, bits); else if (ram_base(a)) wr32_ram(c, e, bits); else wr32<IO>(c, e, bits); }
 template <bool IO = false> PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
 template <bool IO = false> PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32<IO>(c, ea_x(c, a, b), float(c.f[t])); }
 template <bool IO = false> PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
