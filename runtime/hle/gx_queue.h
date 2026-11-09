@@ -51,8 +51,11 @@ public:
         new (at + sizeof(Header)) T(std::forward<F>(f));
         (void)header;
         tail_ += need; emitted_ += need;
-        current_->published.store(tail_, std::memory_order_seq_cst);   // seq_cst: pairs with the builder's sleeping_ store (no lost wake-up)
-        if (sleeping_.load(std::memory_order_seq_cst)) [[unlikely]] wake();
+        // Release, and a plain look at sleeping_: no store-load barrier, which made the guest thread wait for the command's stores to drain
+        // (after an SDK block copy, 1.6% of the guest thread in ResMeshDraw alone). A wake-up missed in the race with the builder going to
+        // sleep costs at most the builder's sleep timeout (loop()).
+        current_->published.store(tail_, std::memory_order_release);
+        if (sleeping_.load(std::memory_order_relaxed)) [[unlikely]] wake();
         if (emitted_ - done_.load(std::memory_order_relaxed) > kMaxBacklog) [[unlikely]] wait_until(emitted_ - kMaxBacklog / 2);
     }
     // emit() for a command that takes a run of bytes (copied after the capture): f(std::span<const std::byte>).
@@ -70,8 +73,8 @@ public:
         std::memcpy(at + sizeof(Header) + sizeof(T), &count, sizeof count);
         if (count) std::memcpy(at + sizeof(Header) + sizeof(T) + sizeof count, bytes, count);
         tail_ += uint32_t(need); emitted_ += need;
-        current_->published.store(tail_, std::memory_order_seq_cst);
-        if (sleeping_.load(std::memory_order_seq_cst)) [[unlikely]] wake();
+        current_->published.store(tail_, std::memory_order_release);   // as in emit()
+        if (sleeping_.load(std::memory_order_relaxed)) [[unlikely]] wake();
         if (emitted_ - done_.load(std::memory_order_relaxed) > kMaxBacklog) [[unlikely]] wait_until(emitted_ - kMaxBacklog / 2);
     }
     static constexpr uint32_t kMaxBytes = (1u << 20) - 4096;   // the most emit_bytes() takes

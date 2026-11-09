@@ -101,7 +101,10 @@ void CommandQueue::loop() {
         std::unique_lock lock(mutex_);
         sleeping_.store(true, std::memory_order_seq_cst);
         if (chunk->published.load(std::memory_order_seq_cst) != read || chunk->next.load(std::memory_order_seq_cst)) { sleeping_.store(false); continue; }
-        work_.wait(lock, [&] { return !sleeping_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed); });
+        // Timed: the front publishes without a store-load barrier, so it can miss this store of sleeping_ (gx_queue.h, emit); the builder then
+        // finds the command at the timeout instead of never.
+        work_.wait_for(lock, std::chrono::microseconds(500), [&] { return !sleeping_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed); });
+        sleeping_.store(false, std::memory_order_relaxed);
         idle = 0;
     }
 }

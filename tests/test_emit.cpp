@@ -310,5 +310,13 @@ int main() {
         CHECK(epilogue != std::string::npos && t.substr(epilogue, t.find('\n', epilogue) - epilogue).find("frame_note") == std::string::npos);
         CHECK(count("frame_note") == 3 && s3.frame_notes == 2 && s3.framed_stores == 5);
     }
+    {   // stmw from r1 is framed too: one framed store per register, and the range covers rS..r31
+        auto q = make_prog({stwu(1, -64, 1), D(47, 29, 1, 40), blr});   // stmw r29,40(r1)
+        uc::EmitStats s4{};
+        const std::string t = uc::emit_function(q, q.an.functions[0], s4);
+        auto has = [&](const char* text) { return t.find(text) != std::string::npos; };
+        CHECK(has("ppc::frame_note(c, 40, 52); const uint32_t e_ = c.r[1] + uint32_t(40); ppc::wr32_framed(c, e_ + 0u, c.r[29]);"));
+        CHECK(has("ppc::wr32_framed(c, e_ + 8u, c.r[31]);") && !has("ppc::wr32(c, e_"));
+    }
     return 0;
 }

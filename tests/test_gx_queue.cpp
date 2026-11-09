@@ -3,7 +3,10 @@
 #include "check.h"
 #include "gx_queue.h"
 #include "gx_watch_stamp.h"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -67,6 +70,24 @@ int main() {
         thrown = false;
         try { queue.emit([] {}, 1); } catch (const std::runtime_error&) { thrown = true; }
         CHECK(thrown);
+        queue.stop();
+    }
+    {   // a command emitted while the builder is going to sleep or asleep runs without a drain, soon (the front publishes without a
+        // store-load barrier; a wake-up it misses costs the builder's sleep timeout, never a hang)
+        gx::CommandQueue queue;
+        queue.start(nullptr, nullptr);
+        std::atomic<int> ran{0};
+        double worst_ms = 0;
+        for (int i = 0; i < 300; ++i) {
+            std::this_thread::sleep_for(std::chrono::microseconds(i % 3 == 0 ? 20 : i % 3 == 1 ? 150 : 900));   // around the builder's spin
+            const auto sent = std::chrono::steady_clock::now();
+            queue.emit([&] { ran.fetch_add(1, std::memory_order_release); }, 1);
+            while (ran.load(std::memory_order_acquire) != i + 1 && std::chrono::steady_clock::now() - sent < std::chrono::seconds(2)) std::this_thread::yield();
+            worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sent).count());
+            CHECK(ran.load() == i + 1);
+        }
+        std::printf("test_gx_queue: worst wake-up %.2f ms over 300 sleeps of the builder\n", worst_ms);
+        CHECK(worst_ms < 50);
         queue.stop();
     }
     std::puts("test_gx_queue: ok");

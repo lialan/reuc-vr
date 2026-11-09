@@ -245,7 +245,8 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
             std::string o = "const uint32_t e_ = " + (A ? "c.r[" + num(A) + "] + " : std::string()) + "uint32_t(" + num(ppc::simm(w)) + ");";
             for (uint32_t i = T; i < 32; ++i) {
                 const std::string at = "e_ + " + num(4 * (i - T)) + "u";
-                o += name == "lmw" ? " c.r[" + num(i) + "] = ppc::rd32(c, " + at + ");" : " ppc::wr32(c, " + at + ", c.r[" + num(i) + "]);";
+                o += name == "lmw" ? " c.r[" + num(i) + "] = ppc::rd32(c, " + at + ");"
+                                   : std::string(hints && hints->framed ? " ppc::wr32_framed(c, " : " ppc::wr32(c, ") + at + ", c.r[" + num(i) + "]);";
             }
             return o;
         }
@@ -911,12 +912,13 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         // such store lies in it) instead: at its entry and its secondary entries, after every call (a closed callee still polls), after every
         // instruction that writes r1, and in its polls' slow path. A rollback capture runs only while this thread sits at a safe point (a call
         // or a poll), so every page such a store writes is marked within the same stretch between two safe points, as the per-store barrier
-        // did. stwu, stmw and the indexed forms keep their own barrier.
+        // did. stwu and the indexed forms keep their own barrier.
         int32_t lo = INT32_MAX, hi = INT32_MIN;
         for (size_t i = 0; i < n; ++i) {
             const uint32_t w = words[i], opcd = w >> 26;
             if (!comment[i].empty() || hints[i].io || hints[i].fifo || ppc::a(w) != 1) continue;
-            const int32_t size = opcd == 36 || opcd == 52 ? 4 : opcd == 38 ? 1 : opcd == 44 ? 2 : opcd == 54 || opcd == 60 ? 8 : 0;
+            const int32_t size = opcd == 36 || opcd == 52 ? 4 : opcd == 38 ? 1 : opcd == 44 ? 2 : opcd == 54 || opcd == 60 ? 8
+                               : opcd == 47 ? int32_t(4 * (32 - ppc::t(w))) : 0;   // stmw: rS..r31
             if (!size) continue;
             const int32_t d = opcd == 60 ? int32_t(w << 20) >> 20 : ppc::simm(w);   // psq_st: a 12-bit displacement
             hints[i].framed = true;
