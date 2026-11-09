@@ -98,7 +98,12 @@ public:
     void set_foveation(int level);
     bool game_crosshair() const { return config_.settings.crosshair != 0; }   // the panel's "Game crosshair": the game's own reticle (off: the laser is the aim)
     int foveation_level() const { return config_.settings.foveation; }   // vr.cfg / the panel: the renderer's foveation map (0 off .. 3 high)
-    float render_scale() const { return config_.settings.render_scale; }   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
+    float render_scale() const { return config_.settings.render_scale; }
+    // The Display page, read live: edge smoothing in the screen pass (UC_XR_FXAA=0/1 forces it), coarse shading of the full-screen post
+    // passes over the scene copy (UC_POST_SHADING=full|coarse forces it), the fragment-only uniform identity for merging.
+    bool fxaa_on() const;
+    bool post_shading_coarse() const;
+    bool merge_frag_uniform() const { return config_.settings.merge != 0; }   // vr.cfg / the panel: the eyes' scene scale, 0 = native (the eye image's rows)
     // The panel changed the render scale since the last call: the renderer applies it at its next frame (no restart).
     bool take_render_scale_change() { const bool changed = render_scale_changed_; render_scale_changed_ = false; return changed; }
     void request_refresh(float hz);
@@ -149,7 +154,7 @@ private:
     VkSampler sampler_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline pipelines_[2]{};   // the screen pass without / with edge smoothing (fxaa_on)
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     struct Bound { VkImageView view, light, transmit, glow_light, glow_transmit; VkDescriptorSet set; };
     std::vector<Bound> bound_;

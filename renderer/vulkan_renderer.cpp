@@ -74,6 +74,23 @@ VkExtent2D bloom_shading_rate(const gx::DrawPacket& draw, VkExtent2D target, boo
     const auto axis=[](double scale) { return scale/4>=1.5 ? 4u : scale/2>=1.5 ? 2u : 1u; };
     return {axis(target.width/640.0),axis(target.height/480.0)};
 }
+// The Display page's "Post-effect shading: Coarse": a 2D draw outside the scene, drawn the same in both eyes, whose textures are all full-size
+// EFB copies (wider than the bloom chain's 320: the composite, the colour pass over the scene copy) or that has none (fades), shades 2x2
+// where an EFB pixel is at least 3 eye pixels' worth of guest detail on that axis (scale >= 3 a guest pixel, as at native); else 1x1. This
+// trades the scene copy's finest detail for fragment work: these passes redraw the whole picture. Text and the HUD (ordinary textures),
+// the reticle and late-aimed quads keep 1x1.
+VkExtent2D post_shading_rate(const gx::DrawPacket& draw, VkExtent2D target) {
+    const VkExtent2D full{1,1};
+    if (draw.reticle || draw.late_aim || draw.layer || draw.transforms->projection[3][3]==0) return full;
+    for (size_t map=0;map<8;++map) {
+        const auto& texture=draw_texture(draw,map);
+        if (!texture || texture->levels.empty()) continue;
+        if (!texture->gpu_only || texture->levels[0].width<=320) return full;
+    }
+    const auto axis=[](double scale) { return scale>=3 ? 2u : 1u; };
+    return {axis(target.width/640.0),axis(target.height/480.0)};
+}
+VkExtent2D coarser(VkExtent2D a, VkExtent2D b) { return {std::max(a.width,b.width),std::max(a.height,b.height)}; }
 void vk_check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: VkResult " + std::to_string(result));
 }
@@ -386,8 +403,9 @@ void VulkanRenderer::initialize(SDL_Window* window, bool validation, const std::
     constexpr bool kFragUniformDefault = false;
 #endif
     const char* frag_uniform_env = std::getenv("UC_MERGE_FRAG_UNIFORM");
-    frag_uniform_merge_ = xform_ && (frag_uniform_env && *frag_uniform_env ? std::strcmp(frag_uniform_env, "0") != 0 : kFragUniformDefault);
-    if (frag_uniform_merge_) std::fprintf(stderr, "[vr] fragment-only uniform identity for merging on\n");
+    frag_uniform_forced_ = frag_uniform_env && *frag_uniform_env;   // else the headset's Display page ("Draw merging", vr.cfg merge) decides live
+    frag_uniform_merge_ = xform_ && (frag_uniform_forced_ ? std::strcmp(frag_uniform_env, "0") != 0 : kFragUniformDefault);
+    if (frag_uniform_merge_) std::fprintf(stderr, "[vr] fragment-only uniform identity for merging on%s\n", frag_uniform_forced_ ? " (UC_MERGE_FRAG_UNIFORM)" : "");
     static_depth_ = layers_ > 1 && std::getenv("UC_STATIC_DEPTH");   // diagnostics: does dynamic depth state cost the tiler its LRZ?   // the headset's vertex pre-pass reads the vertices by address
     if (xform_) {
         features12.bufferDeviceAddress = VK_TRUE;
@@ -2485,6 +2503,21 @@ void VulkanRenderer::composite_particle_layer(VkCommandBuffer command) {
     barrier(command,efb_,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,all,any);
     barrier(command,particle_.color,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,all,any);
 }
+// Fragment-only uniform identity for merging: UC_MERGE_FRAG_UNIFORM when set, else on the headset the Display page's "Draw merging".
+bool VulkanRenderer::frag_uniform_merge() const {
+#ifdef UC_OPENXR
+    if (xr_ && xform_ && !frag_uniform_forced_) return xr_->merge_frag_uniform();
+#endif
+    return frag_uniform_merge_;
+}
+// Coarse post-effect shading (post_shading_rate): UC_POST_SHADING=full|coarse or the headset's Display page; off elsewhere.
+bool VulkanRenderer::post_shading_coarse() const {
+#ifdef UC_OPENXR
+    if (xr_) return xr_->post_shading_coarse();
+#endif
+    static const char* forced=std::getenv("UC_POST_SHADING");
+    return forced && std::strcmp(forced,"coarse")==0;
+}
 // The foveation level asked for: UC_VR_FOVEATION=0..3 (tests, the preview), else the headset's vr.cfg / settings panel.
 int VulkanRenderer::wanted_fovea_level() const {
     static const int forced=std::getenv("UC_VR_FOVEATION") ? std::atoi(std::getenv("UC_VR_FOVEATION")) : -1;
@@ -4041,6 +4074,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         // The pre-pass (xform_): consecutive draws that differ only in their vertices (same pipeline, textures, samplers, uniform block, eye
         // block, push constants, viewport, scissor; consecutive in the rebased index buffer) are one draw. UC_NO_MERGE=1: a draw each.
         static const bool no_merge=std::getenv("UC_NO_MERGE")!=nullptr;
+        const bool frag_uniform=frag_uniform_merge();   // the Display page's "Draw merging", once a pass
+        // A draw's own shading rate: the bloom chain's and world sprites' (bloom_shading_rate), and with the Display page's coarse post-effect
+        // shading the full-screen 2D passes over the scene copy (post_shading_rate).
+        const bool post_coarse=post_shading_coarse();
+        const auto draw_rate=[&](const gx::DrawPacket& draw,int stereo_kind,bool depth_write) {
+            const bool flat=!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL);
+            const VkExtent2D rate=bloom_shading_rate(draw,target.extent,flat,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),depth_write);
+            return post_coarse && flat ? coarser(rate,post_shading_rate(draw,target.extent)) : rate;
+        };
         // uber: a small-draw ubershader run (uber_merge.h), draws: how many draws it holds; merge: the ubershader pipeline every draw of the run
         // may take (null: not all may); pixels: the guest pixels its draws' screen boxes cover (the ubershader's fragments, an upper bound).
         struct Run { size_t d; VkPipeline pipeline; size_t set; DrawPush push; VkViewport viewport; VkRect2D scissor; uint32_t first, count, positions_end, attributes_end; VkExtent2D rate; bool fovea; bool table=false;
@@ -4278,7 +4320,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                         std::fprintf(stderr,"[tex-merge] packets %llu, overflows %llu, entries %llu, runs %llu, joins %llu, waiting %llu\n",(unsigned long long)table_packets_,(unsigned long long)table_overflows_,
                                      (unsigned long long)table_entries_,(unsigned long long)table_runs_,(unsigned long long)table_joins_,(unsigned long long)table_pending_);
                     table_packets_=table_overflows_=table_entries_=table_runs_=table_joins_=table_pending_=0;
-                    if (uber_small_scene_ || uber_small_hud_ || frag_uniform_merge_)   // the small-draw ubershader and the fragment-only uniform test over the same 2 s
+                    if (uber_small_scene_ || uber_small_hud_ || frag_uniform_merge())   // the small-draw ubershader and the fragment-only uniform test over the same 2 s
                         std::fprintf(stderr,"[uber-merge] EFB: ubershader runs %llu holding %llu draws, joins %llu, runs of small draws left on their own pipeline %llu, big draws %llu, waiting %llu; HUD layer: %llu draws in %llu runs, %llu ubershader runs holding %llu draws; fragment-uniform joins %llu; ubershader guest pixels %.0f; EFB ubershader draws of 0/1/2/3+ stages %llu/%llu/%llu/%llu, runs on the few-stage family %llu\n",
                                      (unsigned long long)uber_runs_,(unsigned long long)uber_draws_,(unsigned long long)uber_joins_,(unsigned long long)uber_singles_,(unsigned long long)uber_big_,(unsigned long long)uber_pending_,
                                      (unsigned long long)hud_layer_draws_,(unsigned long long)hud_layer_runs_,(unsigned long long)hud_uber_runs_,(unsigned long long)hud_uber_draws_,(unsigned long long)frag_uniform_joins_,uber_pixels_,
@@ -4308,7 +4350,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 push.motion=0;   // the stereo shaders read the eye block from the set, not this index
                 const auto& x=xform_draws[d];
                 Run run{d,particle_pass ? particle_pipeline(info.key) : info.choice.pipeline,set_index,push,draw_viewport,draw_scissor,x.first,info.index_count,x.positions+x.count,x.attributes+x.count*(x.word&255),
-                        set_shading_rate_ ? bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
+                        set_shading_rate_ ? draw_rate(draw,stereo_kind,(info.key[68]>>4)&1) : VkExtent2D{1,1},fovea_draw};
                 // The texture table: the draw's pipeline variant that reads its textures from the packet's table, once compiled (meanwhile the
                 // draw keeps its own). Not for the particle layer's pipelines, nor a draw whose second destination-alpha draw reads its own set.
                 // UC_TEX_MERGE_SKIP=<hex>[,<hex>...] (diagnostics): those callsites keep their own sets
@@ -4343,7 +4385,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // projection the draw vertex stage does not read, the destination-alpha flag, the bank) need not be equal
                 const auto same_uber_push=[](DrawPush a,DrawPush b) { a.projection=b.projection={}; a.palette=b.palette=a.current_row=b.current_row=a.indexed=b.indexed=a.alpha_pass=b.alpha_pass=a.bank=b.bank=0; return std::memcmp(&a,&b,sizeof a)==0; };
                 // the uniform blocks: the same block, or with UC_MERGE_FRAG_UNIFORM blocks equal where a fragment reads them (uber_merge.h)
-                const auto same_uniform=[&](size_t a,size_t b) { return set_keys[a][16]==set_keys[b][16] || (frag_uniform_merge_ && screen_refraction[a]==screen_refraction[b] && copy_dimensions[a]==copy_dimensions[b] && gx::fragment_uniforms_equal(*packet.draws[a].uniforms,*packet.draws[b].uniforms)); };
+                const auto same_uniform=[&](size_t a,size_t b) { return set_keys[a][16]==set_keys[b][16] || (frag_uniform && screen_refraction[a]==screen_refraction[b] && copy_dimensions[a]==copy_dimensions[b] && gx::fragment_uniforms_equal(*packet.draws[a].uniforms,*packet.draws[b].uniforms)); };
                 const bool same_textures=pending && std::equal(set_keys[pending->set].begin(),set_keys[pending->set].begin()+16,set_keys[run.set].begin());
                 // the sets: equal (textures, samplers, uniform block), or for two table runs the uniform block alone (the textures are in the table)
                 // Lazily (run.table_pipeline): a run on its folded modules moves onto the table (table_moves) when the next draw has the same key and
@@ -4415,7 +4457,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 continue;
             }
             if (set_shading_rate_) {
-                const VkExtent2D rate=bloom_shading_rate(draw,target.extent,!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_PASS || stereo_kind==LG_STEREO_FILL),!scene && (stereo_kind<0 || stereo_kind==LG_STEREO_WORLD),(info.key[68]>>4)&1);
+                const VkExtent2D rate=draw_rate(draw,stereo_kind,(info.key[68]>>4)&1);
                 apply_rate(rate,fovea_draw);
                 static const bool rate_stats=std::getenv("UC_GPU_PACKETS")!=nullptr;
                 if (rate_stats) {

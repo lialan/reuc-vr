@@ -576,7 +576,9 @@ private:
     // runs join draws of different TEV setups, uniform blocks and textures. A draw moves onto it only to join a run it could not join
     // otherwise: a run of one draw, or of draws that join anyway, keeps its folded module.
     // frag_uniform_merge_ (UC_MERGE_FRAG_UNIFORM=1): runs join draws whose uniform blocks differ only where no fragment reads them.
-    bool uber_small_scene_ = false, uber_small_hud_ = false, frag_uniform_merge_ = false;
+    bool uber_small_scene_ = false, uber_small_hud_ = false, frag_uniform_merge_ = false, frag_uniform_forced_ = false;
+    bool frag_uniform_merge() const;   // frag_uniform_merge_, or live from the headset's Display page
+    bool post_shading_coarse() const;  // the Display page's "Post-effect shading" (post_shading_rate)
     float uber_max_pixels_ = 0;
     VkDescriptorSetLayout merge_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout merge_layout_ = VK_NULL_HANDLE;

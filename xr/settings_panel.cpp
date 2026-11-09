@@ -25,7 +25,7 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
         int row=-1;const bool read=std::fscanf(command,"%d",&row)==1;std::fclose(command);
         if(std::remove(action_file)==0 && read) {
             effects|=xp_choose(&panel_,&cfg,&hand,row,rates.data(),int(rates.size()));
-            std::fprintf(stderr,"[xr-panel-test] row %d effects %u scale %.3g foveation %d\n",row,effects,cfg.render_scale,cfg.foveation);
+            std::fprintf(stderr,"[xr-panel-test] page %d row %d effects %u scale %.3g foveation %d fxaa %d post %d merge %d\n",panel_.page,row,effects,cfg.render_scale,cfg.foveation,cfg.fxaa,cfg.post_shading,cfg.merge);
         }
     }
     float head[3];for(int i=0;i<3;++i)head[i]=.5f*(scene.overlay_eyes()[0][i]+scene.overlay_eyes()[1][i]);
@@ -41,7 +41,7 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
             const float forward[]={0,0,-1};float direction[3],hit[3],u,v;
             lg_stereo_rotate(sample.pose[h].orientation.data(),forward,direction);
             const bool on=xp_hit(&panel_,sample.pose[h].position.data(),direction,&u,&v,hit);
-            const int row=on?xm_row_at(u,v,XP_COUNT):-1;
+            const int row=on?xm_row_at(u,v,xp_count(&panel_)):-1;
             if((on||(!pl&&!dual))&&row!=panel_.hover){panel_.hover=row;panel_.dirty=1;}
             if(!fake_&&row>=0&&sample.buttons.trigger[h]&&!previous_trigger_[h])effects|=xp_choose(&panel_,&cfg,&hand,row,rates.data(),int(rates.size()));
         }
@@ -70,8 +70,8 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
             gun.beam=1;gun.dot=on;gun.flash=0;
             for(int i=0;i<3;++i)gun.end[i]=on?hit[i]:gun.gun_p[i]+direction[i]*5;
         }
-        if(panel_.dirty){XmItem items[XP_COUNT];xp_items(&panel_,&cfg,input.gun_hand(),scene.head_locked(),height_,width_,items);
-            xm_paint(panel_pixels_.data(),title_.c_str(),items,XP_COUNT,panel_.hover,"Point and pull the trigger. Menu button: close.");
+        if(panel_.dirty){XmItem items[XP_MAX_ROWS];xp_items(&panel_,&cfg,input.gun_hand(),scene.head_locked(),height_,width_,items);
+            xm_paint(panel_pixels_.data(),title_.c_str(),items,xp_count(&panel_),panel_.hover,"Point and pull the trigger. Menu button: close.");
             panel_.dirty=0;panel_dirty_=true;}
     }
     if(cfg.show_stats) {

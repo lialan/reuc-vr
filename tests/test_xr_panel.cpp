@@ -1,0 +1,67 @@
+// The headset settings panel's Display page (xr/xr_panel.c) and the vr.cfg keys it edits (xr/xr_settings.c): rows, toggles, paging,
+// save and load. The vr.cfg migrations of the Quest build (__ANDROID__) are not compiled here.
+#include "xr_panel.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+int main() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("test_xr_panel_" + std::to_string(std::rand()));
+    fs::create_directories(dir);
+    fs::current_path(dir);   // xr_settings_save / _load use ./vr.cfg
+
+    LgXrSettings cfg = LG_XR_SETTINGS_DEFAULT;
+    CHECK(cfg.version == LG_XR_SETTINGS_VERSION);
+    CHECK(cfg.fxaa == LG_XR_DEFAULT_FXAA && cfg.post_shading == 0 && cfg.merge == 1);
+
+    XpPanel panel{}; panel.open = 1; int hand = 1;
+    XmItem items[XP_MAX_ROWS];
+    CHECK(xp_count(&panel) == XP_COUNT);
+    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
+    CHECK(std::strcmp(items[XP_DISPLAY].label, "Display") == 0);
+
+    // Display opens the page without saving; its rows toggle and save
+    CHECK(xp_choose(&panel, &cfg, &hand, XP_DISPLAY, nullptr, 0) == 0);
+    CHECK(panel.page == 1 && xp_count(&panel) == XD_COUNT);
+    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
+    CHECK(std::strcmp(items[XD_FOVEATION].label, "Foveation") == 0 && std::strcmp(items[XD_BACK].label, "Back") == 0);
+    const int fxaa = cfg.fxaa;
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_FXAA, nullptr, 0) == XP_SAVE && cfg.fxaa == !fxaa);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_POST, nullptr, 0) == XP_SAVE && cfg.post_shading == 1);
+    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
+    CHECK(std::strcmp(items[XD_POST].value, "Coarse (faster)") == 0);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_MERGE, nullptr, 0) == XP_SAVE && cfg.merge == 0);
+    const int level = cfg.foveation;
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_FOVEATION, nullptr, 0) == (XP_SAVE | XP_FOVEATION_CHANGED) && cfg.foveation == (level + 1) % 4);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_SCALE, nullptr, 0) & XP_SCALE_CHANGED);
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_COUNT, nullptr, 0) == 0);   // past the page's rows
+
+    // Back returns to the main rows; closing and reopening starts on them too
+    CHECK(xp_choose(&panel, &cfg, &hand, XD_BACK, nullptr, 0) == 0 && panel.page == 0);
+    xp_choose(&panel, &cfg, &hand, XP_DISPLAY, nullptr, 0);
+    CHECK(xp_menu_button(&panel, 1, 0) && !panel.open);
+    CHECK(xp_menu_button(&panel, 1, 0) && panel.open && panel.page == 0);
+
+    // the new keys survive vr.cfg
+    xr_settings_save(&cfg);
+    LgXrSettings loaded = LG_XR_SETTINGS_DEFAULT;
+    xr_settings_load(&loaded);
+    CHECK(loaded.fxaa == cfg.fxaa && loaded.post_shading == 1 && loaded.merge == 0 && loaded.foveation == cfg.foveation);
+    LgXrSettings parsed = LG_XR_SETTINGS_DEFAULT;
+    xr_settings_set(&parsed, "fxaa", "off"); xr_settings_set(&parsed, "post_shading", "coarse"); xr_settings_set(&parsed, "merge", "off");
+    CHECK(parsed.fxaa == 0 && parsed.post_shading == 1 && parsed.merge == 0);
+    xr_settings_set(&parsed, "fxaa", "on"); xr_settings_set(&parsed, "post_shading", "full"); xr_settings_set(&parsed, "merge", "on");
+    CHECK(parsed.fxaa == 1 && parsed.post_shading == 0 && parsed.merge == 1);
+
+    fs::current_path(fs::temp_directory_path());
+    fs::remove_all(dir);
+    if (failures) return 1;
+    std::puts("test_xr_panel: ok");
+    return 0;
+}

@@ -10,6 +10,10 @@ typedef struct {
     int foveation;              /* 0 off, 1 low, 2 medium, 3 high: Umbrella Chronicles' foveated shading of its own picture (renderer/fovea_map.h) */
     int version;                /* vr.cfg's defaults generation (2: Umbrella Chronicles' Quest eye size) */
     float render_scale;         /* Umbrella Chronicles: the eyes' scene scale (720p multiplier), 0 = native (the eye image's rows); applied live */
+    /* The panel's Display page (Umbrella Chronicles), all applied live: */
+    int fxaa;                   /* vr.cfg "fxaa on|off": edge smoothing in the screen pass that puts the picture into the eye images */
+    int post_shading;           /* vr.cfg "post_shading full|coarse": coarse (2x2) shading of the full-screen post passes over the scene copy */
+    int merge;                  /* vr.cfg "merge on|off": draws whose uniform blocks differ only where no fragment reads them join one draw */
 } LgXrSettings;
 /* The settings panel's render scales after native, largest first */
 #define LG_XR_RENDER_SCALES {2.75f,2.5f,2.25f,2.0f,1.5f,1.25f,1.0f}
@@ -33,9 +37,12 @@ typedef struct {
 /* Version 11: restore image quality. The 1080-row scene, reduced eye images and
  * high foveation visibly blurred the 3D view. Native removes both resizes; lower
  * render scales remain explicit choices. Version 12 enables medium foveation. */
+/* Version 13: high foveation and no screen-pass FXAA on the Quest (GPU time; both on the Display page). */
 #if defined(__ANDROID__)
-#define LG_XR_DEFAULT_FOVEATION 2
+#define LG_XR_DEFAULT_FOVEATION 3
+#define LG_XR_DEFAULT_FXAA 0
 #else
+#define LG_XR_DEFAULT_FXAA 1
 #define LG_XR_DEFAULT_FOVEATION 3
 #endif
 #define LG_XR_DEFAULT_WIDTH  LG_XR_NATIVE_WIDTH
@@ -52,8 +59,9 @@ typedef struct {
  * fight holds 60 */
 #define LG_XR_DEFAULT_REFRESH 90
 /* game crosshair shown again (version 10): with it hidden the owner could not aim properly by the laser alone */
-/* Version 12: medium foveation by default, retaining native eye/scene size. */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,12,LG_XR_DEFAULT_RENDER_SCALE}
+/* Version 12: medium foveation by default, retaining native eye/scene size. Version 13: high foveation, FXAA off (Quest). */
+#define LG_XR_SETTINGS_VERSION 13
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);

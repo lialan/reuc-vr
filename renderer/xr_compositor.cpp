@@ -280,11 +280,11 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EyeConstants)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout_; layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
     vk(vkCreatePipelineLayout(device_, &layout, nullptr, &layout_), "pipeline layout");
-    // xr_screen.slang constant 0: edge smoothing as the picture is magnified onto the eye (UC_XR_FXAA=0 turns it off, for comparison)
-    const uint32_t fxaa = [] { const char* v = std::getenv("UC_XR_FXAA"); return v && *v == '0' ? 0u : 1u; }();
+    // xr_screen.slang constant 0: edge smoothing as the picture is magnified onto the eye. Two pipelines, without and with it: the Display
+    // page's "Edge smoothing" (vr.cfg fxaa) picks one each frame; UC_XR_FXAA=0 / 1 forces one (tests).
+    uint32_t fxaa = 0;
     const VkSpecializationMapEntry fxaa_entry{0, 0, sizeof(uint32_t)};
     const VkSpecializationInfo fxaa_info{1, &fxaa_entry, sizeof fxaa, &fxaa};
-    std::fprintf(stderr, "[vulkan-xr] screen pass edge smoothing %s\n", fxaa ? "on" : "off");
     const VkPipelineShaderStageCreateInfo stages[] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex_, "vertexMain", nullptr},
                                                       {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment_, "fragmentMain", &fxaa_info}};
     VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -308,7 +308,7 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     VkPipelineFragmentShadingRateStateCreateInfoKHR rate{VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
     rate.fragmentSize = {1, 1}; rate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
     if (fovea_support_) { rate.pNext = rendering.pNext; rendering.pNext = &rate; pipeline.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR; }
-    vk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_), "screen pipeline");
+    for (fxaa = 0; fxaa < 2; ++fxaa) vk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipelines_[fxaa]), "screen pipeline");
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 160}, {VK_DESCRIPTOR_TYPE_SAMPLER, 32}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets = 32; pool.poolSizeCount = 2; pool.pPoolSizes = sizes;
     vk(vkCreateDescriptorPool(device_, &pool, nullptr, &pool_), "descriptor pool");
@@ -532,6 +532,15 @@ void XrCompositor::finish_input() {
     for (int h = 0; h < 2; ++h) if (haptics[h].milliseconds) rumble(h, haptics[h].amplitude, haptics[h].milliseconds);
 }
 
+bool XrCompositor::fxaa_on() const {
+    static const char* forced = std::getenv("UC_XR_FXAA");
+    return forced && *forced ? *forced != '0' : config_.settings.fxaa != 0;
+}
+bool XrCompositor::post_shading_coarse() const {
+    static const char* forced = std::getenv("UC_POST_SHADING");
+    return forced && *forced ? std::strcmp(forced, "coarse") == 0 : config_.settings.post_shading != 0;
+}
+
 std::optional<std::array<float,2>> XrCompositor::aim_pointer() const {
     if (!controller_aim_enabled_) return std::nullopt;
     const auto& aims=controls_.aims(); const auto& ray=aims.ray[0];
@@ -605,7 +614,7 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
         rendering.pNext = &rate;
     }
     vkCmdBeginRendering(command, &rendering);
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines_[fxaa_on() ? 1 : 0]);
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &set, 0, nullptr);
     const VkViewport viewport{0, 0, float(width_), float(height_), 0, 1}; const VkRect2D scissor{{0, 0}, {width_, height_}};
     vkCmdSetViewport(command, 0, 1, &viewport); vkCmdSetScissor(command, 0, 1, &scissor);
@@ -712,7 +721,7 @@ void XrCompositor::detach() {
         overlay_.shutdown();
         for (auto view : views_array_) vkDestroyImageView(device_, view, nullptr);
         if (pool_) vkDestroyDescriptorPool(device_, pool_, nullptr);
-        if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
+        for (auto pipeline : pipelines_) if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
         if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
         if (set_layout_) vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
         if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
@@ -720,7 +729,7 @@ void XrCompositor::detach() {
         if (fragment_) vkDestroyShaderModule(device_, fragment_, nullptr);
     }
     views_array_.clear(); images_.clear(); bound_.clear();
-    pool_ = VK_NULL_HANDLE; pipeline_ = VK_NULL_HANDLE; layout_ = VK_NULL_HANDLE; set_layout_ = VK_NULL_HANDLE; sampler_ = VK_NULL_HANDLE; vertex_ = fragment_ = VK_NULL_HANDLE;
+    pool_ = VK_NULL_HANDLE; pipelines_[0] = pipelines_[1] = VK_NULL_HANDLE; layout_ = VK_NULL_HANDLE; set_layout_ = VK_NULL_HANDLE; sampler_ = VK_NULL_HANDLE; vertex_ = fragment_ = VK_NULL_HANDLE;
     if (profile_ && destroy_profile_) destroy_profile_(profile_); profile_ = XR_NULL_HANDLE;
     if (swapchain_) xrDestroySwapchain(swapchain_); swapchain_ = XR_NULL_HANDLE;
     if (space_) xrDestroySpace(space_); space_ = XR_NULL_HANDLE;

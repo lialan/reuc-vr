@@ -18,6 +18,7 @@ void xr_settings_save(const LgXrSettings *c)
             FOVEATION_NAME[c->foveation < 0 || c->foveation > 3 ? 3 : c->foveation], c->version);
     if (c->render_scale > 0) fprintf(f, "render_scale %g\n", c->render_scale);
     else fprintf(f, "render_scale native\n");
+    fprintf(f, "fxaa %s\npost_shading %s\nmerge %s\n", c->fxaa ? "on" : "off", c->post_shading ? "coarse" : "full", c->merge ? "on" : "off");
     fclose(f);
 }
 
@@ -68,8 +69,13 @@ void xr_settings_load(LgXrSettings *c)
     }
     /* Upgrade the old off default once; a subsequent explicit Off is retained. */
     if (c->version < 12 && c->foveation == 0) c->foveation = LG_XR_DEFAULT_FOVEATION;
+    /* Version 13 (GPU time): the medium default moves to high once, FXAA goes off once; later choices on the Display page are kept. */
+    if (c->version < 13) {
+        if (c->foveation == 2) c->foveation = LG_XR_DEFAULT_FOVEATION;
+        c->fxaa = LG_XR_DEFAULT_FXAA;
+    }
 #endif
-    c->version = 12;
+    c->version = LG_XR_SETTINGS_VERSION;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
     const char *e = getenv("LINDBERGH_XR_SET");
     while (e && *e) {
@@ -113,6 +119,9 @@ void xr_settings_set(LgXrSettings *c,const char *key,const char *val)
             const float scale = !strcmp(val, "native") ? 0.0f : (float)atof(val);
             c->render_scale = scale >= 0.5f && scale <= 6.0f ? scale : 0.0f;
         }
+        else if (!strcmp(key, "fxaa")) c->fxaa = strcmp(val, "off") != 0;
+        else if (!strcmp(key, "post_shading")) c->post_shading = !strcmp(val, "coarse");
+        else if (!strcmp(key, "merge")) c->merge = strcmp(val, "off") != 0;
         else if (!strcmp(key, "foveation")) {
             for (int i = 0; i < 4; i++) if (!strcmp(val, FOVEATION_NAME[i])) c->foveation = i;
         }

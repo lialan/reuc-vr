@@ -4,13 +4,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+int xp_count(const XpPanel *menu) { return menu->page ? XD_COUNT : XP_COUNT; }
+static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
+{
+    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Post-effect shading", "Draw merging", "Back" };
+    for (int i = 0; i < XD_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
+    char res[24];
+    if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
+    else snprintf(res, sizeof res, "%d", cfg->resolution);
+    if (cfg->resolution == running_resolution && cfg->width == running_width) snprintf(it[XD_RES].value, 40, "%s", res);
+    else snprintf(it[XD_RES].value, 40, "%s (on restart)", res);
+    /* the eyes' scene: native is the eye image's rows (720 at 1x), e.g. 3.07x for the Quest 3's 2208 */
+    if (cfg->render_scale > 0) snprintf(it[XD_SCALE].value, 40, "%.3gx", cfg->render_scale);
+    else snprintf(it[XD_SCALE].value, 40, "Native (%.2fx)", running_resolution / 720.0);
+    static const char *const foveation[] = { "Off", "Low", "Medium", "High" };
+    snprintf(it[XD_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 3 : cfg->foveation]);
+    snprintf(it[XD_FXAA].value, 40, "%s", cfg->fxaa ? "FXAA" : "Off");
+    snprintf(it[XD_POST].value, 40, "%s", cfg->post_shading ? "Coarse (faster)" : "Full");
+    snprintf(it[XD_MERGE].value, 40, "%s", cfg->merge ? "On" : "Off");
+}
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
+    if (menu->page) { display_items(cfg, running_resolution, running_width, it); return; }
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[XP_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show stats", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
-        "Render scale", "Foveation", "Recentre view", "Reset game", "Close" };
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show stats", "Screen distance", "HUD position", "Display rate", "Display",
+        "Recentre view", "Reset game", "Close" };
     for (int i = 0; i < XP_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     snprintf(it[XP_SIGHT].value, 40, "%s", sight[cfg->sight]);
     snprintf(it[XP_LASER].value, 40, "%s", laser[cfg->laser]);
@@ -25,23 +45,35 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     else if (cfg->hud_pitch == 0) snprintf(it[XP_HUD].value, 40, "Centre");
     else snprintf(it[XP_HUD].value, 40, "%s %d deg", cfg->hud_pitch < 0 ? "Down" : "Up", abs(cfg->hud_pitch));
     snprintf(it[XP_RATE].value, 40, "%d Hz", cfg->refresh);
-    char res[24];
-    if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
-    else snprintf(res, sizeof res, "%d", cfg->resolution);
-    if (cfg->resolution == running_resolution && cfg->width == running_width) snprintf(it[XP_RES].value, 40, "%s", res);
-    else snprintf(it[XP_RES].value, 40, "%s (on restart)", res);
-    /* the eyes' scene: native is the eye image's rows (720 at 1x), e.g. 3.07x for the Quest 3's 2208 */
-    if (cfg->render_scale > 0) snprintf(it[XP_SCALE].value, 40, "%.3gx", cfg->render_scale);
-    else snprintf(it[XP_SCALE].value, 40, "Native (%.2fx)", running_resolution / 720.0);
-    static const char *const foveation[] = { "Off", "Low", "Medium", "High" };
-    snprintf(it[XP_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 3 : cfg->foveation]);
+    snprintf(it[XP_DISPLAY].value, 40, ">");
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }
 
-
+static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
+{
+    unsigned effects=XP_SAVE;
+    switch(item) {
+    case XD_RES:{/* smaller sizes at the headset's proportions, then its panel */
+        static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{LG_XR_NATIVE_WIDTH,LG_XR_NATIVE_HEIGHT}};int k=0;
+        while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
+        cfg->width=sizes[k%5][0];cfg->resolution=sizes[k%5][1];break;}
+    case XD_SCALE:{/* native, then smaller scales; back to native */
+        static const float scales[LG_XR_RENDER_SCALE_COUNT]=LG_XR_RENDER_SCALES;int k=0;
+        if(cfg->render_scale>0){while(k<LG_XR_RENDER_SCALE_COUNT&&scales[k]>=cfg->render_scale-.001f)++k;}
+        cfg->render_scale=k<LG_XR_RENDER_SCALE_COUNT?scales[k]:0;effects|=XP_SCALE_CHANGED;break;}
+    case XD_FOVEATION:cfg->foveation=(cfg->foveation+1)%4;effects|=XP_FOVEATION_CHANGED;break;
+    case XD_FXAA:cfg->fxaa=!cfg->fxaa;break;
+    case XD_POST:cfg->post_shading=!cfg->post_shading;break;
+    case XD_MERGE:cfg->merge=!cfg->merge;break;
+    case XD_BACK:p->page=0;p->hover=-1;effects=0;break;
+    default:return 0;
+    }
+    p->dirty=1;return effects;
+}
 unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *rates,int nrates)
 {
-    if(item<0||item>=XP_COUNT)return 0;
+    if(item<0||item>=xp_count(p))return 0;
+    if(p->page){p->reset_armed=0;return display_choose(p,cfg,item);}
     static const float screens[]={2,2.5f,3,4,5};const int armed=p->reset_armed;
     unsigned effects=XP_SAVE;p->reset_armed=0;
     switch(item) {
@@ -55,15 +87,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     case XP_SCREEN:{int k=0;while(k<5&&screens[k]<=cfg->screen+.01f)++k;cfg->screen=screens[k%5];effects|=XP_SCREEN_CHANGED;break;}
     case XP_HUD:{static const int pitches[]={0,-10,-20,-30,10};int k=0;while(k<5&&pitches[k]!=cfg->hud_pitch)++k;cfg->hud_pitch=pitches[(k+1)%5];effects|=XP_HUD_CHANGED;break;}
     case XP_RATE:if(nrates){int k=0;while(k<nrates&&rates[k]<=cfg->refresh+.5f)++k;cfg->refresh=(int)(rates[k%nrates]+.5f);effects|=XP_RATE_CHANGED;}break;
-    case XP_RES:{/* smaller sizes at the headset's proportions, then its panel */
-        static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{LG_XR_NATIVE_WIDTH,LG_XR_NATIVE_HEIGHT}};int k=0;
-        while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
-        cfg->width=sizes[k%5][0];cfg->resolution=sizes[k%5][1];break;}
-    case XP_SCALE:{/* native, then smaller scales; back to native */
-        static const float scales[LG_XR_RENDER_SCALE_COUNT]=LG_XR_RENDER_SCALES;int k=0;
-        if(cfg->render_scale>0){while(k<LG_XR_RENDER_SCALE_COUNT&&scales[k]>=cfg->render_scale-.001f)++k;}
-        cfg->render_scale=k<LG_XR_RENDER_SCALE_COUNT?scales[k]:0;effects|=XP_SCALE_CHANGED;break;}
-    case XP_FOVEATION:cfg->foveation=(cfg->foveation+1)%4;effects|=XP_FOVEATION_CHANGED;break;
+    case XP_DISPLAY:p->page=1;p->hover=-1;effects=0;break;
     case XP_RECENTRE:effects|=XP_RECENTER;break;
     case XP_RESET:if(!armed)p->reset_armed=1;else effects|=XP_RESTART;break;
     case XP_CLOSE:p->open=0;break;
@@ -92,7 +116,7 @@ void xp_matrix(const XpPanel *p,float model[16])
 {
     memset(model,0,64);for(int i=0;i<3;++i){model[i]=p->right[i]*p->hw;model[4+i]=p->up[i]*p->hh;model[8+i]=p->n[i];model[12+i]=p->c[i];}model[15]=1;
 }
-static void toggle(XpPanel *p){p->open=!p->open;p->reset_armed=0;if(p->open){p->hover=-1;p->dirty=1;}}
+static void toggle(XpPanel *p){p->open=!p->open;p->reset_armed=0;p->page=0;if(p->open){p->hover=-1;p->dirty=1;}}
 int xp_menu_button(XpPanel *p,int pressed,int previous){if(!pressed||previous)return 0;toggle(p);return 1;}
 int xp_hold_button(XpPanel *p,int pressed,int previous,int dual,int64_t time,int64_t *held)
 {
