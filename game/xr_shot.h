@@ -18,9 +18,22 @@ private:
     int exceptions_=0;
     std::optional<TrackedRay> ray_;
 };
+// The segment query 801C7800 from the pointer's ray (800F2B00) and from the item pickup (801AB354): along the VR controller's ray.
+class XrPickScope {
+public:
+    explicit XrPickScope(ppc::Ctx&);
+    ~XrPickScope() noexcept(false);
+    XrPickScope(const XrPickScope&)=delete;
+private:
+    ppc::Ctx& c_;
+    int exceptions_=0;
+    uint32_t start_=0;
+    std::array<float,3> saved_{};
+};
 struct NoXrShotScope {};
 template<uint32_t entry> auto xr_shot_scope(ppc::Ctx& c) {
     if constexpr(entry==0x80069210u) return XrShotScope(c);
+    else if constexpr(entry==0x801C7800u) return XrPickScope(c);
     else return NoXrShotScope{};
 }
 }
