@@ -60,8 +60,14 @@ typedef struct {
 #define LG_XR_DEFAULT_REFRESH 90
 /* game crosshair shown again (version 10): with it hidden the owner could not aim properly by the laser alone */
 /* Version 12: medium foveation by default, retaining native eye/scene size. Version 13: high foveation, FXAA off (Quest). */
-#define LG_XR_SETTINGS_VERSION 13
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,1,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1}
+/* Version 14: the gun model hidden on the Quest (GPU time: the present pass 1.8-2.1 -> 1.4-1.5 ms in r020; Gun model on the main page). */
+#if defined(__ANDROID__)
+#define LG_XR_DEFAULT_SHOW_GUN 0
+#else
+#define LG_XR_DEFAULT_SHOW_GUN 1
+#endif
+#define LG_XR_SETTINGS_VERSION 14
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,LG_XR_DEFAULT_SHOW_GUN,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);

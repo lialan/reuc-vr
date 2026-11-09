@@ -74,6 +74,8 @@ void xr_settings_load(LgXrSettings *c)
         if (c->foveation == 2) c->foveation = LG_XR_DEFAULT_FOVEATION;
         c->fxaa = LG_XR_DEFAULT_FXAA;
     }
+    /* Version 14 (GPU time): the gun model goes off once; Gun model on the main page brings it back and that choice is kept. */
+    if (c->version < 14) c->show_gun = LG_XR_DEFAULT_SHOW_GUN;
 #endif
     c->version = LG_XR_SETTINGS_VERSION;
     /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
