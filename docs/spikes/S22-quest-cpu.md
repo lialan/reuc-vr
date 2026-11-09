@@ -60,3 +60,31 @@ has not been timed.
 The guest's own work per frame (~14 ms average in the fight, more in its heaviest moments) plus the remaining builder tail. Next, by size:
 the translated code (68%, flat: translator work such as inlining the SDK vector math at its call sites), GX recording (~9%: display lists
 re-recorded every frame, S17), the render thread (~11 ms a frame recording, now off the critical path) and the gx-builder.
+
+## 5. Collision natives (2026-11-09)
+
+The fight window's biggest translated cluster was the game's sphere-against-triangle collision: `fn_801371B4` (Ericson's closest point on a
+triangle, up to eleven SDK vector calls on stack temporaries, 4.8% self) and its caller `fn_80197AC8` (the sphere test), with their
+PSQUATDotProduct / PSVECSubtract / Scale / Add calls (~3%). Both are now natives (`hle_ClosestPtTriangle`, `hle_SphereTriangleHit` in
+`runtime/hle/sdk_math.cpp`) on locals with the same rounding, comparisons and dead frame bytes (the game reads stale stack slots), and the
+translator keeps them partial-sync calls (`leaf_hle` in emit.cpp). The reference in `tests/test_sdk_math_hle.cpp` is the translated code
+itself (generated out of the lifted functions, every call in its partial-sync form): 0 mismatches in 30000 randomised runs over all seven
+regions and 5622 sphere hits; a missing frame store or the missing ps1 rounding of the f26..f31 restores fails it.
+
+fightmac guest memory identical over 307 retraces. Quest fightvr replay (alternating, same 2,177,981 draws): guest 21834 / 21951 Mcycles
+before, 21327 / 21405 after (**-2.4%**); the native still costs 2.8% of the guest thread (it runs per triangle of the query).
+
+## 6. Where the guest thread goes now, and where live frames are lost
+
+The earlier profiles left a quarter of the samples unnamed: simpleperf's report does not read local symbols (static `body_*` functions,
+anonymous-namespace helpers). `llvm-symbolizer` on the unstripped library names them (outermost inline frame): translated code is **58%** of
+the guest thread, GX recording 9.6%, NW4R draw HLEs (`hle_Res*`) 7.7%, libc 4.6% (memcpy 2.6%), SDK math 2%. The hottest function is
+`fn_80378090` (NW4R material apply, 4.8% with what ThinLTO inlined into it), then the new native (2.8%), `fn_80187018` (box against
+triangle, 2.75%, the sphere native inlined), `fn_803949B8` 2.2%, `fn_80045B20` (a bounding-box tree walk, 2.1%). In the replay
+`hle_ResMeshDraw` reads the clock twice per mesh (`CallTimer`, `--profile` only): live play does not pay that.
+
+Live train fight (`uctest run fight --quest`, 30 s): at the harness's default eye images (2064x2208) the GPU is 99% busy (~50 fps); at the
+owner's 1603x1680 (`--quest-set LINDBERGH_XR_SET=width=1603,resolution=1680`) both d7b2e40 and this build hold 60 fps (59.7 / 60.0 mean,
+GPU 81-84%). The owner's slowdown (session s2, chapter 1 room r002, t=65-70 s) is draw-bound: draws go from ~28k to ~73k a second and the
+guest main thread's baton time from ~9 to ~14 ms a present (all guest threads share the baton, ~19 ms with the others). The per-draw guest
+work (GX recording, the Res* HLEs, the material apply) is what is left to shrink there.
