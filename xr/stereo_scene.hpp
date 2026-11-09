@@ -27,7 +27,9 @@ struct StereoPose {
     std::array<float,3> position{};
     std::array<float,4> tangents{1,1,1,1};
 };
-struct StereoRay {std::array<float,3> origin{},direction{};int x=-100000,y=-100000;float reach=0;};
+// x/y: the aim's pixel on the width x height picture of the screen plane. In the world (not on_hud) a ray past the picture still aims, at
+// the picture's edge with on_screen false: the shot follows the controller's own ray (game/xr_shot.cpp), so the player can shoot anywhere.
+struct StereoRay {std::array<float,3> origin{},direction{};int x=-100000,y=-100000;float reach=0;bool on_screen=false;};
 struct StereoSettings {
     float scale=1,screen=3,hud_lens=0,hud_pitch=0,zoom_lens=8;
     bool head_locked=false;

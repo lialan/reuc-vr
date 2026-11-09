@@ -37,6 +37,13 @@ static void close_target(float metres) {
         CHECK(lg_stereo_project_xy(scene.overlay_matrices().view_projection[eye],hit,actual));
         CHECK(std::abs(reticle[0]-actual[0])<1e-5f && std::abs(reticle[1]-actual[1])<1e-5f);
     }
+    CHECK(ray.on_screen);
+    // Far to the right of the picture: in the world it still aims, pinned to the right edge; on the menu screen it does not.
+    xr::StereoPose aside=gun; const float a=1.2f; aside.orientation={0,-std::sin(a/2),0,std::cos(a/2)};
+    xr::StereoRay off;
+    CHECK(scene.aim(aside,1280,720,false,metres,off));
+    CHECK(!off.on_screen && off.x==1279 && off.y>=0 && off.y<720);
+    CHECK(!scene.aim(aside,1280,720,true,metres,off));
     geometry.reset(); CHECK(!geometry.active() && geometry.depth(1,10)==0);
 }
 int main() {

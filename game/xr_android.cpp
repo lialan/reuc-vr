@@ -76,8 +76,8 @@ std::unique_ptr<XrCompositor> make_android_xr() {
 void feed_xr_input(XrCompositor& xr, NativeInput& input) {
     xr::ControllerSnapshot snapshot;
     if (!xr.consume(snapshot)) return;
-    // The aim: the scene hit projected into the game's camera (-1..1, y down). Off the screen the pointer stays put, as a
-    // remote pointing away from the sensor bar does.
+    // The aim: the scene hit projected into the game's camera (-1..1, y down). In gameplay a ray past the picture still aims: the pointer
+    // stays at the picture's edge and the shot follows the controller's ray (xr_shot.cpp). In menus, off the screen the pointer stays put.
     const auto& ray = snapshot.ray[0];
     if (snapshot.valid[0] && ray.x >= 0 && ray.y >= 0 && ray.x < XrCompositor::kAimWidth && ray.y < XrCompositor::kAimHeight)
         input.host_xr_pointer(2.f * (ray.x + .5f) / XrCompositor::kAimWidth - 1, 2.f * (ray.y + .5f) / XrCompositor::kAimHeight - 1,

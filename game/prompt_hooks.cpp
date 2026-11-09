@@ -21,6 +21,7 @@ std::atomic<bool> has_pending{false};
 // The table the prompts are read from and the device they are drawn for.
 const Bindings& shown() { return device.gamepad || device.wiimote ? pad_assignments : assignments; }   // pad_assignments holds the table of the other device: the gamepad's or the Wii Remote's
 bool initialized=false;
+bool replace=true;   // draw the host's input pictures over the game's Wii button pictures
 bool trace_owners=false;
 std::set<std::string> owners_seen,decisions_seen;
 uint32_t invalid_owners=0;
@@ -41,6 +42,7 @@ void prompt_hooks_init(const Bindings& bindings,bool trace) {
     registry={};assignments=bindings;pad_assignments=default_pad_bindings();device={};initialized=true;
     trace_owners=trace;owners_seen.clear();decisions_seen.clear();invalid_owners=0;glyphs_seen.clear();rejected_prompts=0;
 }
+void prompt_hooks_set_replace(bool on) { replace=on; }
 void prompt_hooks_set_bindings(const Bindings& bindings) {
     if(auto error=validate_bindings(bindings))throw std::invalid_argument(*error);
     std::lock_guard lock(pending_mutex);pending=bindings;has_pending=true;
@@ -75,7 +77,7 @@ PromptScope::PromptScope(ppc::Ctx& c,uint32_t entry):c_(c),entry_(entry),excepti
             if(end==bytes.end())return;
             name_.assign(reinterpret_cast<const char*>(bytes.data()),size_t(end-bytes.begin()));object_=c.r[3];
         } catch(const gx::Error&) {return;} // SDK profile mismatch leaves the original layout unchanged.
-    } else if(entry==0x803B7CF0) {
+    } else if(entry==0x803B7CF0 && replace) {
         // CharWriter::Print(u16) from both TextWriterBase instantiations; PrintGlyph emits one quad.
         const uint16_t code=uint16_t(c.r[4]);
         if(code<0x391 || code>0x3A9 || (c.lr!=0x803BA238 && c.lr!=0x803BC138))return;
@@ -88,7 +90,7 @@ PromptScope::PromptScope(ppc::Ctx& c,uint32_t entry):c_(c),entry_(entry),excepti
         if(actions.empty())return;
         description_=actions.size()==1 ? primary_prompt(shown(),{actions[0]},device) : primary_prompt(shown(),{actions[0],actions[1]},device);
         compact_=true;checkpoint_=gx_prompt_checkpoint();
-    } else if(entry==0x80394038 && c.lr==0x8038BD1C) {
+    } else if(entry==0x80394038 && c.lr==0x8038BD1C && replace) {
         if(trace_owners && owners_seen.size()<256) {
             try {
             if(const auto layout=registry.layout_name(memory(c),c.r[28])) {

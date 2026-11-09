@@ -685,6 +685,9 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     uc::input_probe_init(options.input_probe);
     uc::entry_probe_init(options.input_probe);
     uc::prompt_hooks_init(input_config.input,options.input_probe);
+#ifdef UC_OPENXR
+    uc::prompt_hooks_set_replace(false);   // in the headset the game's own Wii button pictures stay
+#endif
     bool pad_last_used=false,shown_pad_last=false;   // the last device used was a gamepad (control type "auto" shows that device's prompts); what the prompts were built for
     unsigned pad_changes=0;
     bool wii_last_used=false,shown_wii_last=false;   // the last device used was the Wii Remote (control type "auto" shows its prompts, in its look)

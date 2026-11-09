@@ -8,6 +8,8 @@ void prompt_hooks_set_bindings(const Bindings&);   // any thread (in-game menu);
 // Any thread: the table of the gamepad (or, for a PromptDevice with wiimote set, of the Wii Remote) and which device the prompts show (keyboard and mouse until this is called);
 // effective from the next hook on.
 void prompt_hooks_set_gamepad(const Bindings& pad,const PromptDevice&);
+// Before the game starts: false leaves the game's own Wii button pictures as they are (the headset build; its controllers stand in for the Wii Remote).
+void prompt_hooks_set_replace(bool);
 struct PromptSnapshot;
 std::shared_ptr<const PromptSnapshot> prompt_checkpoint();
 void prompt_restore(const PromptSnapshot&);
