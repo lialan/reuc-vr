@@ -13,6 +13,7 @@ using namespace ppc;
 void hle_PSMTXIdentity(Ctx&); void hle_PSMTXCopy(Ctx&); void hle_PSMTXConcat(Ctx&); void hle_PSMTXTransApply(Ctx&); void hle_PSMTXScaleApply(Ctx&);
 void hle_PSMTXMultVec(Ctx&); void hle_PSVECAdd(Ctx&); void hle_PSVECSubtract(Ctx&); void hle_PSVECScale(Ctx&); void hle_PSVECNormalize(Ctx&);
 void hle_PSVECSquareMag(Ctx&); void hle_PSVECMag(Ctx&); void hle_PSQUATDotProduct(Ctx&); void hle_PSVECCrossProduct(Ctx&); void hle_SegmentTriangleHit(Ctx&); void hle_BoundsRecordInit(Ctx&); void hle_HitBufferConstruct(Ctx&);
+void hle_ClosestPtTriangle(Ctx&); void hle_SphereTriangleHit(Ctx&);
 
 namespace {
 void ref_PSMTXIdentity(Ctx& c) {
@@ -300,6 +301,391 @@ void compare_segment_triangle(int iterations = 20000) {
     CHECK(hits > iterations / 4);
 }
 
+
+// The translated functions 801371B4 (closest point on a triangle) and 80197AC8 (sphere against triangle), as tools wrote them out of the
+// generation (the partial-sync form of every call, the SDK calls on the reference op sequences above): the code the game ran before the natives.
+void ref_ClosestPtTriangle(Ctx& c) {
+  ppc::Ctx& ctx = c;
+  {
+  ppc::Ctx c; c.mem = ctx.mem;
+  c.r[1] = ctx.r[1]; c.r[2] = ctx.r[2]; c.r[3] = ctx.r[3]; c.r[4] = ctx.r[4]; c.r[5] = ctx.r[5]; c.r[6] = ctx.r[6]; c.r[7] = ctx.r[7]; c.r[8] = ctx.r[8]; c.r[26] = ctx.r[26]; c.r[27] = ctx.r[27]; c.r[28] = ctx.r[28]; c.r[29] = ctx.r[29]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31]; c.f[26] = ctx.f[26]; c.f[27] = ctx.f[27]; c.f[28] = ctx.f[28]; c.f[29] = ctx.f[29]; c.f[30] = ctx.f[30]; c.f[31] = ctx.f[31]; c.ps1[26] = ctx.ps1[26]; c.ps1[27] = ctx.ps1[27]; c.ps1[28] = ctx.ps1[28]; c.ps1[29] = ctx.ps1[29]; c.ps1[30] = ctx.ps1[30]; c.ps1[31] = ctx.ps1[31]; c.lr = ctx.lr; c.gqr[0] = ctx.gqr[0]; 
+L_801371B4:;
+  /*801371B4*/ { ppc::op_stwu(c, 1, 1, -224); }
+  /*801371B8*/ { ppc::op_mfspr(c, 0, 8); }
+  /*801371BC*/ { ppc::op_stw(c, 0, 1, 228); }
+  /*801371C0*/ { ppc::op_stfd(c, 31, 1, 208); }
+  /*801371C4*/ { ppc::op_psq_st(c, 31, 1, 216, 0, 0); }
+  /*801371C8*/ { ppc::op_stfd(c, 30, 1, 192); }
+  /*801371CC*/ { ppc::op_psq_st(c, 30, 1, 200, 0, 0); }
+  /*801371D0*/ { ppc::op_stfd(c, 29, 1, 176); }
+  /*801371D4*/ { ppc::op_psq_st(c, 29, 1, 184, 0, 0); }
+  /*801371D8*/ { ppc::op_stfd(c, 28, 1, 160); }
+  /*801371DC*/ { ppc::op_psq_st(c, 28, 1, 168, 0, 0); }
+  /*801371E0*/ { ppc::op_stfd(c, 27, 1, 144); }
+  /*801371E4*/ { ppc::op_psq_st(c, 27, 1, 152, 0, 0); }
+  /*801371E8*/ { ppc::op_stfd(c, 26, 1, 128); }
+  /*801371EC*/ { ppc::op_psq_st(c, 26, 1, 136, 0, 0); }
+  /*801371F0*/ { ppc::op_addi(c, 11, 1, 128); }
+  /*801371F4*/ { c.lr = 0x801371F8u; ppc::save_gpr<26>(c);  }
+  /*801371F8*/ { ppc::op_or(c, 5, 28, 5, false); }
+  /*801371FC*/ { ppc::op_or(c, 6, 29, 6, false); }
+  /*80137200*/ { ppc::op_or(c, 3, 26, 3, false); }
+  /*80137204*/ { ppc::op_or(c, 4, 27, 4, false); }
+  /*80137208*/ { ppc::op_or(c, 7, 30, 7, false); }
+  /*8013720C*/ { ppc::op_or(c, 8, 31, 8, false); }
+  /*80137210*/ { ppc::op_or(c, 29, 3, 29, false); }
+  /*80137214*/ { ppc::op_or(c, 28, 4, 28, false); }
+  /*80137218*/ { ppc::op_addi(c, 5, 1, 80); }
+  /*8013721C*/ { { c.lr = 0x80137220u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECSubtract(ctx); } }
+  /*80137220*/ { ppc::op_or(c, 30, 3, 30, false); }
+  /*80137224*/ { ppc::op_or(c, 28, 4, 28, false); }
+  /*80137228*/ { ppc::op_addi(c, 5, 1, 68); }
+  /*8013722C*/ { { c.lr = 0x80137230u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECSubtract(ctx); } }
+  /*80137230*/ { ppc::op_or(c, 27, 3, 27, false); }
+  /*80137234*/ { ppc::op_or(c, 28, 4, 28, false); }
+  /*80137238*/ { ppc::op_addi(c, 5, 1, 56); }
+  /*8013723C*/ { { c.lr = 0x80137240u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECSubtract(ctx); } }
+  /*80137240*/ { ppc::op_addi(c, 3, 1, 80); }
+  /*80137244*/ { ppc::op_addi(c, 4, 1, 56); }
+  /*80137248*/ { { c.lr = 0x8013724Cu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*8013724C*/ { ppc::op_fmr(c, 27, 1, false); }
+  /*80137250*/ { ppc::op_addi(c, 3, 1, 68); }
+  /*80137254*/ { ppc::op_addi(c, 4, 1, 56); }
+  /*80137258*/ { { c.lr = 0x8013725Cu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*8013725C*/ { ppc::op_lfs(c, 0, 2, -26264); }
+  /*80137260*/ { ppc::op_fmr(c, 28, 1, false); }
+  /*80137264*/ { ppc::op_fcmpo(c, 0, 27, 0); }
+  /*80137268*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*8013726C*/ { { if (ppc::crbit(c, 2) == false) { goto L_801372A0; } } }
+  /*80137270*/ { ppc::op_fcmpo(c, 0, 1, 0); }
+  /*80137274*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80137278*/ { { if (ppc::crbit(c, 2) == false) { goto L_801372A0; } } }
+  /*8013727C*/ { ppc::op_addi(c, 0, 0, 0); }
+  /*80137280*/ { ppc::op_lfs(c, 2, 28, 0); }
+  /*80137284*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*80137288*/ { ppc::op_lfs(c, 1, 28, 4); }
+  /*8013728C*/ { ppc::op_lfs(c, 0, 28, 8); }
+  /*80137290*/ { ppc::op_stfs(c, 2, 26, 0); }
+  /*80137294*/ { ppc::op_stfs(c, 1, 26, 4); }
+  /*80137298*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*8013729C*/ { ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; goto L_80137574; }
+L_801372A0:;
+  /*801372A0*/ { ppc::op_or(c, 27, 3, 27, false); }
+  /*801372A4*/ { ppc::op_or(c, 29, 4, 29, false); }
+  /*801372A8*/ { ppc::op_addi(c, 5, 1, 44); }
+  /*801372AC*/ { { c.lr = 0x801372B0u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECSubtract(ctx); } }
+  /*801372B0*/ { ppc::op_addi(c, 3, 1, 80); }
+  /*801372B4*/ { ppc::op_addi(c, 4, 1, 44); }
+  /*801372B8*/ { { c.lr = 0x801372BCu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*801372BC*/ { ppc::op_fmr(c, 29, 1, false); }
+  /*801372C0*/ { ppc::op_addi(c, 3, 1, 68); }
+  /*801372C4*/ { ppc::op_addi(c, 4, 1, 44); }
+  /*801372C8*/ { { c.lr = 0x801372CCu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*801372CC*/ { ppc::op_lfs(c, 0, 2, -26264); }
+  /*801372D0*/ { ppc::op_fmr(c, 30, 1, false); }
+  /*801372D4*/ { ppc::op_fcmpo(c, 0, 29, 0); }
+  /*801372D8*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*801372DC*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137310; } } }
+  /*801372E0*/ { ppc::op_fcmpo(c, 0, 1, 29); }
+  /*801372E4*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*801372E8*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137310; } } }
+  /*801372EC*/ { ppc::op_addi(c, 0, 0, 1); }
+  /*801372F0*/ { ppc::op_lfs(c, 2, 29, 0); }
+  /*801372F4*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*801372F8*/ { ppc::op_lfs(c, 1, 29, 4); }
+  /*801372FC*/ { ppc::op_lfs(c, 0, 29, 8); }
+  /*80137300*/ { ppc::op_stfs(c, 2, 26, 0); }
+  /*80137304*/ { ppc::op_stfs(c, 1, 26, 4); }
+  /*80137308*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*8013730C*/ { ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; goto L_80137574; }
+L_80137310:;
+  /*80137310*/ { ppc::op_fmuls(c, 2, 29, 28, false); }
+  /*80137314*/ { ppc::op_lfs(c, 0, 2, -26264); }
+  /*80137318*/ { ppc::op_fmsubs(c, 26, 27, 2, 1, false); }
+  /*8013731C*/ { ppc::op_fcmpo(c, 0, 26, 0); }
+  /*80137320*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80137324*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137388; } } }
+  /*80137328*/ { ppc::op_fcmpo(c, 0, 27, 0); }
+  /*8013732C*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*80137330*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137388; } } }
+  /*80137334*/ { ppc::op_fcmpo(c, 0, 29, 0); }
+  /*80137338*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*8013733C*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137388; } } }
+  /*80137340*/ { ppc::op_fsubs(c, 0, 27, 29, false); }
+  /*80137344*/ { ppc::op_addi(c, 3, 1, 80); }
+  /*80137348*/ { ppc::op_addi(c, 4, 1, 20); }
+  /*8013734C*/ { ppc::op_fdivs(c, 1, 27, 0, false); }
+  /*80137350*/ { { c.lr = 0x80137354u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.f[0] = c.f[0]; ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.ps1[0] = c.ps1[0]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; ref_PSVECScale(ctx); } }
+  /*80137354*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*80137358*/ { ppc::op_or(c, 28, 4, 28, false); }
+  /*8013735C*/ { ppc::op_or(c, 3, 5, 3, false); }
+  /*80137360*/ { { c.lr = 0x80137364u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECAdd(ctx); } }
+  /*80137364*/ { ppc::op_addi(c, 0, 0, 3); }
+  /*80137368*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*8013736C*/ { ppc::op_lfs(c, 0, 1, 20); }
+  /*80137370*/ { ppc::op_stfs(c, 0, 26, 0); }
+  /*80137374*/ { ppc::op_lfs(c, 0, 1, 24); }
+  /*80137378*/ { ppc::op_stfs(c, 0, 26, 4); }
+  /*8013737C*/ { ppc::op_lfs(c, 0, 1, 28); }
+  /*80137380*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*80137384*/ { ctx.f[26] = c.f[26]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.ps1[26] = c.ps1[26]; goto L_80137574; }
+L_80137388:;
+  /*80137388*/ { ppc::op_or(c, 27, 3, 27, false); }
+  /*8013738C*/ { ppc::op_or(c, 30, 4, 30, false); }
+  /*80137390*/ { ppc::op_addi(c, 5, 1, 32); }
+  /*80137394*/ { { c.lr = 0x80137398u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ctx.f[2] = c.f[2]; ctx.ps1[2] = c.ps1[2]; ref_PSVECSubtract(ctx); } }
+  /*80137398*/ { ppc::op_addi(c, 3, 1, 80); }
+  /*8013739C*/ { ppc::op_addi(c, 4, 1, 32); }
+  /*801373A0*/ { { c.lr = 0x801373A4u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*801373A4*/ { ppc::op_fmr(c, 31, 1, false); }
+  /*801373A8*/ { ppc::op_addi(c, 3, 1, 68); }
+  /*801373AC*/ { ppc::op_addi(c, 4, 1, 32); }
+  /*801373B0*/ { { c.lr = 0x801373B4u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*801373B4*/ { ppc::op_lfs(c, 0, 2, -26264); }
+  /*801373B8*/ { ppc::op_fcmpo(c, 0, 1, 0); }
+  /*801373BC*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*801373C0*/ { { if (ppc::crbit(c, 2) == false) { goto L_801373F4; } } }
+  /*801373C4*/ { ppc::op_fcmpo(c, 0, 31, 1); }
+  /*801373C8*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*801373CC*/ { { if (ppc::crbit(c, 2) == false) { goto L_801373F4; } } }
+  /*801373D0*/ { ppc::op_addi(c, 0, 0, 2); }
+  /*801373D4*/ { ppc::op_lfs(c, 2, 30, 0); }
+  /*801373D8*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*801373DC*/ { ppc::op_lfs(c, 1, 30, 4); }
+  /*801373E0*/ { ppc::op_lfs(c, 0, 30, 8); }
+  /*801373E4*/ { ppc::op_stfs(c, 2, 26, 0); }
+  /*801373E8*/ { ppc::op_stfs(c, 1, 26, 4); }
+  /*801373EC*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*801373F0*/ { ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.f[26] = c.f[26]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.f[31] = c.f[31]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; ctx.ps1[26] = c.ps1[26]; goto L_80137574; }
+L_801373F4:;
+  /*801373F4*/ { ppc::op_fmuls(c, 2, 27, 1, false); }
+  /*801373F8*/ { ppc::op_lfs(c, 0, 2, -26264); }
+  /*801373FC*/ { ppc::op_fmsubs(c, 4, 31, 2, 28, false); }
+  /*80137400*/ { ppc::op_fcmpo(c, 0, 4, 0); }
+  /*80137404*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80137408*/ { { if (ppc::crbit(c, 2) == false) { goto L_8013746C; } } }
+  /*8013740C*/ { ppc::op_fcmpo(c, 0, 28, 0); }
+  /*80137410*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*80137414*/ { { if (ppc::crbit(c, 2) == false) { goto L_8013746C; } } }
+  /*80137418*/ { ppc::op_fcmpo(c, 0, 1, 0); }
+  /*8013741C*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80137420*/ { { if (ppc::crbit(c, 2) == false) { goto L_8013746C; } } }
+  /*80137424*/ { ppc::op_fsubs(c, 0, 28, 1, false); }
+  /*80137428*/ { ppc::op_addi(c, 3, 1, 68); }
+  /*8013742C*/ { ppc::op_addi(c, 4, 1, 20); }
+  /*80137430*/ { ppc::op_fdivs(c, 1, 28, 0, false); }
+  /*80137434*/ { { c.lr = 0x80137438u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.f[0] = c.f[0]; ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.ps1[0] = c.ps1[0]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; ref_PSVECScale(ctx); } }
+  /*80137438*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*8013743C*/ { ppc::op_or(c, 28, 4, 28, false); }
+  /*80137440*/ { ppc::op_or(c, 3, 5, 3, false); }
+  /*80137444*/ { { c.lr = 0x80137448u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ctx.f[4] = c.f[4]; ctx.ps1[4] = c.ps1[4]; ref_PSVECAdd(ctx); } }
+  /*80137448*/ { ppc::op_addi(c, 0, 0, 4); }
+  /*8013744C*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*80137450*/ { ppc::op_lfs(c, 0, 1, 20); }
+  /*80137454*/ { ppc::op_stfs(c, 0, 26, 0); }
+  /*80137458*/ { ppc::op_lfs(c, 0, 1, 24); }
+  /*8013745C*/ { ppc::op_stfs(c, 0, 26, 4); }
+  /*80137460*/ { ppc::op_lfs(c, 0, 1, 28); }
+  /*80137464*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*80137468*/ { ctx.f[26] = c.f[26]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.f[31] = c.f[31]; ctx.ps1[26] = c.ps1[26]; goto L_80137574; }
+L_8013746C:;
+  /*8013746C*/ { ppc::op_fmuls(c, 0, 31, 30, false); }
+  /*80137470*/ { ppc::op_lfs(c, 3, 2, -26264); }
+  /*80137474*/ { ppc::op_fmsubs(c, 5, 29, 0, 1, false); }
+  /*80137478*/ { ppc::op_fcmpo(c, 0, 5, 3); }
+  /*8013747C*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80137480*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137500; } } }
+  /*80137484*/ { ppc::op_fsubs(c, 2, 30, 29, false); }
+  /*80137488*/ { ppc::op_fcmpo(c, 0, 2, 3); }
+  /*8013748C*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*80137490*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137500; } } }
+  /*80137494*/ { ppc::op_fsubs(c, 0, 31, 1, false); }
+  /*80137498*/ { ppc::op_fcmpo(c, 0, 0, 3); }
+  /*8013749C*/ { ppc::op_cror(c, 2, 1, 2); }
+  /*801374A0*/ { { if (ppc::crbit(c, 2) == false) { goto L_80137500; } } }
+  /*801374A4*/ { ppc::op_fadds(c, 0, 2, 0, false); }
+  /*801374A8*/ { ppc::op_or(c, 30, 3, 30, false); }
+  /*801374AC*/ { ppc::op_or(c, 29, 4, 29, false); }
+  /*801374B0*/ { ppc::op_addi(c, 5, 1, 20); }
+  /*801374B4*/ { ppc::op_fdivs(c, 27, 2, 0, false); }
+  /*801374B8*/ { { c.lr = 0x801374BCu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ctx.f[2] = c.f[2]; ctx.f[3] = c.f[3]; ctx.f[4] = c.f[4]; ctx.f[5] = c.f[5]; ctx.ps1[2] = c.ps1[2]; ctx.ps1[3] = c.ps1[3]; ctx.ps1[4] = c.ps1[4]; ctx.ps1[5] = c.ps1[5]; ref_PSVECSubtract(ctx); } }
+  /*801374BC*/ { ppc::op_fmr(c, 1, 27, false); }
+  /*801374C0*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*801374C4*/ { ppc::op_or(c, 3, 4, 3, false); }
+  /*801374C8*/ { { c.lr = 0x801374CCu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.f[0] = c.f[0]; ctx.f[1] = c.f[1]; ctx.ps1[0] = c.ps1[0]; ref_PSVECScale(ctx); } }
+  /*801374CC*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*801374D0*/ { ppc::op_or(c, 29, 4, 29, false); }
+  /*801374D4*/ { ppc::op_or(c, 3, 5, 3, false); }
+  /*801374D8*/ { { c.lr = 0x801374DCu; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECAdd(ctx); } }
+  /*801374DC*/ { ppc::op_addi(c, 0, 0, 5); }
+  /*801374E0*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*801374E4*/ { ppc::op_lfs(c, 0, 1, 20); }
+  /*801374E8*/ { ppc::op_stfs(c, 0, 26, 0); }
+  /*801374EC*/ { ppc::op_lfs(c, 0, 1, 24); }
+  /*801374F0*/ { ppc::op_stfs(c, 0, 26, 4); }
+  /*801374F4*/ { ppc::op_lfs(c, 0, 1, 28); }
+  /*801374F8*/ { ppc::op_stfs(c, 0, 26, 8); }
+  /*801374FC*/ { ctx.f[26] = c.f[26]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.f[31] = c.f[31]; ctx.ps1[26] = c.ps1[26]; ctx.ps1[27] = c.ps1[27]; goto L_80137574; }
+L_80137500:;
+  /*80137500*/ { ppc::op_fadds(c, 1, 5, 4, false); }
+  /*80137504*/ { ppc::op_lfs(c, 0, 2, -26260); }
+  /*80137508*/ { ppc::op_addi(c, 3, 1, 80); }
+  /*8013750C*/ { ppc::op_addi(c, 4, 1, 20); }
+  /*80137510*/ { ppc::op_fadds(c, 1, 26, 1, false); }
+  /*80137514*/ { ppc::op_fdivs(c, 0, 0, 1, false); }
+  /*80137518*/ { ppc::op_fmuls(c, 1, 4, 0, false); }
+  /*8013751C*/ { ppc::op_fmuls(c, 27, 26, 0, false); }
+  /*80137520*/ { { c.lr = 0x80137524u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.f[0] = c.f[0]; ctx.f[1] = c.f[1]; ctx.f[2] = c.f[2]; ctx.ps1[0] = c.ps1[0]; ctx.ps1[1] = c.ps1[1]; ctx.ps1[2] = c.ps1[2]; ref_PSVECScale(ctx); } }
+  /*80137524*/ { ppc::op_fmr(c, 1, 27, false); }
+  /*80137528*/ { ppc::op_addi(c, 3, 1, 68); }
+  /*8013752C*/ { ppc::op_addi(c, 4, 1, 8); }
+  /*80137530*/ { { c.lr = 0x80137534u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.f[1] = c.f[1]; ref_PSVECScale(ctx); } }
+  /*80137534*/ { ppc::op_addi(c, 4, 1, 20); }
+  /*80137538*/ { ppc::op_or(c, 28, 3, 28, false); }
+  /*8013753C*/ { ppc::op_or(c, 4, 5, 4, false); }
+  /*80137540*/ { { c.lr = 0x80137544u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ctx.f[3] = c.f[3]; ctx.f[4] = c.f[4]; ctx.f[5] = c.f[5]; ctx.ps1[3] = c.ps1[3]; ctx.ps1[4] = c.ps1[4]; ctx.ps1[5] = c.ps1[5]; ref_PSVECAdd(ctx); } }
+  /*80137544*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*80137548*/ { ppc::op_addi(c, 4, 1, 8); }
+  /*8013754C*/ { ppc::op_or(c, 3, 5, 3, false); }
+  /*80137550*/ { { c.lr = 0x80137554u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECAdd(ctx); } }
+  /*80137554*/ { ppc::op_addi(c, 0, 0, 6); }
+  /*80137558*/ { ppc::op_stw(c, 0, 31, 0); }
+  /*8013755C*/ { ppc::op_lfs(c, 0, 1, 20); }
+  /*80137560*/ { ppc::op_stfs(c, 0, 26, 0); }
+  /*80137564*/ { ppc::op_lfs(c, 0, 1, 24); }
+  /*80137568*/ { ppc::op_stfs(c, 0, 26, 4); }
+  /*8013756C*/ { ppc::op_lfs(c, 0, 1, 28); }
+  /*80137570*/ { ppc::op_stfs(c, 0, 26, 8); } { ctx.f[26] = c.f[26]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.f[31] = c.f[31]; ctx.ps1[26] = c.ps1[26]; ctx.ps1[27] = c.ps1[27]; }
+L_80137574:;
+  /*80137574*/ { ppc::op_psq_l(c, 31, 1, 216, 0, 0); }
+  /*80137578*/ { ppc::op_lfd(c, 31, 1, 208); }
+  /*8013757C*/ { ppc::op_psq_l(c, 30, 1, 200, 0, 0); }
+  /*80137580*/ { ppc::op_lfd(c, 30, 1, 192); }
+  /*80137584*/ { ppc::op_psq_l(c, 29, 1, 184, 0, 0); }
+  /*80137588*/ { ppc::op_lfd(c, 29, 1, 176); }
+  /*8013758C*/ { ppc::op_psq_l(c, 28, 1, 168, 0, 0); }
+  /*80137590*/ { ppc::op_lfd(c, 28, 1, 160); }
+  /*80137594*/ { ppc::op_psq_l(c, 27, 1, 152, 0, 0); }
+  /*80137598*/ { ppc::op_lfd(c, 27, 1, 144); }
+  /*8013759C*/ { ppc::op_psq_l(c, 26, 1, 136, 0, 0); }
+  /*801375A0*/ { ppc::op_addi(c, 11, 1, 128); }
+  /*801375A4*/ { ppc::op_lfd(c, 26, 1, 128); }
+  /*801375A8*/ { c.lr = 0x801375ACu; ppc::rest_gpr<26>(c);  }
+  /*801375AC*/ { ppc::op_lwz(c, 0, 1, 228); }
+  /*801375B0*/ { ppc::op_mtspr(c, 0, 8); }
+  /*801375B4*/ { ppc::op_addi(c, 1, 1, 224); }
+  /*801375B8*/ { ctx.r[0] = c.r[0]; ctx.r[1] = c.r[1]; ctx.r[11] = c.r[11]; ctx.r[26] = c.r[26]; ctx.r[27] = c.r[27]; ctx.r[28] = c.r[28]; ctx.r[29] = c.r[29]; ctx.r[30] = c.r[30]; ctx.r[31] = c.r[31]; ctx.f[0] = c.f[0]; ctx.f[26] = c.f[26]; ctx.f[27] = c.f[27]; ctx.f[28] = c.f[28]; ctx.f[29] = c.f[29]; ctx.f[30] = c.f[30]; ctx.f[31] = c.f[31]; ctx.ps1[0] = c.ps1[0]; ctx.ps1[26] = c.ps1[26]; ctx.ps1[27] = c.ps1[27]; ctx.ps1[28] = c.ps1[28]; ctx.ps1[29] = c.ps1[29]; ctx.ps1[30] = c.ps1[30]; ctx.ps1[31] = c.ps1[31]; ctx.cr[0] = c.cr[0]; ctx.lr = c.lr; return; }
+  ppc::trap(0x801375BC, "fell off the end of function 801371B4");
+  }
+}
+void ref_SphereTriangleHit(Ctx& c) {
+  ppc::Ctx& ctx = c;
+  {
+  ppc::Ctx c; c.mem = ctx.mem;
+  c.r[1] = ctx.r[1]; c.r[3] = ctx.r[3]; c.r[4] = ctx.r[4]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31]; c.f[1] = ctx.f[1]; c.f[31] = ctx.f[31]; c.ps1[31] = ctx.ps1[31]; c.lr = ctx.lr; c.gqr[0] = ctx.gqr[0]; 
+L_80197AC8:;
+  /*80197AC8*/ { ppc::op_stwu(c, 1, 1, -64); }
+  /*80197ACC*/ { ppc::op_mfspr(c, 0, 8); }
+  /*80197AD0*/ { ppc::op_stw(c, 0, 1, 68); }
+  /*80197AD4*/ { ppc::op_stfd(c, 31, 1, 48); }
+  /*80197AD8*/ { ppc::op_psq_st(c, 31, 1, 56, 0, 0); }
+  /*80197ADC*/ { ppc::op_fmr(c, 31, 1, false); }
+  /*80197AE0*/ { ppc::op_stw(c, 31, 1, 44); }
+  /*80197AE4*/ { ppc::op_or(c, 4, 31, 4, false); }
+  /*80197AE8*/ { ppc::op_stw(c, 30, 1, 40); }
+  /*80197AEC*/ { ppc::op_or(c, 3, 30, 3, false); }
+  /*80197AF0*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*80197AF4*/ { { c.lr = 0x80197AF8u; ctx.r[0] = c.r[0]; ctx.r[1] = c.r[1]; ctx.r[3] = c.r[3]; ctx.r[30] = c.r[30]; ctx.r[31] = c.r[31]; ctx.f[31] = c.f[31]; ctx.lr = c.lr; ref_ClosestPtTriangle(ctx); c.r[1] = ctx.r[1]; c.r[30] = ctx.r[30]; c.r[31] = ctx.r[31]; c.f[31] = ctx.f[31]; } }
+  /*80197AF8*/ { ppc::op_or(c, 31, 4, 31, false); }
+  /*80197AFC*/ { ppc::op_addi(c, 3, 1, 20); }
+  /*80197B00*/ { ppc::op_addi(c, 5, 1, 8); }
+  /*80197B04*/ { { c.lr = 0x80197B08u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ctx.r[5] = c.r[5]; ref_PSVECSubtract(ctx); } }
+  /*80197B08*/ { ppc::op_addi(c, 3, 1, 8); }
+  /*80197B0C*/ { ppc::op_or(c, 3, 4, 3, false); }
+  /*80197B10*/ { { c.lr = 0x80197B14u; ctx.r[3] = c.r[3]; ctx.r[4] = c.r[4]; ref_PSQUATDotProduct(ctx); c.f[1] = ctx.f[1]; } }
+  /*80197B14*/ { ppc::op_fmuls(c, 0, 31, 31, false); }
+  /*80197B18*/ { ppc::op_fcmpo(c, 0, 1, 0); }
+  /*80197B1C*/ { ppc::op_cror(c, 2, 0, 2); }
+  /*80197B20*/ { { if (ppc::crbit(c, 2) == false) { goto L_80197B44; } } }
+  /*80197B24*/ { ppc::op_lfs(c, 0, 1, 20); }
+  /*80197B28*/ { ppc::op_addi(c, 3, 0, 1); }
+  /*80197B2C*/ { ppc::op_stfs(c, 0, 30, 0); }
+  /*80197B30*/ { ppc::op_lfs(c, 0, 1, 24); }
+  /*80197B34*/ { ppc::op_stfs(c, 0, 30, 4); }
+  /*80197B38*/ { ppc::op_lfs(c, 0, 1, 28); }
+  /*80197B3C*/ { ppc::op_stfs(c, 0, 30, 8); }
+  /*80197B40*/ { goto L_80197B48; }
+L_80197B44:;
+  /*80197B44*/ { ppc::op_addi(c, 3, 0, 0); }
+L_80197B48:;
+  /*80197B48*/ { ppc::op_psq_l(c, 31, 1, 56, 0, 0); }
+  /*80197B4C*/ { ppc::op_lwz(c, 0, 1, 68); }
+  /*80197B50*/ { ppc::op_lfd(c, 31, 1, 48); }
+  /*80197B54*/ { ppc::op_lwz(c, 31, 1, 44); }
+  /*80197B58*/ { ppc::op_lwz(c, 30, 1, 40); }
+  /*80197B5C*/ { ppc::op_mtspr(c, 0, 8); }
+  /*80197B60*/ { ppc::op_addi(c, 1, 1, 64); }
+  /*80197B64*/ { ctx.r[0] = c.r[0]; ctx.r[1] = c.r[1]; ctx.r[3] = c.r[3]; ctx.r[30] = c.r[30]; ctx.r[31] = c.r[31]; ctx.f[0] = c.f[0]; ctx.f[31] = c.f[31]; ctx.ps1[0] = c.ps1[0]; ctx.ps1[31] = c.ps1[31]; ctx.cr[0] = c.cr[0]; ctx.lr = c.lr; return; }
+  ppc::trap(0x80197B68, "fell off the end of function 80197AC8");
+  }
+}
+
+// Points around random triangles (every region: the three vertices, the three edges, the inside), degenerate triangles and arbitrary bits.
+void compare_closest_point(int iterations = 30000) {
+    constexpr uint32_t out = kBase + 0x60, pt = kBase + 0x10, va = kBase + 0x20, vb = kBase + 0x30, vc = kBase + 0x40, reg = kBase + 0x70, sp = kBase + 0x3000;
+    int mismatches = 0, regions[8] = {}, sphere_hits = 0;
+    for (int n = 0; n < iterations; ++n) {
+        std::vector<uint32_t> words(kRegion / 4, 0);
+        auto put = [&](uint32_t at, double x, double y, double z) { const size_t i = (at - kBase) / 4; words[i] = float_bits(x); words[i + 1] = float_bits(y); words[i + 2] = float_bits(z); };
+        std::uniform_real_distribution<double> d(-10, 10), unit(-0.5, 1.5);
+        if (n % 9 != 0) {
+            double a[3], b[3], cc[3];
+            for (int k = 0; k < 3; ++k) { a[k] = d(rng); b[k] = d(rng); cc[k] = n % 17 == 0 ? a[k] + (b[k] - a[k]) * 0.5 : d(rng); }   // some collinear
+            const double u = unit(rng), v = unit(rng);
+            double q[3];
+            for (int k = 0; k < 3; ++k) q[k] = a[k] + u * (b[k] - a[k]) + v * (cc[k] - a[k]) + d(rng) * 0.3;
+            if (n % 13 == 0) for (int k = 0; k < 3; ++k) q[k] = (n % 3 == 0 ? a : n % 3 == 1 ? b : cc)[k];   // exactly on a vertex
+            put(va, a[0], a[1], a[2]); put(vb, b[0], b[1], b[2]); put(vc, cc[0], cc[1], cc[2]); put(pt, q[0], q[1], q[2]);
+        } else for (auto& w : words) w = random_float_bits();
+        uint32_t args[6] = {out, pt, va, vb, vc, reg};
+        if (n % 11 == 0) args[0] = pt; else if (n % 19 == 0) args[0] = va;   // the result overwrites an input
+        uint32_t k[2] = {0, float_bits(1.0)};
+        if (n % 23 == 0) { k[0] = random_float_bits(); k[1] = random_float_bits(); }
+        const double radius = n % 7 == 0 ? double(float(random_arg())) : double(float(d(rng) * 0.6));
+        const bool sphere = n % 2 == 1;
+        auto run1 = [&](Fix& f, void (*fn)(Ctx&)) {
+            Ctx& c = f.c;
+            fill_region(f, words);
+            wr32(c, kSda - 26264, k[0]); wr32(c, kSda - 26260, k[1]);
+            for (uint32_t a = sp - 0x140; a < sp + 0x20; a += 4) wr32(c, a, 0xDEAD0000u + (a & 0xFFFFu));
+            c.r[2] = kSda; c.r[1] = sp; c.lr = 0x80045678u; c.gqr[0] = 0;
+            for (int i = 0; i < 6; ++i) c.r[3 + i] = args[i];
+            for (int i = 13; i < 32; ++i) c.r[i] = 0xBBBB0000u + i;
+            for (int i = 0; i < 32; ++i) { c.f[i] = 123.0 + i; c.ps1[i] = -7.0 - i * 1.1e-9; }   // ps1 not singles: the psq_l restores round them
+            c.f[1] = radius;
+            fn(c);
+            std::vector<uint8_t> memory(c.mem + (kBase & 0x3FFFFFFF), c.mem + (kBase & 0x3FFFFFFF) + kRegion);
+            const uint8_t* at = c.mem + ((sp - 0x140) & 0x3FFFFFFF); memory.insert(memory.end(), at, at + 0x160);
+            std::vector<uint64_t> regs{c.r[1], c.lr, sphere ? c.r[3] : c.r[11], c.r[0]};
+            for (int i = 26; i < 32; ++i) { regs.push_back(c.r[i]); regs.push_back(bits(c.f[i])); regs.push_back(bits(c.ps1[i])); }
+            return std::make_pair(memory, regs);
+        };
+        Fix expected, got;
+        const auto want = run1(expected, sphere ? ref_SphereTriangleHit : ref_ClosestPtTriangle);
+        const auto have = run1(got, sphere ? hle_SphereTriangleHit : hle_ClosestPtTriangle);
+        const uint32_t r = rd32(expected.c, reg);
+        ++regions[r < 7 ? r : 7];
+        sphere_hits += sphere && want.second[2] == 1;
+        if (!(same_memory(want.first, have.first) && want.second == have.second) && ++mismatches <= 5)
+            std::printf("%s differs at iteration %d (region %u)\n", sphere ? "SphereTriangleHit" : "ClosestPtTriangle", n, r);
+    }
+    std::printf("ClosestPtTriangle / SphereTriangleHit: %d mismatches in %d randomised runs (regions 0-6: %d %d %d %d %d %d %d; %d sphere hits)\n", mismatches,
+                iterations, regions[0], regions[1], regions[2], regions[3], regions[4], regions[5], regions[6], sphere_hits);
+    CHECK(mismatches == 0);
+    for (int i = 0; i < 7; ++i) CHECK(regions[i] > iterations / 200);
+    CHECK(sphere_hits > iterations / 50);
+}
+
 // The translated instructions of the bounds record init (801316C8) and the hit buffer constructor (800462E8); the element constructor (80131684) is
 // empty (a lone blr), so __construct_array (80289B34) has no effect on guest memory besides its own dead stack frame.
 void ref_BoundsRecordInit(Ctx& c) {
@@ -489,5 +875,6 @@ int main() {
     compare_segment_triangle();
     compare_hit_buffer();
     compare_collision_loop();
+    compare_closest_point();
     return 0;
 }

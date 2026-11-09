@@ -969,10 +969,12 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
 // and stores of the real context are its entry loads, its flushes and those of its callees, all within the registers the tree reads or
 // writes. The generated Leaf_ HLEs (runtime/hle/leaf_gen.cpp, written by tools/leaf_hle.py from these very instructions) qualify the same
 // way: they copy in and out only registers their guest code uses. So do the native SDK matrix/vector routines below: they read the guest
-// routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both).
+// routine's arguments and write no register but its result (tests/test_sdk_math_hle.cpp checks both), and so do the two collision routines
+// built on them, which write no register outside what their guest code writes (r0, r3, r11 and the ps1 rounding of the f26..f31 restores).
 static bool leaf_hle(const std::string& name) {
     static const std::set<std::string> math = {"PSMTXIdentity", "PSMTXCopy", "PSMTXConcat", "PSMTXTransApply", "PSMTXScaleApply", "PSMTXMultVec",
-        "PSVECAdd", "PSVECSubtract", "PSVECScale", "PSVECNormalize", "PSVECSquareMag", "PSVECMag", "PSQUATDotProduct", "PSVECCrossProduct"};
+        "PSVECAdd", "PSVECSubtract", "PSVECScale", "PSVECNormalize", "PSVECSquareMag", "PSVECMag", "PSQUATDotProduct", "PSVECCrossProduct",
+        "ClosestPtTriangle", "SphereTriangleHit"};
     return name.compare(0, 5, "Leaf_") == 0 || math.count(name);
 }
 struct Closed {

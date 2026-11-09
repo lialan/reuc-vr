@@ -445,3 +445,123 @@ void hle_HitBufferConstruct(ppc::Ctx& c) {
     }
     float f; std::memcpy(&f, &low, 4); c.f[1] = c.ps1[1] = f; std::memcpy(&f, &high, 4); c.f[0] = c.ps1[0] = f; c.r[0] = 0;
 }
+
+// void ClosestPtTriangle(Vec* out, Vec* p, Vec* a, Vec* b, Vec* c, int* region)   r3..r8
+// The game's closest point on the triangle a b c to p (801371B4, Ericson's ClosestPtPointTriangle): *out = the point, *region = 0..6 (vertex a,
+// b, c; edge ab, ac, bc; inside). The translated function is up to eleven SDK vector calls on stack temporaries (4.8% of the guest thread in the
+// train fight plus the calls); this runs the same operations on locals with the same rounding and comparisons, and writes the same frame bytes.
+// tests/test_sdk_math_hle.cpp runs the translated function against it.
+namespace {
+SDK_INLINE V3 vadd(const V3& a, const V3& b) { return {a.xy + b.xy, a.z + b.z}; }
+SDK_INLINE V3 vscale(const V3& v, double s) {   // PSVECScale: ps_muls0 on both pairs
+    const PS xy = muls0(wide(v.xy), s), z = muls0({v.z, 1.0}, s);
+    return {{xy.p0, xy.p1}, z.p0};
+}
+// The dead frame of a translated body: the bytes its stores leave there (the game reads stale stack slots). Noted once for rollback.
+struct DeadFrame {
+    uint8_t* p = nullptr;
+    DeadFrame(Ctx& c, uint32_t at, uint32_t size) { if (in_ram(at, size)) { p = ppc::hp(c, at); gx::note_write_range(at, size); } }
+    void u32(uint32_t at, uint32_t v) const { if (p) put32(p + at, v); }
+    void f64(uint32_t at, double v) const { if (p) put_f64(p + at, v); }
+    void pair(uint32_t at, double a, double b) const { if (p) put_pair(p + at, {a, b}); }
+    void vec(uint32_t at, const V3& v) const { if (p) { put_pair(p + at, wide(v.xy)); put_f32(p + at + 8, v.z); } }
+};
+SDK_INLINE uint32_t f32_bits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }
+// stw region; then lfs/stfs of the three components into out (the guest's order: the x load of a vertex comes before the region store).
+SDK_INLINE float bits_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
+// Both return the point as written (the bits a later lfs/psq_l of *out reads).
+SDK_INLINE V3 put_bits(Ctx& c, uint32_t out, uint32_t x, uint32_t y, uint32_t z) {
+    ppc::wr32(c, out, x); ppc::wr32(c, out + 4, y); ppc::wr32(c, out + 8, z);
+    return {{bits_f32(x), bits_f32(y)}, bits_f32(z)};
+}
+SDK_INLINE V3 put_vertex(Ctx& c, uint32_t out, uint32_t src, uint32_t region, uint32_t n) {
+    const uint32_t x = through_double(ppc::rd32(c, src));
+    ppc::wr32(c, region, n);
+    const uint32_t y = through_double(ppc::rd32(c, src + 4)), z = through_double(ppc::rd32(c, src + 8));
+    return put_bits(c, out, x, y, z);
+}
+SDK_INLINE V3 put_point(Ctx& c, uint32_t out, const V3& v, uint32_t region, uint32_t n) {
+    ppc::wr32(c, region, n);
+    return put_bits(c, out, through_double(f32_bits(v.xy[0])), through_double(f32_bits(v.xy[1])), through_double(f32_bits(v.z)));
+}
+V3 closest_pt_triangle(Ctx& c) {
+    float_gqr(c);
+    const uint32_t entry = c.r[1], out = c.r[3], pp = c.r[4], pa = c.r[5], pb = c.r[6], pc = c.r[7], region = c.r[8];
+    // Frame -224: back chain, link register at +228, f31..f26 (stfd + psq_st) from +208 down to +128, r26..r31 (_savegpr_26) at +104.
+    const DeadFrame fr(c, entry - 224, 232);
+    fr.u32(0, entry); fr.u32(228, c.lr);
+    for (int i = 31; i >= 26; --i) { fr.f64(128 + 16 * (i - 26), c.f[i]); fr.pair(136 + 16 * (i - 26), c.f[i], c.ps1[i]); }
+    for (int i = 26; i <= 31; ++i) fr.u32(104 + 4 * (i - 26), c.r[i]);
+    // The epilogue's psq_l restores leave ps1 rounded to a single; r0 holds the reloaded link register, r11 the _restgpr_26 base.
+    for (int i = 26; i <= 31; ++i) c.ps1[i] = double(float(c.ps1[i]));
+    c.r[0] = c.lr; c.r[11] = entry - 96;
+    const double zero = f32_at(c, c.r[2] - 26264);
+    const V3 a = vld(c, pa), b = vld(c, pb), cc = vld(c, pc), p = vld(c, pp);
+    const V3 ab = vsub(b, a), ac = vsub(cc, a), ap = vsub(p, a);
+    fr.vec(80, ab); fr.vec(68, ac); fr.vec(56, ap);
+    const double d1 = vdot(ab, ap), d2 = vdot(ac, ap);
+    if (d1 <= zero && d2 <= zero) return put_vertex(c, out, pa, region, 0);
+    const V3 bp = vsub(p, b);
+    fr.vec(44, bp);
+    const double d3 = vdot(ab, bp), d4 = vdot(ac, bp);
+    if (d3 >= zero && d4 <= d3) return put_vertex(c, out, pb, region, 1);
+    const double vc = rs(std::fma(d1, d4, -rs(d3 * d2)));
+    if (vc <= zero && d1 >= zero && d3 <= zero) {   // edge ab
+        const double v = rs(d1 / rs(d1 - d3));
+        const V3 s = vscale(ab, v), q = vadd(s, a);
+        fr.vec(20, q);
+        return put_point(c, out, q, region, 3);
+    }
+    const V3 cp = vsub(p, cc);
+    fr.vec(32, cp);
+    const double d5 = vdot(ab, cp), d6 = vdot(ac, cp);
+    if (d6 >= zero && d5 <= d6) return put_vertex(c, out, pc, region, 2);
+    const double vb = rs(std::fma(d5, d2, -rs(d1 * d6)));
+    if (vb <= zero && d2 >= zero && d6 <= zero) {   // edge ac
+        const double w = rs(d2 / rs(d2 - d6));
+        const V3 q = vadd(vscale(ac, w), a);
+        fr.vec(20, q);
+        return put_point(c, out, q, region, 4);
+    }
+    const double va = rs(std::fma(d3, d6, -rs(d5 * d4)));
+    if (va <= zero) {
+        const double e43 = rs(d4 - d3);
+        if (e43 >= zero) {
+            const double e56 = rs(d5 - d6);
+            if (e56 >= zero) {   // edge bc
+                const double w = rs(e43 / rs(e43 + e56));
+                const V3 q = vadd(vscale(vsub(cc, b), w), b);
+                fr.vec(20, q);
+                return put_point(c, out, q, region, 5);
+            }
+        }
+    }
+    const double denom = rs(f32_at(c, c.r[2] - 26260) / rs(vc + rs(va + vb)));   // inside: one / (va + vb + vc)
+    const double v = rs(vb * denom), w = rs(vc * denom);
+    const V3 sb = vscale(ab, v), sc = vscale(ac, w), q = vadd(vadd(a, sb), sc);
+    fr.vec(8, sc); fr.vec(20, q);
+    return put_point(c, out, q, region, 6);
+}
+}  // namespace
+void hle_ClosestPtTriangle(ppc::Ctx& c) { closest_pt_triangle(c); }
+
+// int SphereTriangleHit(Vec* hit, Vec* center, Vec* a, Vec* b, Vec* c, int* region, f32 radius)   r3..r8, f1 -> r3
+// 80197AC8: the closest point of the triangle to the center (above, into its frame); a hit when it lies within the radius, then *hit = that point.
+void hle_SphereTriangleHit(ppc::Ctx& c) {
+    const uint32_t entry = c.r[1], frame = entry - 64, hit = c.r[3], center = c.r[4];
+    const uint32_t r30 = c.r[30], r31 = c.r[31], lr = c.lr;
+    const double f31 = c.f[31], ps31 = c.ps1[31], radius = c.f[1];
+    // Frame -64: back chain, link register at +68, f31 at +48 (stfd) and +56 (psq_st), r31 at +44, r30 at +40; the point at +20, the offset at +8.
+    const DeadFrame fr(c, frame, 72);
+    fr.u32(0, entry); fr.u32(68, lr); fr.f64(48, f31); fr.pair(56, f31, ps31); fr.u32(44, r31); fr.u32(40, r30);
+    c.f[31] = radius; c.r[31] = center; c.r[30] = hit;
+    c.r[1] = frame; c.r[3] = frame + 20; c.lr = 0x80197AF8u;
+    const V3 q = closest_pt_triangle(c), d = vsub(q, vld(c, center));
+    fr.vec(8, d);
+    const bool inside = vdot(d, d) <= rs(radius * radius);
+    if (inside) {
+        ppc::wr32(c, hit, through_double(f32_bits(q.xy[0]))); ppc::wr32(c, hit + 4, through_double(f32_bits(q.xy[1]))); ppc::wr32(c, hit + 8, through_double(f32_bits(q.z)));
+    }
+    c.r[3] = inside ? 1 : 0;
+    c.f[31] = f31; c.ps1[31] = double(float(ps31)); c.r[30] = r30; c.r[31] = r31; c.r[0] = lr; c.lr = lr; c.r[1] = entry;
+}

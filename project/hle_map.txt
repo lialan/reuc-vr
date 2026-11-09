@@ -301,6 +301,8 @@ KPADEnableMotor Nop
 @80394548 Leaf_80394548
 @800ABCE0 Leaf_800ABCE0
 @800460A0 SegmentTriangleHit   # the game's segment/triangle collision test built on the vector routines above
+@801371B4 ClosestPtTriangle   # the game's closest point on a triangle (Ericson), the same vector routines on locals
+@80197AC8 SphereTriangleHit   # sphere against triangle: the closest point above, then a squared-distance test
 
 # --- Register save/restore helpers of the compiler (runtime/hle/sdk_regs.cpp): _savefpr_N, _restfpr_N, _savegpr_N, _restgpr_N for N = 14..31; the entry for register N is the base + 4 * (N - 14)
 @80289D28 SaveFpr14
