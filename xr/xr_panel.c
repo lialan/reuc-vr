@@ -7,14 +7,15 @@
 int xp_count(const XpPanel *menu) { return menu->page == 2 ? XC_COUNT : menu->page ? XD_COUNT : XP_COUNT; }
 /* The game's controls on the Touch controllers (game/xr_android.cpp maps them to the Wii Remote's buttons; the knife and the shakes
  * come from the gun's swings). The gun hand's lower face button is A on the right controller, X on the left. */
-static void controls_items(XmItem *it)
+static void controls_items(const LgXrSettings *cfg,XmItem *it)
 {
     static const char *const rows[XC_COUNT][2] = {
         { "Fire / confirm", "Trigger" }, { "Reload", "Grip" }, { "Action / pick up", "A (X on the left)" },
         { "Knife", "Hold A, swing the gun" }, { "Grenade", "Hold A, pull trigger" }, { "Next weapon", "B (Y on the left)" },
         { "Shake prompts", "Shake the gun" }, { "Pause", "Thumbstick click" }, { "This menu", "Menu button" },
-        { "Switch gun hand", "Trigger, other hand" }, { "Back", "" } };
+        { "Switch gun hand", "Trigger, other hand" }, { "Vibration", "" }, { "Back", "" } };
     for (int i = 0; i < XC_COUNT; i++) { it[i].label = rows[i][0]; snprintf(it[i].value, 40, "%s", rows[i][1]); }
+    snprintf(it[XC_VIBRATION].value, 40, "%s", cfg->vibration ? "On" : "Off");   /* the game's own rumble (WPADControlMotor) */
 }
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
@@ -42,7 +43,7 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
 }
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
-    if (menu->page == 2) { controls_items(it); return; }
+    if (menu->page == 2) { controls_items(cfg, it); return; }
     if (menu->page) { display_items(cfg, running_resolution, running_width, it); return; }
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
@@ -94,7 +95,9 @@ static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
 unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *rates,int nrates)
 {
     if(item<0||item>=xp_count(p))return 0;
-    if(p->page==2){if(item==XC_BACK){p->page=0;p->hover=-1;p->dirty=1;}return 0;}
+    if(p->page==2){
+        if(item==XC_VIBRATION){cfg->vibration=!cfg->vibration;p->dirty=1;return XP_SAVE;}
+        if(item==XC_BACK){p->page=0;p->hover=-1;p->dirty=1;}return 0;}
     if(p->page){p->reset_armed=0;return display_choose(p,cfg,item);}
     static const float screens[]={2,2.5f,3,4,5};const int armed=p->reset_armed;
     unsigned effects=XP_SAVE;p->reset_armed=0;

@@ -534,6 +534,19 @@ void XrCompositor::finish_input() {
     if ((effects & XP_RESTART) && config_.restart) config_.restart();
     const auto& haptics = panel_.haptics();
     for (int h = 0; h < 2; ++h) if (haptics[h].milliseconds) rumble(h, haptics[h].amplitude, haptics[h].milliseconds);
+    // The game's own vibration (WPADControlMotor: shots, hits, prompts): each player's motor on that player's gun hand. The game's taps are a frame
+    // or two long, so each is held 60 ms and an automatic weapon's are bridged into one rumble (rumble_hold.h); while held, every frame renews a
+    // 30 ms pulse, so the controller stops at most 30 ms after the hold. Nothing while the panel is open or the input is not focused (a tap is
+    // dropped, not resumed), or with the Controls page's Vibration off.
+    if (config_.game_motors) {
+        constexpr uint64_t kHoldMs = 60, kBurstMs = 250; constexpr float kAmplitude = .8f; constexpr int kPulseMs = 30;
+        const unsigned game = config_.game_motors();   // every frame, so the taps since the last call do not pile up
+        const bool allowed = settings.vibration && input_focused_ && !panel_.open();
+        const unsigned motors = rumble_hold_.apply(allowed ? game : 0u, uint64_t(frame_.predictedDisplayTime / 1000000), kHoldMs, kBurstMs);
+        const int gun = controls_.gun_hand();
+        if (allowed) for (int player = 0; player < (control_settings.dual ? 2 : 1); ++player)
+            if (motors & (1u << player)) rumble(player ? 1 - gun : gun, kAmplitude, kPulseMs);
+    }
 }
 
 int XrCompositor::sharpen_level() const {

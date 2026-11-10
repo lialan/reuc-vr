@@ -3,6 +3,7 @@
 #include "gx_audit.h"
 #include "wide_view.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -19,6 +20,8 @@ uc::NativeInput* second_input;
 unsigned sampled_channel=0;
 unsigned aim_channel=0;   // the pad whose pointer drives the local reticle (network play: the local player's slot)
 bool aim_exact=false;   // network play: the reticle follows the mouse exactly (late_aim.h)
+std::atomic<unsigned> rumble_motors{0};   // the game's motor per player (bit 0, bit 1): set by the guest thread, read by the host (upstream d3391f9)
+std::atomic<unsigned> rumble_taps{0};     // the motors the game switched on since the host last looked: a tap that began and ended between two looks is not lost
 std::function<void(const ppc::Ctx&)> input_poll;
 uc::InputProbe input_probe;
 uc::InputMap input_map;
@@ -447,6 +450,7 @@ std::array<float,2> input_consumed_aim() { auto* source=aim_channel==1 ? second_
 std::optional<std::array<float,2>> input_consumed_aim_of(unsigned channel) { auto* source=channel==0 ? input : channel==1 ? second_input : nullptr; if(!source) return std::nullopt; return source->consumed_aim(); }
 void input_hle_set_aim_channel(unsigned channel) { aim_channel=channel; aim_exact=true; }
 bool input_aim_exact() { return aim_exact; }
+unsigned input_rumble_local() { const unsigned motors=rumble_motors|rumble_taps.exchange(0); return aim_exact ? (motors>>aim_channel)&1 : motors; }
 bool input_demo_playing() { return input && input->demo_playing(); }
 unsigned input_aim_channel() { return aim_channel; }
 InputSample NativeInput::consume() { return consume_at(motion_time()); }
@@ -579,7 +583,7 @@ InputFrame NativeInput::capture_frame() {
     return frame;
 }
 void NativeInput::install_frame(const InputFrame& frame) { std::lock_guard lock(mutex_); network_frame_=frame; previous_x_=frame.sample.x;previous_y_=frame.sample.y; }
-void input_hle_init(NativeInput* source,NativeInput* second) { input=source; second_input=second; sampled_channel=0; aim_channel=0; aim_exact=false; }
+void input_hle_init(NativeInput* source,NativeInput* second) { input=source; second_input=second; sampled_channel=0; aim_channel=0; aim_exact=false; rumble_motors=0; rumble_taps=0; }
 void input_hle_set_poll(std::function<void(const ppc::Ctx&)> poll) { input_poll=std::move(poll); }
 unsigned input_hle_channel() { return sampled_channel; }
 void input_hle_restore_channel(unsigned channel) {
@@ -615,6 +619,13 @@ void hle_KPADRead(ppc::Ctx& c) {
     ppc::wrf32(c,buffer+0x6C,-1); ppc::wrf32(c,buffer+0x74,1); // Neutral Nunchuk gravity.
     c.r[3]=1;
     if(channel==0 && input_probe) input_probe(c,sample);
+}
+// WPADControlMotor(chan, command): command 1 starts the remote's motor, 0 and 2 (the SDK's stop and hard stop) stop it. The headset plays it on the
+// gun hand's controller (input_rumble_local, renderer/xr_compositor.cpp).
+void hle_WPADControlMotor(ppc::Ctx& c) {
+    const auto channel=c.r[3];
+    if(channel>1) return;
+    if(c.r[4]==1) { rumble_motors|=1u<<channel; rumble_taps|=1u<<channel; } else rumble_motors&=~(1u<<channel);
 }
 void hle_WPADProbe(ppc::Ctx& c) {
     const auto channel=c.r[3],type=c.r[4];

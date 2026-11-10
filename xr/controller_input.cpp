@@ -37,7 +37,7 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
             const bool firing=frame.trigger[hand]&&frame.aimed[pl]&&!frame.blocked;
             if(firing&&!controls_.prev_trigger[hand])fire_start_[pl]=time;
             const float phase=firing?std::fmod(float((time-fire_start_[pl])/1000000)/100.f,1.f):1.f;
-            if(firing&&phase<fire_phase_[pl])haptics[hand]={.7f,35};
+            // the recoil you feel is the game's own vibration (renderer/xr_compositor.cpp), no longer a pulse every 100 ms of held trigger; phase still drives the gun model's kick
             if(frame.trigger[hand]&&!frame.aimed[pl]&&!controls_.prev_trigger[hand]&&!frame.blocked)haptics[hand]={.3f,40};
             auto &f=overlay_[pl];f.gun_valid=next.valid[pl];f.p2=pl;
             if(f.gun_valid) {

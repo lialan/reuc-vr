@@ -6,6 +6,7 @@
 //
 // Per presented game frame (VulkanRenderer::render): begin_frame() (xrWaitFrame/xrBeginFrame/xrLocateViews, acquire), record() into that
 // frame's command buffer, the queue submit, end_frame(). begin_frame() false: nothing is drawn, end_frame(false) still closes the frame.
+#include "../common/rumble_hold.h"
 #include "../xr/stereo_scene.hpp"
 #include "../xr/controller_input.hpp"
 #include "../xr/settings_panel.hpp"
@@ -47,6 +48,7 @@ struct XrConfig {
     xr::StereoSettings stereo{};      // scale (game units per metre), screen distance, HUD pitch
     LgXrSettings settings = LG_XR_SETTINGS_DEFAULT;   // vr.cfg: the settings panel edits and saves it (HOTD4's panel)
     std::function<void()> restart;    // the panel's "Reset game" (the activity's restartGame)
+    std::function<unsigned()> game_motors;   // the game's rumble motors since the last call (input_rumble_local: bit 0 first player, bit 1 second)
 };
 void xr_check(XrResult result, const char* what);
 
@@ -164,6 +166,7 @@ private:
     bool lens_seen_ = false;
     xr::ControllerInput controls_;
     xr::SettingsPanel panel_;
+    uc::RumbleHold rumble_hold_;   // the game's taps held long enough to be felt (rumble_hold.h)
     XrOverlay overlay_;
     void controller_frame(bool tracked);
     AimGeometry aim_geometry_;

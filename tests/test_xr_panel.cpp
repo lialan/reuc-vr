@@ -70,7 +70,13 @@ int main() {
     xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
     CHECK(std::strcmp(items[XC_KNIFE].label, "Knife") == 0 && std::strcmp(items[XC_KNIFE].value, "Hold A, swing the gun") == 0);
     CHECK(std::strcmp(items[XC_BACK].label, "Back") == 0 && items[XC_BACK].value[0] == 0);
-    for (int i = 0; i < XC_BACK; i++) CHECK(items[i].value[0] != 0 && xp_choose(&panel, &cfg, &hand, i, nullptr, 0) == 0 && panel.page == 2);
+    for (int i = 0; i < XC_VIBRATION; i++) CHECK(items[i].value[0] != 0 && xp_choose(&panel, &cfg, &hand, i, nullptr, 0) == 0 && panel.page == 2);
+    {   // the Vibration switch: on by default, toggled and saved, the page stays
+        CHECK(cfg.vibration == 1 && std::strcmp(items[XC_VIBRATION].label, "Vibration") == 0 && std::strcmp(items[XC_VIBRATION].value, "On") == 0);
+        CHECK(xp_choose(&panel, &cfg, &hand, XC_VIBRATION, nullptr, 0) == XP_SAVE && cfg.vibration == 0 && panel.page == 2);
+        xp_items(&panel, &cfg, hand, 0, 0, 0, items); CHECK(std::strcmp(items[XC_VIBRATION].value, "Off") == 0);
+        CHECK(xp_choose(&panel, &cfg, &hand, XC_VIBRATION, nullptr, 0) == XP_SAVE && cfg.vibration == 1);
+    }
     CHECK(std::memcmp(&before, &cfg, sizeof cfg) == 0);
     CHECK(xp_choose(&panel, &cfg, &hand, XC_BACK, nullptr, 0) == 0 && panel.page == 0);
 

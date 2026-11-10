@@ -565,6 +565,10 @@ add_test(NAME test_step_audit COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_S
 add_test(NAME test_docs_links COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_docs_links.py ${CMAKE_SOURCE_DIR})
 add_test(NAME test_mod_api_generated COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_mod_api_generated.py ${CMAKE_SOURCE_DIR})
 add_test(NAME test_build_tools COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_build_tools.py ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/build_tools)
+add_executable(test_rumble_hold test_rumble_hold.cpp)
+target_include_directories(test_rumble_hold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/common)
+add_test(NAME test_rumble_hold COMMAND test_rumble_hold)
+
 foreach(t test_dol test_dol_scan test_isa test_analyzer test_isa_roundtrip test_emit test_dsy test_format test_host_compat test_sha256)
   add_executable(${t} ${t}.cpp)
   target_link_libraries(${t} PRIVATE uc_common)

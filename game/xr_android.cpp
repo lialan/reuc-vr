@@ -84,6 +84,7 @@ std::unique_ptr<XrCompositor> make_android_xr() {
         if (!SDL_PushEvent(&quit)) restart_requested=false;
         else std::fprintf(stderr,"[android] reset: orderly shutdown requested\n");
     };
+    config.game_motors = [] { return input_rumble_local(); };   // the game's rumble (runtime/native_input.cpp) on the gun hand
     std::fprintf(stderr, "[xr] vr.cfg: eye %dx%d, %d Hz, foveation %d, screen %.2f m, scale %.2f, aim %.1f m\n", settings.width, settings.resolution,
                  settings.refresh, settings.foveation, settings.screen, settings.scale, settings.aim);
     return std::make_unique<XrCompositor>(config, XrPlatform{vm, held});

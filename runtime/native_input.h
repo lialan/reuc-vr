@@ -166,9 +166,11 @@ std::optional<std::array<float,2>> input_consumed_aim_of(unsigned channel);   //
 bool input_demo_playing();   // a demo replays the recorded samples: the live pointer is not what the game consumed
 bool input_aim_exact();   // true once a network session set the aim channel
 std::optional<TrackedRay> input_xr_ray(unsigned channel);
+unsigned input_rumble_local();   // the game's motors (bit 0 first player, bit 1 second; network play: only the local player's, as bit 0), and every motor switched on since the previous call even if off again (call once per frame)
 unsigned input_aim_channel();   // the local player's pad (0 outside network play)
 void input_hle_set_aim_channel(unsigned channel);   // network play: the local player's pad (0 host, 1 client); reset to 0 by input_hle_init
 uint32_t input_demo_speed(uint32_t live);   // the clock speed factor the deterministic game pacing uses (recorded and replayed with the demo; live without input)
 }
 void hle_KPADRead(ppc::Ctx&);
 void hle_WPADProbe(ppc::Ctx&);
+void hle_WPADControlMotor(ppc::Ctx&);
