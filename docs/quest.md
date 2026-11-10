@@ -1,0 +1,28 @@
+# Meta Quest 3 (VR)
+
+The Quest app (`reuc-*.apk`) contains the port only. The game comes from **your own disc image** of the North American release (`RBUE08`). The app reads its files straight from the image every time, so it does not need to be unpacked.
+
+## Install
+
+1. Install the APK with SideQuest or `adb install reuc-release.apk`.
+2. Connect the headset to the computer over USB and copy your image (`.wbfs` or `.iso`) into the folder **`UmbrellaChronicles`** at the top of the headset's internal shared storage, so that it is at
+
+   ```
+   /sdcard/UmbrellaChronicles/RBUE08.wbfs
+   ```
+
+   (any file name ending in `.wbfs` or `.iso` works; `/sdcard/Download/` is searched as well).
+3. **The Wii common key.** Wii discs are encrypted. Unless your APK was built with the key in it (see below), also copy the Wii common key, a 16-byte file named **`common-key.bin`**, into the same folder. The port does not include this key.
+4. Start **Umbrella Chronicles VR** from the library (Unknown Sources). On the first start, allow the app to **access all files** when it asks, then start it again.
+
+If something is missing or wrong, the app shows a message and writes `HOW-TO-ADD-THE-GAME.txt` into `/sdcard/Android/data/org.uc.umbrellachronicles.vr/files/`. These images are refused: other regions (`RBUP08`, `RBUJ08`), a `main.dol` that differs from the one the APK was built for, and the `.rvz`, `.ciso`, `.wia` and split-`.wbfs` formats. Convert those to a plain `.iso` or one `.wbfs` first (for example with Dolphin or Wit).
+
+An unpacked disc (`/sdcard/UmbrellaChronicles/game/DATA/sys/main.dol`, as older builds needed) still works. The app uses it only when it finds no image.
+
+## Building the APK
+
+See the header of `scripts/build-quest.sh`. The build translates `main.dol` from `UC_INSTALL_DIR` and records its SHA-256 in the APK. At start-up the game checks the `main.dol` inside the player's image against it.
+
+`UC_WII_COMMON_KEY_FILE` (in `local.env`, a 16-byte file on the build machine) builds the common key into that APK, so players need only the image. The key never enters the repository. A default build contains no key.
+
+On a desktop build, `--game <image.wbfs>` reads an image the same way, with `common-key.bin` next to the image or next to the executable. `UC_WII_COMMON_KEY` (32 hex digits) in the environment also works.

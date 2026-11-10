@@ -14,6 +14,7 @@ android {
         versionName(project.findProperty("appVersionName") ?: "0.1.0")
         // the SHA-256 of the main.dol the game's code was translated from (scripts/build-quest.sh)
         resValue("string", "dol_sha256", project.findProperty("dolSha256") ?: "")
+        resValue("bool", "common_key_embedded", (project.findProperty("commonKeyEmbedded") ?: "0") == "1" ? "true" : "false")
         ndk { abiFilters 'arm64-v8a' }
     }
 

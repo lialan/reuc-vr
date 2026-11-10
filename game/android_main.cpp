@@ -1,8 +1,11 @@
 // Starts Resident Evil: The Umbrella Chronicles on Meta Quest (the HOTD4 VR start-up, games/hotd4/src/android_main.c, for this game).
 //
-// SDL's Java side calls SDL_main. The game's disc files are not in the APK: they are copied to the headset, and looked for in turn at
-//   <app's own folder>/game/DATA/sys/main.dol        (/sdcard/Android/data/<package>/files; a diagnostic run's private folder)
-//   /sdcard/UmbrellaChronicles/game/DATA/sys/main.dol (needs all-files access)
+// SDL's Java side calls SDL_main. The game is not in the APK: the player copies their own disc image (.wbfs or .iso, RBUE08) to the headset,
+// and the game reads its files from it in place (runtime/wii_disc.h). Looked for in turn, in each of
+//   <app's own folder>                (/sdcard/Android/data/<package>/files; a diagnostic run's private folder)
+//   /sdcard/UmbrellaChronicles        (needs all-files access)
+//   /sdcard/Download
+// first a disc image (the first .wbfs/.iso by name), then an unpacked disc (game/DATA/sys/main.dol, as before).
 // The port's own files (data/shaders, data/pipeline_keys.seed) are APK assets, unpacked into the app's own folder on the first start and
 // after an update (data.files lists them; data.stamp names the build). That folder then stands in for the executable's (UC_EXE_PATH):
 // config.json, logs and saves live there.
@@ -21,10 +24,13 @@ extern "C" int __llvm_profile_write_file(void);
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -137,6 +143,24 @@ void unpack_data(const std::string& own) {
     std::fprintf(stderr, "[android] unpacked %u files, %u failed\n", files, failed);
 }
 
+// The first disc image in a folder, by name (empty if none).
+std::string find_image(const std::string& folder) {
+    std::vector<std::string> names;
+    if (DIR* dir = opendir(folder.c_str())) {
+        while (const dirent* e = readdir(dir)) {
+            std::string name = e->d_name;
+            if (name.size() < 5 || name[0] == '.') continue;
+            std::string ext = name.substr(name.size() - 5);
+            for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+            if (ext == ".wbfs" || ext.substr(1) == ".iso") names.push_back(name);
+        }
+        closedir(dir);
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) if (access((folder + "/" + name).c_str(), R_OK) == 0) return folder + "/" + name;
+    return {};
+}
+
 struct Run { std::vector<std::string> args; int rc = 1; };
 void* run_game(void* arg) {
     auto& run = *static_cast<Run*>(arg);
@@ -157,22 +181,23 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** 
     log_to_logcat();
     if (own.empty()) { std::fprintf(stderr, "[android] no app folder\n"); return 1; }
     unpack_data(own);
-    const std::string bases[2] = {own, diagnostic ? std::string() : std::string("/sdcard/UmbrellaChronicles")};
-    std::string base;
-    for (const auto& b : bases)
-        if (!b.empty() && access((b + "/game/DATA/sys/main.dol").c_str(), R_OK) == 0) { base = b; break; }
-    if (base.empty()) {
-        std::fprintf(stderr, "[android] no game found: copy the game folder (game/DATA/...) to %s or %s (and allow the app all-files access)\n",
-                     own.c_str(), bases[1].c_str());
+    std::vector<std::string> bases = {own};
+    if (!diagnostic) { bases.push_back("/sdcard/UmbrellaChronicles"); bases.push_back("/sdcard/Download"); }
+    std::string game;
+    for (const auto& b : bases) if ((game = find_image(b)).size()) break;
+    if (game.empty())
+        for (const auto& b : bases) if (access((b + "/game/DATA/sys/main.dol").c_str(), R_OK) == 0) { game = b + "/game"; break; }
+    if (game.empty()) {
+        std::fprintf(stderr, "[android] no game found: copy your disc image (RBUE08 .wbfs or .iso) to /sdcard/UmbrellaChronicles (and allow the app all-files access)\n");
         return 1;
     }
-    std::fprintf(stderr, "[android] game %s/game, app folder %s\n", base.c_str(), own.c_str());
+    std::fprintf(stderr, "[android] game %s, app folder %s\n", game.c_str(), own.c_str());
     if (chdir(own.c_str()) != 0) { std::fprintf(stderr, "[android] cannot enter %s: %s\n", own.c_str(), std::strerror(errno)); return 1; }
     load_env(own + "/env.txt");
     setenv("UC_EXE_PATH", (own + "/uc").c_str(), 1);   // config.json, data/, logs/ beside it (exe_path.h)
 
     Run run;
-    run.args = {"uc", "--game", base + "/game"};
+    run.args = {"uc", "--game", game};
     for (auto& a : load_args(own + "/args.txt")) run.args.push_back(a);
     for (auto& a : run.args) std::fprintf(stderr, "[android] arg %s\n", a.c_str());
     // Every guest call is a host call: the game's main thread gets the same deep stack as HOTD4's.

@@ -14,6 +14,8 @@
 #include "dispatch.h"
 #include "dol.h"
 #include "dvdfs.h"
+#include "sha256.h"
+#include "wii_disc.h"
 #include "texture_replacement.h"
 #include "fatal.h"
 #include "crash_report.h"
@@ -389,16 +391,32 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         for (const fs::path& d : {exe_dir() / "data", exe_dir() / ".." / ".." / "project"}) if (fs::exists(d / n)) { uc::symbols_load((d / n).string()); break; }
     }
 
-    auto dol_bytes = slurp(game / "DATA" / "sys" / "main.dol");
+    // The game: an unpacked disc (the folder holding DATA) or the player's disc image itself (.wbfs or .iso), read in place.
+    std::shared_ptr<const uc::WiiDisc> disc_image;
+    std::error_code game_error;
+    if (fs::is_regular_file(game, game_error)) {
+        const auto key = uc::load_wii_common_key({game.parent_path() / "common-key.bin", exe_dir() / "common-key.bin"});
+        if (!key) uc::fatal("%s is a disc image, and reading it needs the Wii common key: put common-key.bin (16 bytes) next to it", game.string().c_str());
+        std::string error;
+        auto opened = uc::WiiDisc::open(game, *key, error);
+        if (!opened) uc::fatal("cannot read the disc image %s: %s", game.string().c_str(), error.c_str());
+        if (opened->game_id() != "RBUE08") uc::fatal("the disc image %s is %s; only the North American release (RBUE08) is supported", game.string().c_str(), opened->game_id().c_str());
+        disc_image = std::move(opened);
+    }
+    auto dol_bytes = disc_image ? disc_image->main_dol() : slurp(game / "DATA" / "sys" / "main.dol");
     auto dol = uc::parse_dol(dol_bytes);
-    if (!dol.ok) uc::fatal("cannot load %s: %s", (game / "DATA" / "sys" / "main.dol").string().c_str(), dol.error.c_str());
+    if (!dol.ok) uc::fatal("cannot load %s: %s", disc_image ? (game.string() + " main.dol").c_str() : (game / "DATA" / "sys" / "main.dol").string().c_str(), dol.error.c_str());
+#ifdef UC_DOL_SHA256
+    // The translated code fits exactly one main.dol (the build's): an image of another revision would run the wrong code.
+    if (const auto sha = uc::sha256_hex(dol_bytes); sha != UC_DOL_SHA256) uc::fatal("this game's main.dol (SHA-256 %s) is not the one this build was made for (%s)", sha.c_str(), UC_DOL_SHA256);
+#endif
 
     uc::guest_mem_init();
     ppc::Ctx boot{};
     boot.mem = uc::guest_mem_base();
     for (const auto& s : dol.image.sections) std::memcpy(boot.mem + (s.address & 0x3FFFFFFFu), dol_bytes.data() + s.file_offset, s.size);   // BSS is already zero
     uint8_t hdr[32] = {};
-    auto boot_bin = slurp(game / "DATA" / "sys" / "boot.bin");
+    auto boot_bin = disc_image ? disc_image->boot_bin() : slurp(game / "DATA" / "sys" / "boot.bin");
     std::memcpy(hdr, boot_bin.data(), std::min<size_t>(32, boot_bin.size()));
     uc::LowMemInfo info;
     info.arena_lo = uc::arena_lo_after_bss(dol.image.bss_address, dol.image.bss_size);
@@ -409,7 +427,8 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
     static const uc::mods::GuestCallBackend guest_calls{&uc::has_function, &uc::call_indirect};   // mods calling game functions (modding/mod_guest_call.h)
     uc::mods::set_guest_call_backend(&guest_calls);
     uc::DvdFs dvd;
-    if (!dvd.open_root(game / "DATA" / "files")) uc::fatal("game files not found under %s", (game / "DATA" / "files").string().c_str());
+    if (disc_image) dvd.open_disc(disc_image);
+    else if (!dvd.open_root(game / "DATA" / "files")) uc::fatal("game files not found under %s", (game / "DATA" / "files").string().c_str());
     // Mods: their file overlays go into the disc tree now, before the game opens anything; the scripts start once the guest is about to run.
     uc::GameMods mods(exe_dir(), input_config.properties.contains("mods") ? input_config.properties["mods"] : nlohmann::ordered_json::object(), dvd,
                       std::string(reinterpret_cast<const char*>(hdr), 6), options.no_mods);

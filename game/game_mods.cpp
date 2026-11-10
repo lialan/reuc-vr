@@ -122,14 +122,7 @@ void GameMods::refresh_files(bool initial) {
     }
     {   // the archive members of the active mods, applied to the disc's archives (read from the disc folder, never through the overlay)
         const auto base = [&](const std::string& disc_path) -> std::optional<std::vector<uint8_t>> {
-            std::error_code file_error;
-            const fs::path file = dvd_->disc_root() / fs::path(std::u8string(disc_path.begin(), disc_path.end()));
-            const uintmax_t size = fs::is_regular_file(file, file_error) ? fs::file_size(file, file_error) : 0;
-            if (size == 0 || size > mods::U8Archive::kMaxArchiveBytes) return std::nullopt;
-            std::vector<uint8_t> bytes(size);
-            std::ifstream in(file, std::ios::binary);
-            if (!in.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(size))) return std::nullopt;
-            return bytes;
+            return dvd_->disc_file(disc_path, mods::U8Archive::kMaxArchiveBytes);   // the unpacked folder's file or the disc image's
         };
         auto built = mods::build_arc_mods(mods_dir_ / ".cache", active, base, &arc_memo_);
         arc_root_ = std::move(built.root);

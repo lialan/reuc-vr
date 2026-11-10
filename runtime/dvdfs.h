@@ -11,15 +11,22 @@
 
 namespace uc {
 
+class WiiDisc;
+
 class DvdFs {
 public:
     DvdFs() = default;
-    DvdFs(DvdFs&& other) noexcept : e_(std::move(other.e_)), index_(std::move(other.index_)), undo_(std::move(other.undo_)), hidden_(std::move(other.hidden_)), root_(std::move(other.root_)) {}   // (the lock stays behind)
+    DvdFs(DvdFs&& other) noexcept : e_(std::move(other.e_)), index_(std::move(other.index_)), undo_(std::move(other.undo_)), hidden_(std::move(other.hidden_)), root_(std::move(other.root_)), disc_(std::move(other.disc_)), disc_files_(std::move(other.disc_files_)) {}   // (the lock stays behind)
     DvdFs& operator=(DvdFs&& other) noexcept {
         e_ = std::move(other.e_); index_ = std::move(other.index_); undo_ = std::move(other.undo_); hidden_ = std::move(other.hidden_); root_ = std::move(other.root_);
+        disc_ = std::move(other.disc_); disc_files_ = std::move(other.disc_files_);
         return *this;
     }
     bool open_root(const std::filesystem::path& root);
+    // The files of a disc image read in place (runtime/wii_disc.h): the same tree and entry numbers an unpacked DATA/files folder gets.
+    bool open_disc(std::shared_ptr<const WiiDisc> disc);
+    // A file of the game's own (never an overlay's): the disc image's, or root/rel of the folder. nullopt when absent, empty or above max_bytes.
+    std::optional<std::vector<uint8_t>> disc_file(const std::string& rel, uint64_t max_bytes) const;
     const std::filesystem::path& disc_root() const { return root_; }   // the folder open_root was given (the game's own files, whatever the overlays hold); empty before
     // Mod files: every regular file below files_root replaces the disc file with the same path (case-insensitive; the entry keeps its
     // number) or is added with its parent folders. Symlinks and junctions are skipped, and so are folders named *.arc! (their files are members of an
@@ -37,13 +44,13 @@ public:
     int64_t read(int entry, void* dst, uint32_t len, uint32_t offset) const;   // bytes read (short at EOF), -1 on a bad entry
     // What an entry holds at this moment. A game that opened a file keeps reading this version while a mod's overlay swaps the entry (a stream that is
     // playing must not change its bytes under the player); the backing file must stay on disk for as long as the handle is open.
-    struct Snapshot { int entry = -1; std::filesystem::path full; uint32_t size = 0; };
+    struct Snapshot { int entry = -1; std::filesystem::path full; uint32_t size = 0; bool on_disc = false; uint64_t disc_at = 0; };   // on_disc: in the image, at disc_at
     std::optional<Snapshot> snapshot(int entry) const;   // nullopt for a bad entry or a directory
     int64_t read(const Snapshot& file, void* dst, uint32_t len, uint32_t offset) const;   // like read(entry...) on the version the snapshot names
     size_t entry_count() const { std::shared_lock lock(m_); return e_.size(); }
     std::string path_of(int e) const { std::shared_lock lock(m_); return valid(e) ? e_[size_t(e)].rel : std::string(); }
 private:
-    struct Entry { std::string rel; std::filesystem::path full; bool dir; uint32_t size; bool hidden = false; };
+    struct Entry { std::string rel; std::filesystem::path full; bool dir; uint32_t size; bool hidden = false; bool on_disc = false; uint64_t disc_at = 0; };
     struct Found { std::string rel; std::filesystem::path full; uint32_t size; };
     static std::vector<Found> scan(const std::filesystem::path& files_root);
     size_t apply_locked(const std::filesystem::path& files_root, const std::vector<Found>& files);
@@ -58,6 +65,9 @@ private:
     std::vector<Undo> undo_;             // what overlay() changed, in order
     std::map<std::string, size_t> hidden_;   // lower-case path -> slot of an added entry that was taken back
     std::filesystem::path root_;
+    std::shared_ptr<const WiiDisc> disc_;
+    std::map<std::string, std::pair<uint64_t, uint32_t>> disc_files_;   // lower-case path -> the image's offset, size (open_disc)
+    int64_t read_bytes(const std::filesystem::path& full, bool on_disc, uint64_t disc_at, uint32_t size, void* dst, uint32_t len, uint32_t offset) const;
 };
 
 struct DvdStats { uint64_t opens = 0, reads = 0, bytes = 0; };

@@ -28,10 +28,15 @@ for need in "$NDK/build/cmake/android.toolchain.cmake" "$OXR/jni/arm64-v8a/libop
 done
 [ -f "$ROOT/generated/game_sources.cmake" ] || { echo "ERROR: generated/ is empty: run scripts/build.sh --translate-only first" >&2; exit 1; }
 
+DOL_SHA="$(shasum -a 256 "${UC_INSTALL_DIR:?set UC_INSTALL_DIR (local.env)}/game/DATA/sys/main.dol" | cut -d' ' -f1)"
+# The Wii common key for reading the player's disc image in place: by default the player puts common-key.bin next to the image.
+# UC_WII_COMMON_KEY_FILE (a 16-byte file on this machine, e.g. in local.env) builds it into this APK instead; it never enters the sources.
+KEY_ARGS=(-DUC_WII_COMMON_KEY_FILE="${UC_WII_COMMON_KEY_FILE:-}"); KEY_EMBEDDED=0; [ -n "${UC_WII_COMMON_KEY_FILE:-}" ] && KEY_EMBEDDED=1
+
 echo "[1/4] Configure and build libmain.so (arm64-v8a)"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DUC_SLANGC="$SLANGC" -DUC_THINLTO="${UC_THINLTO:-ON}" \
-  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" "${PGO_ARGS[@]}" > "$BUILD.configure.log" 2>&1 \
+  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" -DUC_DOL_SHA256="$DOL_SHA" "${KEY_ARGS[@]}" "${PGO_ARGS[@]}" > "$BUILD.configure.log" 2>&1 \
   || { echo "ERROR: configure failed (see $BUILD.configure.log)" >&2; tail -20 "$BUILD.configure.log" >&2; exit 1; }
 cmake --build "$BUILD" --target uc || { echo "ERROR: build failed" >&2; exit 1; }
 grep -h "PGO profile" "$BUILD.configure.log" || echo "PGO: $PGO_MODE (no profile in use)"
@@ -47,11 +52,10 @@ cp -R "$BUILD/_deps/sdl3-src/android-project/app/src/main/java" "$APP/sdl-java"
 
 echo "[3/4] Gradle (offline)"
 echo "sdk.dir=$SDK" > "$ROOT/quest/local.properties"
-DOL_SHA="$(shasum -a 256 "${UC_INSTALL_DIR:?set UC_INSTALL_DIR (local.env)}/game/DATA/sys/main.dol" | cut -d' ' -f1)"
 # Debug by default, as gse-recomp's Vulkan Quest builds: run-as (the runner's private game folder) needs a debuggable app. The native code is
 # the optimised build either way. UC_APK_TYPE=release for the signed release variant.
 TYPE="${UC_APK_TYPE:-debug}"; TASK="assemble$(echo "${TYPE:0:1}" | tr a-z A-Z)${TYPE:1}"
-( cd "$ROOT/quest" && JAVA_HOME="$JDK" ./gradlew --offline -q ":reuc:$TASK" -PdolSha256="$DOL_SHA" )
+( cd "$ROOT/quest" && JAVA_HOME="$JDK" ./gradlew --offline -q ":reuc:$TASK" -PdolSha256="$DOL_SHA" -PcommonKeyEmbedded="$KEY_EMBEDDED" )
 
 APK="$ROOT/quest/reuc/build/outputs/apk/$TYPE/reuc-$TYPE.apk"
 echo "[4/4] $APK ($(du -h "$APK" | cut -f1))"

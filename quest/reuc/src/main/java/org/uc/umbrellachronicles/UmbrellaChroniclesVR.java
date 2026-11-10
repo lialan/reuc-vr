@@ -1,12 +1,14 @@
 // Resident Evil: The Umbrella Chronicles VR for Meta Quest. All of the game runs natively (libmain.so, see game/android_main.cpp);
 // this only checks that the player's game files are there and loads the libraries (HOTD4 VR's HouseOfTheDead4VR.java for this game).
 //
-// The game's files (the folder holding DATA/sys/main.dol) are looked for, as android_main.cpp does:
-//   /sdcard/Android/data/org.uc.umbrellachronicles.vr/files/game   (the app's own folder)
-//   /sdcard/UmbrellaChronicles/game                                 (where players copy it; needs all-files access, which the app asks
-//                                                                    for when it finds no game)
-// The APK holds the game's code translated from one exact main.dol (R.string.dol_sha256); any other version would not run, so it is
-// checked here first. Without a usable game the app writes HOW-TO-ADD-THE-GAME.txt into its folder and closes.
+// The game is the player's own disc image (.wbfs or .iso, RBUE08), read in place by the game. It is looked for, as android_main.cpp does, in
+//   /sdcard/Android/data/org.uc.umbrellachronicles.vr/files   (the app's own folder)
+//   /sdcard/UmbrellaChronicles                                (where players copy it; needs all-files access, which the app asks for when it
+//                                                              finds no game)
+//   /sdcard/Download
+// and an unpacked disc (game/DATA/sys/main.dol) in the first two still works. The APK holds the game's code translated from one exact
+// main.dol (R.string.dol_sha256): an unpacked main.dol is checked here, the one inside an image by the game when it starts. Without a
+// usable game the app writes HOW-TO-ADD-THE-GAME.txt into its folder and closes.
 package org.uc.umbrellachronicles;
 
 import android.content.Intent;
@@ -82,19 +84,34 @@ public class UmbrellaChroniclesVR extends SDLActivity {
         }
 
         File shared = new File(Environment.getExternalStorageDirectory(), "UmbrellaChronicles");
+        File download = new File(Environment.getExternalStorageDirectory(), "Download");
+        File image = null;
+        for (File base : new File[] { own, shared, download }) {
+            if ((image = findImage(base)) != null) break;
+        }
         File dol = null;
-        for (File base : new File[] { own, shared }) {
+        if (image == null) for (File base : new File[] { own, shared }) {
             File f = base == null ? null : new File(base, "game/DATA/sys/main.dol");
             if (f != null && f.canRead()) { dol = f; break; }
         }
         String msg = null;
-        if (dol == null) {
+        if (image != null) {
+            String id = discId(image);
+            Log.i(TAG, "game: disc image " + image + ", " + id);
+            if (!"RBUE08".equals(id)) {
+                msg = image.getName() + " is " + (id == null ? "not a Wii disc image" : "the disc " + id) +
+                      "; the app needs the NTSC-U release RBUE08.";
+            } else if (!getResources().getBoolean(R.bool.common_key_embedded) &&
+                       !new File(image.getParentFile(), "common-key.bin").canRead() && !(own != null && new File(own, "common-key.bin").canRead())) {
+                msg = "Reading " + image.getName() + " needs the Wii common key: put common-key.bin (16 bytes) next to it.";
+            }
+        } else if (dol == null) {
             if (!Environment.isExternalStorageManager()) {
-                msg = "Allow Umbrella Chronicles VR to access all files, copy the game folder (game/DATA/...) to " + shared +
+                msg = "Allow Umbrella Chronicles VR to access all files, copy your disc image (RBUE08 .wbfs) to " + shared +
                       ", then start it again.";
                 askForFileAccess();
             } else {
-                msg = "Game files not found: copy the game folder (game/DATA/...) to " + shared;
+                msg = "Game not found: copy your disc image (RBUE08 .wbfs or .iso) to " + shared;
             }
         } else {
             String want = getString(R.string.dol_sha256).trim();
@@ -136,6 +153,37 @@ public class UmbrellaChroniclesVR extends SDLActivity {
         }
     }
 
+    /* The first .wbfs or .iso in a folder by name, as android_main.cpp's find_image. */
+    private static File findImage(File folder) {
+        String[] names = folder == null ? null : folder.list();
+        if (names == null) return null;
+        java.util.Arrays.sort(names);
+        for (String name : names) {
+            String lower = name.toLowerCase(java.util.Locale.ROOT);
+            if (name.startsWith(".") || !(lower.endsWith(".wbfs") || lower.endsWith(".iso"))) continue;
+            File f = new File(folder, name);
+            if (f.isFile() && f.canRead()) return f;
+        }
+        return null;
+    }
+
+    /* The disc ID of an image: the first 6 bytes of the disc (in a .wbfs file, of the disc header copy one WBFS sector in). */
+    private static String discId(File image) {
+        try (java.io.RandomAccessFile f = new java.io.RandomAccessFile(image, "r")) {
+            byte[] head = new byte[16];
+            f.readFully(head);
+            long at = 0;
+            if (head[0] == 'W' && head[1] == 'B' && head[2] == 'F' && head[3] == 'S') at = 1L << (head[8] & 0xFF);
+            byte[] id = new byte[6];
+            f.seek(at);
+            f.readFully(id);
+            for (byte b : id) if (b < 0x20 || b > 0x7E) return null;
+            return new String(id, "US-ASCII");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private static String sha256(File f) {
         try (InputStream in = new FileInputStream(f)) {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
@@ -156,9 +204,11 @@ public class UmbrellaChroniclesVR extends SDLActivity {
         String text =
             "Umbrella Chronicles VR needs your own copy of Resident Evil: The Umbrella Chronicles (Wii, NTSC-U, RBUE08).\n\n" +
             "Last start: " + msg + "\n\n" +
-            "Unpack the disc (wit extract <image> game --pmode name) and copy the folder so that the game's main.dol ends up at\n\n" +
-            "    /sdcard/UmbrellaChronicles/game/DATA/sys/main.dol\n\n" +
-            "(Internal shared storage > UmbrellaChronicles over USB), and allow the app to access all files when it asks.\n\n" +
+            "Copy your disc image (.wbfs or .iso) into the folder\n\n" +
+            "    /sdcard/UmbrellaChronicles/\n\n" +
+            "(Internal shared storage > UmbrellaChronicles over USB), and allow the app to access all files when it asks.\n" +
+            (getResources().getBoolean(R.bool.common_key_embedded) ? "" :
+             "Put the Wii common key (common-key.bin, 16 bytes) in the same folder.\n") + "\n" +
             "The app needs main.dol with SHA-256 " + getString(R.string.dol_sha256).trim() + "\n";
         try (FileOutputStream out = new FileOutputStream(help)) {
             out.write(text.getBytes("UTF-8"));

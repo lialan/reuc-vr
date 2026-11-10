@@ -1,4 +1,5 @@
 #include "dvdfs.h"
+#include "wii_disc.h"
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -29,13 +30,66 @@ void DvdFs::walk(const fs::path& dir, const std::string& rel) {
 
 bool DvdFs::open_root(const fs::path& root) {
     std::unique_lock lock(m_);
-    e_.clear(); index_.clear(); undo_.clear(); hidden_.clear(); root_.clear();
+    e_.clear(); index_.clear(); undo_.clear(); hidden_.clear(); root_.clear(); disc_.reset(); disc_files_.clear();
     if (!fs::is_directory(root)) return false;
     root_ = root;
     e_.push_back({"", root, true, 0});
     index_[""] = 0;
     walk(root, "");
     return true;
+}
+
+bool DvdFs::open_disc(std::shared_ptr<const WiiDisc> disc) {
+    std::unique_lock lock(m_);
+    e_.clear(); index_.clear(); undo_.clear(); hidden_.clear(); root_.clear(); disc_.reset(); disc_files_.clear();
+    if (!disc) return false;
+    // The FST's own order is not the folder walk's: list each folder's children sorted as walk() sorts them, so an entry number names the
+    // same file whichever way the game is supplied.
+    std::map<std::string, std::vector<const WiiDisc::File*>> children;   // lower-case folder path -> its entries
+    for (const auto& file : disc->files()) {
+        const size_t slash = file.path.rfind('/');
+        children[lower(slash == std::string::npos ? std::string() : file.path.substr(0, slash))].push_back(&file);
+        if (!file.dir) disc_files_[lower(file.path)] = {file.offset, file.size};
+    }
+    for (auto& [folder, list] : children)
+        std::sort(list.begin(), list.end(), [](const auto* a, const auto* b) {
+            const auto name = [](const std::string& p) { const size_t slash = p.rfind('/'); return lower(slash == std::string::npos ? p : p.substr(slash + 1)); };
+            return name(a->path) < name(b->path);
+        });
+    disc_ = std::move(disc);
+    e_.push_back({"", {}, true, 0});
+    index_[""] = 0;
+    std::vector<std::pair<const std::vector<const WiiDisc::File*>*, size_t>> stack;   // depth first, like walk()
+    if (const auto root = children.find(""); root != children.end()) stack.push_back({&root->second, 0});
+    while (!stack.empty()) {
+        auto& [list, next] = stack.back();
+        if (next == list->size()) { stack.pop_back(); continue; }
+        const WiiDisc::File& file = *(*list)[next++];
+        e_.push_back({file.path, {}, file.dir, file.dir ? 0u : file.size, false, !file.dir, file.offset});
+        index_[lower(file.path)] = int(e_.size()) - 1;
+        if (file.dir) if (const auto kids = children.find(lower(file.path)); kids != children.end()) stack.push_back({&kids->second, 0});
+    }
+    return true;
+}
+
+std::optional<std::vector<uint8_t>> DvdFs::disc_file(const std::string& rel, uint64_t max_bytes) const {
+    std::shared_lock lock(m_);
+    if (disc_) {
+        const auto at = disc_files_.find(lower(rel));
+        if (at == disc_files_.end() || at->second.second == 0 || at->second.second > max_bytes) return std::nullopt;
+        std::vector<uint8_t> bytes(at->second.second);
+        if (!disc_->read(at->second.first, bytes.data(), bytes.size())) return std::nullopt;
+        return bytes;
+    }
+    if (root_.empty()) return std::nullopt;
+    const fs::path file = root_ / fs::path(std::u8string(rel.begin(), rel.end()));
+    std::error_code error;
+    const uintmax_t size = fs::is_regular_file(file, error) ? fs::file_size(file, error) : 0;
+    if (size == 0 || size > max_bytes) return std::nullopt;
+    std::vector<uint8_t> bytes(size);
+    std::ifstream in(file, std::ios::binary);
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(size))) return std::nullopt;
+    return bytes;
 }
 
 size_t DvdFs::add_entry(Entry entry) {
@@ -107,7 +161,7 @@ size_t DvdFs::apply_locked(const fs::path& files_root, const std::vector<Found>&
             Entry& entry = e_[size_t(at->second)];
             if (entry.dir) continue;
             undo_.push_back({size_t(at->second), false, entry});
-            entry.full = full; entry.size = size; ++count;
+            entry.full = full; entry.size = size; entry.on_disc = false; ++count;
             continue;
         }
         for (size_t slash = rel.find('/'); slash != std::string::npos; slash = rel.find('/', slash + 1)) {   // missing parent folders
@@ -159,30 +213,30 @@ int DvdFs::entry_of(std::string path) const {
 std::optional<DvdFs::Snapshot> DvdFs::snapshot(int entry) const {
     std::shared_lock lock(m_);
     if (!valid(entry) || e_[size_t(entry)].dir) return std::nullopt;
-    return Snapshot{entry, e_[size_t(entry)].full, e_[size_t(entry)].size};
+    const Entry& e = e_[size_t(entry)];
+    return Snapshot{entry, e.full, e.size, e.on_disc, e.disc_at};
 }
 
-int64_t DvdFs::read(const Snapshot& file, void* dst, uint32_t len, uint32_t offset) const {
-    if (len == 0 || offset >= file.size) return 0;
-    const uint32_t n = std::min<uint32_t>(len, file.size - offset);
-    std::ifstream f(file.full, std::ios::binary);
+int64_t DvdFs::read_bytes(const fs::path& full, bool on_disc, uint64_t disc_at, uint32_t size, void* dst, uint32_t len, uint32_t offset) const {
+    if (len == 0 || offset >= size) return 0;
+    const uint32_t n = std::min<uint32_t>(len, size - offset);
+    if (on_disc) return disc_ && disc_->read(disc_at + offset, dst, n) ? int64_t(n) : -1;
+    std::ifstream f(full, std::ios::binary);
     if (!f) return -1;
     f.seekg(offset);
     f.read(static_cast<char*>(dst), n);
     return int64_t(f.gcount());
+}
+
+int64_t DvdFs::read(const Snapshot& file, void* dst, uint32_t len, uint32_t offset) const {
+    return read_bytes(file.full, file.on_disc, file.disc_at, file.size, dst, len, offset);
 }
 
 int64_t DvdFs::read(int entry, void* dst, uint32_t len, uint32_t offset) const {
     std::shared_lock lock(m_);   // held across the file read: a swap of the overlays waits for the read in flight, so a read sees one whole version
     if (!valid(entry) || e_[size_t(entry)].dir) return -1;
     const Entry& e = e_[size_t(entry)];
-    if (len == 0 || offset >= e.size) return 0;
-    uint32_t n = std::min<uint32_t>(len, e.size - offset);
-    std::ifstream f(e.full, std::ios::binary);
-    if (!f) return -1;
-    f.seekg(offset);
-    f.read(static_cast<char*>(dst), n);
-    return int64_t(f.gcount());
+    return read_bytes(e.full, e.on_disc, e.disc_at, e.size, dst, len, offset);
 }
 
 }  // namespace uc

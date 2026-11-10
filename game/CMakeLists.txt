@@ -117,6 +117,11 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
     add_library(uc SHARED uc_main.cpp audio_output.cpp det_trace.cpp frame_log.cpp settings_menu.cpp ${uc_platform_sources} android_main.cpp xr_android.cpp)
     set_target_properties(uc PROPERTIES OUTPUT_NAME main)
     set_source_files_properties(uc_main.cpp PROPERTIES COMPILE_DEFINITIONS main=uc_game_main)
+    # The SHA-256 of the main.dol this build was translated from (scripts/build-quest.sh): a disc image of another revision is refused.
+    set(UC_DOL_SHA256 "" CACHE STRING "SHA-256 of the translated main.dol (checked when the game starts; empty: not checked)")
+    if(UC_DOL_SHA256)
+      set_property(SOURCE uc_main.cpp APPEND PROPERTY COMPILE_DEFINITIONS "UC_DOL_SHA256=\"${UC_DOL_SHA256}\"")
+    endif()
     target_link_libraries(uc PRIVATE android log)
     target_include_directories(uc PRIVATE ${CMAKE_SOURCE_DIR}/runtime)
   else()
