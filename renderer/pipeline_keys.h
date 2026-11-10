@@ -1,4 +1,5 @@
 #pragma once
+#include "decal_bias.h"
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <array>
@@ -104,6 +105,9 @@ inline bool alpha_test_can_discard(uint32_t word) {
 }
 }  // namespace gx
 namespace uc {
+
+// Whether a draw is a decal (decal_bias.h): from its full key, before static_key drops the depth test bit of a draw that does not write depth.
+inline bool decal_depth_bias(const PipelineKey& key) { return decal_depth_bias(key[0]&3,key[68]); }
 
 // Cull mode and the depth test, write and compare op are dynamic state (Vulkan 1.3), set from the draw's full key; a pipeline only keeps
 // whether the draw writes depth (the motion and G-buffer masks follow it). Pipelines, the seed's closure and the recorded file use this form.

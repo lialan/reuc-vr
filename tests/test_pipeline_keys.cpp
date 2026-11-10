@@ -124,6 +124,13 @@ int main() {
     test_alpha_test_bit();
     test_headset_direct_key();
     test_indirect_keys();
+    {   // decals (bullet holes): depth tested, not written, blended. Opaque, depth-writing and untested draws get no bias
+        uc::PipelineKey decal{}; decal[0]=1; decal[68]=1|(3<<1);
+        CHECK(uc::decal_depth_bias(decal));
+        auto opaque=decal; opaque[0]=0; CHECK(!uc::decal_depth_bias(opaque));
+        auto writes=decal; writes[68]|=16; CHECK(!uc::decal_depth_bias(writes));
+        auto untested=decal; untested[68]=0; CHECK(!uc::decal_depth_bias(untested));
+    }
     const auto path=std::filesystem::temp_directory_path()/"uc_test_pipeline_keys.bin";
     std::filesystem::remove(path);
     CHECK(uc::load_pipeline_keys(path).empty());

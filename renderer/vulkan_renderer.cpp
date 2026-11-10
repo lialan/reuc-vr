@@ -1366,6 +1366,11 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; assembly.topology = VkPrimitiveTopology(key[69]);
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; viewport.viewportCount = viewport.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; raster.polygonMode = VK_POLYGON_MODE_FILL; raster.cullMode = cull_mode(key); raster.frontFace = VK_FRONT_FACE_CLOCKWISE; raster.lineWidth = 1; raster.depthClampEnable = depth_clamp_;
+        // Decals (decal_bias.h) are pulled towards the camera: a dynamic bias, zero except for them, set by set_draw_state (in the pipeline with
+        // UC_STATIC_DEPTH). The HUD layer has no depth attachment.
+        const bool biased=!(key[0]&kHudLayerKeyBit);
+        raster.depthBiasEnable=biased;
+        if (biased && static_depth_ && decal_depth_bias(key)) { raster.depthBiasConstantFactor=float(kDecalDepthBias); raster.depthBiasSlopeFactor=kDecalSlopeBias; }
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState blend{};
         blend.colorWriteMask=(mode.color_write ? VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT : 0)|(mode.alpha_write ? VK_COLOR_COMPONENT_A_BIT : 0);
@@ -1396,9 +1401,10 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         }
         VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blending.attachmentCount = hud_layer ? 2 : scene_color_attachments(); blending.pAttachments = blends;
         blending.logicOpEnable=mode.mode==2; blending.logicOp=VkLogicOp(mode.logic);
-        VkDynamicState dynamic_states[7]; uint32_t dynamic_count=0;
+        VkDynamicState dynamic_states[8]; uint32_t dynamic_count=0;
         dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_VIEWPORT; dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_SCISSOR;
         if (!static_depth_) for (const VkDynamicState d:{VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP}) dynamic_states[dynamic_count++]=d;   // set_draw_state
+        if (!static_depth_ && biased) dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_DEPTH_BIAS;   // set_draw_state: the decal bias
         if (set_shading_rate_) dynamic_states[dynamic_count++]=VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;   // the rate: record_pass sets it per draw
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; dynamic.dynamicStateCount = dynamic_count; dynamic.pDynamicStates = dynamic_states;
         const VkFormat formats[5] = {VK_FORMAT_R8G8B8A8_UNORM, kMotionFormat, kGBufferFormat, kMaterialFormat, kAlbedoFormat};
@@ -4138,13 +4144,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (set_shading_rate_) { const VkFragmentShadingRateCombinerOpKHR keep[2]{VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR}; set_shading_rate_(slot.command,&bound_rate,keep); }
         const auto set_draw_state=[&](const PipelineKey& key) {
             if (static_depth_) return;   // in the pipeline
-            const uint32_t state=((key[0]>>14)&3)|((key[68]&31)<<2);
+            const bool decal=decal_depth_bias(key);
+            const uint32_t state=((key[0]>>14)&3)|((key[68]&31)<<2)|(uint32_t(decal)<<7);
             if (state==bound_state) return;
             bound_state=state;
             vkCmdSetCullMode(slot.command,cull_mode(key));
             vkCmdSetDepthTestEnable(slot.command,key[68]&1);
             vkCmdSetDepthWriteEnable(slot.command,(key[68]>>4)&1);
             vkCmdSetDepthCompareOp(slot.command,VkCompareOp((key[68]>>1)&7));
+            vkCmdSetDepthBias(slot.command,decal ? float(kDecalDepthBias) : 0.f,0.f,decal ? kDecalSlopeBias : 0.f);
         };
         bool probe_bound=false;
         // The headset's descriptor binding: the draw's shared set with its uniform block and eye block as dynamic offsets; nothing is
