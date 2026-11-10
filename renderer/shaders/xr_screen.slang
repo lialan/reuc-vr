@@ -32,25 +32,36 @@ VOut vertexMain(uint id : SV_VertexID, uint view : SV_ViewID) {
 // the picture's own texels and its stored (sRGB-encoded) colours, as FXAA expects. Specialization constant 0 = 0 turns it off (UC_XR_FXAA=0).
 [[vk::constant_id(0)]] const uint fxaaOn = 1;
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
-float3 tap(float2 uv, float layer) {   // clamped to the shown rect's texel centres, as a picture of exactly that size clamps to its edge
+float3 tap(float2 uv, float layer, float2 first, float2 last) {   // clamp to the shown rect's texel centres
+    return picture.SampleLevel(linear, float3(clamp(uv, first, last), layer), 0).rgb;
+}
+float3 tap(float2 uv, float layer) {   // the same, finding the bounds itself (sharpening and the single tap)
     uint width, height, layers; picture.GetDimensions(width, height, layers);
     const float2 half = 0.5 / float2(width, height);
-    return picture.SampleLevel(linear, float3(clamp(uv, eyes.rect.xy + half, eyes.rect.xy + eyes.rect.zw - half), layer), 0).rgb;
+    return tap(uv, layer, eyes.rect.xy + half, eyes.rect.xy + eyes.rect.zw - half);
 }
 float3 fxaa(float2 uv, float layer) {
     uint width, height, layers; picture.GetDimensions(width, height, layers);
     const float2 texel = float2(1.0 / width, 1.0 / height);
-    const float3 nw = tap(uv + float2(-0.5, -0.5) * texel, layer), ne = tap(uv + float2(0.5, -0.5) * texel, layer);
-    const float3 sw = tap(uv + float2(-0.5, 0.5) * texel, layer), se = tap(uv + float2(0.5, 0.5) * texel, layer);
-    const float3 m = tap(uv, layer);
+    // Share dimensions and bounds across all nine taps; the generated module
+    // otherwise repeats the query, reciprocal and rect arithmetic at every tap.
+    const float2 half = 0.5 / float2(width, height);
+    const float2 first = eyes.rect.xy + half, last = eyes.rect.xy + eyes.rect.zw - half;
+    const float3 nw = tap(uv + float2(-0.5, -0.5) * texel, layer, first, last), ne = tap(uv + float2(0.5, -0.5) * texel, layer, first, last);
+    const float3 sw = tap(uv + float2(-0.5, 0.5) * texel, layer, first, last), se = tap(uv + float2(0.5, 0.5) * texel, layer, first, last);
+    const float3 m = tap(uv, layer, first, last);
     const float lnw = luma(nw), lne = luma(ne), lsw = luma(sw), lse = luma(se), lm = luma(m);
-    const float lmin = min(lm, min(min(lnw, lne), min(lsw, lse))), lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
     float2 dir = float2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));
+    // With zero direction all four remaining taps are the centre sample and
+    // both candidate averages equal m. No contrast threshold or approximation;
+    // explicit LOD samples also keep this branch independent of derivatives.
+    if (all(dir == float2(0.0))) return m;
+    const float lmin = min(lm, min(min(lnw, lne), min(lsw, lse))), lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
     const float reduce = max((lnw + lne + lsw + lse) * (0.25 / 8.0), 1.0 / 128.0);
     const float scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
     dir = clamp(dir * scale, -8.0, 8.0) * texel;
-    const float3 a = 0.5 * (tap(uv + dir * (1.0 / 3.0 - 0.5), layer) + tap(uv + dir * (2.0 / 3.0 - 0.5), layer));
-    const float3 b = a * 0.5 + 0.25 * (tap(uv - dir * 0.5, layer) + tap(uv + dir * 0.5, layer));
+    const float3 a = 0.5 * (tap(uv + dir * (1.0 / 3.0 - 0.5), layer, first, last) + tap(uv + dir * (2.0 / 3.0 - 0.5), layer, first, last));
+    const float3 b = a * 0.5 + 0.25 * (tap(uv - dir * 0.5, layer, first, last) + tap(uv + dir * 0.5, layer, first, last));
     const float lb = luma(b);
     return (lb < lmin || lb > lmax) ? a : b;
 }

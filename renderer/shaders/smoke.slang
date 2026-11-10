@@ -226,6 +226,15 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // the vertex index is the position's, and consecutive draws that share everything else can be one draw.
 [[vk::binding(6, 0)]] StructuredBuffer<XformPosition> xformPositions;
 [[vk::binding(7, 0)]] StructuredBuffer<uint> xformAttributes;
+#ifndef UBER_MERGE
+// Material-dependent outputs; packed offsets still follow the actual draw mask.
+[[vk::constant_id(68)]] const uint xformCoordinateMask = 255u;
+float3 loadXformCoordinate(uint at, uint mask, uint id) {
+    if ((xformCoordinateMask & (1u << id)) == 0 || (mask & (1u << id)) == 0) return float3(0.0, 0.0, 1.0);
+    const uint coordinate = at + 3 * countbits(mask & ((1u << id) - 1));
+    return asfloat(uint3(xformAttributes[coordinate], xformAttributes[coordinate + 1], xformAttributes[coordinate + 2]));
+}
+#endif
 Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   // gl_VertexIndex: the rebased index (vertexOffset 0)
     Output output;
     float4 clip = (projection.effects & 8u) != 0 ? xformPositions[vertex].view : xformPositions[vertex].clip;
@@ -270,10 +279,20 @@ Output vertexMain(uint vertex : SV_VulkanVertexID, uint view : SV_ViewID) {   //
     }
     at += 3 * countbits(mask);
 #else
+#ifdef UBER_MERGE
     [unroll] for (uint id = 0; id < 8; ++id) {
         output.texcoords[id] = float3(0.0, 0.0, 1.0);
         if ((mask & (1u << id)) != 0) { output.texcoords[id] = asfloat(uint3(xformAttributes[at], xformAttributes[at + 1], xformAttributes[at + 2])); at += 3; }
     }
+#else
+    // Spell out the constant indices: Slang's [unroll] only decorates an SPIR-V
+    // loop, leaving the coordinate selection dynamic until the driver unrolls it.
+#define UC_XFORM_COORD(N) output.texcoords[N] = loadXformCoordinate(at, mask, N);
+    UC_XFORM_COORD(0) UC_XFORM_COORD(1) UC_XFORM_COORD(2) UC_XFORM_COORD(3)
+    UC_XFORM_COORD(4) UC_XFORM_COORD(5) UC_XFORM_COORD(6) UC_XFORM_COORD(7)
+#undef UC_XFORM_COORD
+    at += 3 * countbits(mask);
+#endif
 #endif
 #ifdef TEX_TABLE
     output.textureBase = xformAttributes[at];   // the draw's first texture-table entry (the pre-pass's last word)

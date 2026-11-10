@@ -1,5 +1,6 @@
 #include "check.h"
 #include "pipeline_keys.h"
+#include "texture_coordinates.h"
 #include <fstream>
 
 static void test_without_logic_op() {   // a GPU without logicOp (MoltenVK) draws the GX logic ops with blend equivalents
@@ -43,10 +44,86 @@ void test_headset_direct_key() {
     CHECK(uc::headset_direct_key(mixed)==mixed);
     uc::PipelineKey none{}; CHECK(uc::headset_direct_key(none)==none);   // no stages: nothing to mark
 }
+static void test_indirect_keys() {
+    uc::PipelineKey base{}; base[1]=2; base[5]=0x148; base[6]=0x2AB; base[9]=0x50; base[10]=0x155;
+    base[69]=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    // A shader must distinguish the complete command and the selected IREF pair,
+    // but not unused pairs. Its ordinary TEV selectors must survive unchanged.
+    for (uint32_t stage=0;stage<2;++stage) for (uint32_t indirect=0;indirect<4;++indirect) {
+        const uint32_t command=(0x1ABCDEu&~3u)|indirect;
+        const uint32_t references=0x654321;
+        auto key=base; uc::specialize_indirect_stage(key,stage,command,references);
+        CHECK(uc::valid_pipeline_key(key,true));
+        CHECK(uc::headset_direct_key(key)==key); // no direct stage: must not be mistaken for a legacy key
+        CHECK((key[5+4*stage]&0xFFFFu)==base[5+4*stage]);
+        CHECK((key[6+4*stage]&1023u)==base[6+4*stage]);
+        CHECK((key[6+4*stage]>>10)==command);
+        CHECK(((key[5+4*stage]>>18)&63u)==((references>>(6*indirect))&63u));
+        CHECK(uc::dynamic_indirect_key(key)==base);
+        auto unused=base; uc::specialize_indirect_stage(unused,stage,command,references^(63u<<(6*((indirect+1)%4))));
+        CHECK(unused==key);
+        auto changed=base; uc::specialize_indirect_stage(changed,stage,command,references^(1u<<(6*indirect)));
+        CHECK(changed!=key);
+        for (uint32_t bit=2;bit<21;++bit) {
+            changed=base; uc::specialize_indirect_stage(changed,stage,command^(1u<<bit),references);
+            CHECK(changed!=key);
+        }
+    }
+    auto direct=base; uc::specialize_indirect_stage(direct,0,0,0xFFFFFF); CHECK(direct==base);
+    // Preserve the dynamic path's behavior for reserved IND_CMD bits instead of truncating them.
+    uc::specialize_indirect_stage(direct,0,1u<<21,0xFFFFFF); CHECK(direct==base);
+    auto untextured=base; untextured[5]&=~64u; direct=untextured;
+    uc::specialize_indirect_stage(untextured,0,0x1FFFFF,0xFFFFFF); CHECK(untextured==direct);
+}
+static void test_xform_coordinates() {
+    uc::PipelineKey k{};
+    CHECK(uc::xform_coordinate_mask(k)==1); // no stages: evaluateTev reads texture 0 / coordinate 0
+    k[1]=2; k[5]=64|(2u<<3)|uc::kTevDirectStage;
+    k[9]=64|(5u<<3)|uc::kTevDirectStage;
+    CHECK(uc::xform_coordinate_mask(k)==((1u<<2)|(1u<<5)));
+    k[9]&=~uc::kTevDirectStage;
+    CHECK(uc::xform_coordinate_mask(k)==255); // unknown indirect reference remains dynamic
+    uc::specialize_indirect_stage(k,1,1,7u<<9); // indirect stage 1 reads coordinate 7
+    CHECK(uc::xform_coordinate_mask(k)==((1u<<2)|(1u<<5)|(1u<<7)));
+    k[5]&=~64u;
+    CHECK(uc::xform_coordinate_mask(k)==((1u<<5)|(1u<<7))); // untextured stage does not read coordinates
+    k[9]&=~64u;
+    CHECK(uc::xform_coordinate_mask(k)==0);
+}
+static void test_affine_coordinates() {
+    gx::DrawUniform u;
+    CHECK(gx::unit_texture_q(u,255)); // regular ST and identity post matrices
+    u.tex_gens[2]|=2;
+    CHECK(!gx::unit_texture_q(u,1u<<2)); // STQ can carry perspective Q
+    CHECK(gx::unit_texture_q(u,1u<<0)); // an unused projected coordinate does not split the shader
+    u.post_rows[8]={0,0,0,1};
+    CHECK(gx::unit_texture_q(u,1u<<2)); // constant post Q replaces the projected Q
+    u.tex_posts[2]=256;
+    CHECK(!gx::unit_texture_q(u,1u<<2)); // retain normalization's general path
+    u.tex_posts[2]=0; u.tex_gens[2]&=~2u;
+    u.post_rows[8]={0.1f,0,1,0}; CHECK(!gx::unit_texture_q(u,1u<<2));
+    u.post_rows[8]={0,0,2,0}; CHECK(!gx::unit_texture_q(u,1u<<2));
+    u.post_rows[8]={0,0,0,0}; CHECK(!gx::unit_texture_q(u,1u<<2));
+    u.post_rows[8]={0,0,1,0}; u.tex_gens[2]|=1u<<4;
+    CHECK(!gx::unit_texture_q(u,1u<<2)); // unsupported/emboss texgen types stay general
+    uc::PipelineKey k{};
+    auto affine=uc::affine_coordinates_key(k);
+    CHECK(affine[5]==uc::kTevAffineCoordinates && uc::general_coordinates_key(affine)==k);
+    CHECK(uc::affine_coordinates_key(affine)==affine);
+    k[1]=2; k[5]=64|uc::kTevDirectStage; k[9]=64|uc::kTevIndirectStage|(2u<<21);
+    affine=uc::affine_coordinates_key(k);
+    CHECK(uc::general_coordinates_key(affine)==k);
+    CHECK(uc::xform_coordinate_mask(affine)==((1u<<0)|(1u<<2)));
+    k[5]&=~64u; k[9]&=~64u;
+    CHECK(uc::affine_coordinates_key(k)==k); // no texture reads: no new variant
+}
 int main() {
+    test_affine_coordinates();
+    test_xform_coordinates();
     test_without_logic_op();
     test_alpha_test_bit();
     test_headset_direct_key();
+    test_indirect_keys();
     const auto path=std::filesystem::temp_directory_path()/"uc_test_pipeline_keys.bin";
     std::filesystem::remove(path);
     CHECK(uc::load_pipeline_keys(path).empty());

@@ -24,9 +24,9 @@ struct DrawState {
     uint4 indCmd[4];
     uint4 tevWords[17];   // pipeline key words 1..67 (only the ubershader reads them)
 #ifdef STEREO
-    // Guest dimensions of scaled EFB copies, two (width,height) pairs per word.
-    // Indirect offsets/wrapping are GX texels, not pixels of the enlarged image.
-    // Zero keeps the image's dimensions for ordinary textures.
+    // Sizes used by indirect texturing, two (width,height) pairs per word.
+    // EFB copies use guest texels; ordinary textures use the bound image's size.
+    // Unused maps may remain zero. The renderer fills every map imageSize reads.
     uint4 copyDimensions[4];
 #endif
 };
@@ -318,8 +318,8 @@ float2 imageSize(uint id) {
 #ifdef STEREO
     const uint4 pair = drawState.copyDimensions[id / 2];
     const uint2 logical = (id & 1) != 0 ? pair.zw : pair.xy;
-    if (logical.x != 0 && logical.y != 0) return float2(logical);
-#endif
+    return float2(logical);
+#else
     uint w = 1, h = 1;
 #ifdef TEX_TABLE
     UC_DIMENSIONS(id);
@@ -336,6 +336,7 @@ float2 imageSize(uint id) {
     }
 #endif
     return float2(w, h);
+#endif
 }
 uint indirectWord(uint index) { return drawState.indirect[index / 4][index % 4]; }
 int signed11(uint value) { return int(value << 21) >> 21; }
@@ -343,13 +344,18 @@ int indirectWrap(int coord, uint mode) { return mode == 0 ? coord : (mode < 6 ? 
 // GX indirect texturing in hardware fixed point: texcoords are texels*128, matrices s.10, scale 2^(e-17).
 // A texture coordinate as interpolated (s, t, q) divided by q where it is read: the stages and the indirect path pick coordinates by a
 // runtime index (an indirect stage's coordinate comes from a uniform), so dividing all eight up front cost every fragment eight divisions.
-float2 uvOf(float3 t) { return t.xy / (t.z != 0.0 ? t.z : 1.0); }
-float2 indirectCoord(uint map, float2 coord, float3 uv[8], uint command, inout int2 previous) {
+float2 uvOf(float3 t) {
+#if defined(STEREO) && !defined(UBER_MERGE)
+    if ((order0 & 0x1000000u) != 0) return t.xy; // runtime proved Q=1 for every consumed coordinate
+#endif
+    return t.xy / (t.z != 0.0 ? t.z : 1.0);
+}
+float2 indirectCoord(uint map, float2 coord, float3 uv[8], uint command, uint reference, inout int2 previous) {
     float2 size = imageSize(map);
     int2 fixedUV = int2(floor(coord * size * 128.0));
     uint stage = command & 3, format = (command >> 2) & 3, bias = (command >> 4) & 7, matrix = (command >> 9) & 15;
-    uint iref = indirectWord(9), scale = indirectWord(10 + stage / 2) >> ((stage & 1) * 8);
-    uint indirectMap = (iref >> (stage * 6)) & 7, indirectCoordinate = (iref >> (stage * 6 + 3)) & 7;
+    uint scale = indirectWord(10 + stage / 2) >> ((stage & 1) * 8);
+    uint indirectMap = reference & 7, indirectCoordinate = (reference >> 3) & 7;
     float2 indirectSize = imageSize(indirectMap);
     int2 indirectUV = int2(floor(uvOf(uv[indirectCoordinate]) * indirectSize * 128.0));
     indirectUV = int2(indirectUV.x >> (scale & 15), indirectUV.y >> ((scale >> 4) & 15));
@@ -387,7 +393,8 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
 #if defined(UBER_MERGE) && defined(UBER)
     uint command = 0u;   // the small-draw ubershader takes only draws whose stages are all direct (uber_merge.h): no indirect path in it
 #else
-    uint command = (order & 0x10000u) != 0 ? 0u : drawState.indCmd[stageIndex / 4][stageIndex % 4];
+    uint command = (order & 0x10000u) != 0 ? 0u : (order & 0x20000u) != 0 ?
+        ((konst >> 10) & 0x1FFFFFu) : drawState.indCmd[stageIndex / 4][stageIndex % 4];
 #endif
     if ((order & 64) != 0) {
 #if defined(UBER_MERGE) && defined(UBER) && defined(UBER_STAGES)
@@ -395,7 +402,11 @@ void tevStage(inout float4 r[4], float3 uv[8], float4 vertexColor, float4 vertex
 #else
         float2 coord = uvOf(uv[(order >> 3) & 7]);
 #endif
-        if (command != 0) coord = indirectCoord(order & 7, coord, uv, command, previousCoord);
+        if (command != 0) {
+            const uint reference = (order & 0x20000u) != 0 ? ((order >> 18) & 63u) :
+                ((indirectWord(9) >> ((command & 3u) * 6)) & 63u);
+            coord = indirectCoord(order & 7, coord, uv, command, reference, previousCoord);
+        }
         tex = sampleImage(order & 7, coord);
     }
     uint channel = (order >> 7) & 7;

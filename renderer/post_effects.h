@@ -27,4 +27,20 @@ inline bool vr_screen_refraction(const DrawPacket& draw) {
         if (draw.uniforms->ind_cmd[stage]) return false;
     return true;
 }
+// Pipeline specialization and the uploaded uniform block must describe the
+// same effective state after the VR adaptation, not different GX states.
+inline uint32_t effective_indirect_command(const DrawUniform& uniforms,uint32_t stage,bool screen_refraction) {
+    return screen_refraction && stage==0 ? 0u : uniforms.ind_cmd[stage];
+}
+// imageSize() is read for both the destination map and the selected indirect
+// map. Other ordinary textures need no size uniforms and retain their merge key.
+inline uint32_t indirect_size_maps(const DrawPacket& draw,bool screen_refraction) {
+    uint32_t maps=0;
+    for (uint32_t stage=0;stage<draw.material.stages && stage<16;++stage) {
+        const uint32_t order=draw.material.stage[stage].order;
+        const uint32_t command=effective_indirect_command(*draw.uniforms,stage,screen_refraction);
+        if ((order&64) && command) maps|=(1u<<(order&7)) | (1u<<((draw.uniforms->indirect[9]>>((command&3)*6))&7));
+    }
+    return maps;
+}
 }

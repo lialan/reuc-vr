@@ -33,12 +33,15 @@ def fnv1a64(data: bytes) -> int:
 
 
 DIRECT_STAGE = 1 << 16   # pipeline_keys.h kTevDirectStage: order-word bit of a stage without indirect texturing (the headset's keys)
+INDIRECT_STAGE = 1 << 17
+INDIRECT_REFERENCE = 63 << 18
+AFFINE_COORDINATES = 1 << 24
 
 
 def headset_key(key):
     """pipeline_keys.h headset_direct_key: a key recorded before the headset marked its direct stages is read as all-direct."""
     stages = min(key[1], 16)
-    if any(key[5 + 4 * i] & DIRECT_STAGE for i in range(stages)):
+    if any(key[5 + 4 * i] & (DIRECT_STAGE | INDIRECT_STAGE) for i in range(stages)):
         return key
     key = list(key)
     for i in range(stages):
@@ -46,10 +49,24 @@ def headset_key(key):
     return tuple(key)
 
 
-def stripped_key(key):
+def general_coordinates_key(key):
     key = list(key)
+    key[5] &= ~AFFINE_COORDINATES
+    return tuple(key)
+
+
+def affine_coordinates_key(key):
+    key = list(key)
+    if key[1] == 0 or any(key[5 + 4 * i] & 64 for i in range(min(key[1], 16))):
+        key[5] |= AFFINE_COORDINATES
+    return tuple(key)
+
+
+def stripped_key(key):
+    key = list(general_coordinates_key(key))
     for i in range(min(key[1], 16)):
-        key[5 + 4 * i] &= ~DIRECT_STAGE
+        key[5 + 4 * i] &= ~(DIRECT_STAGE | INDIRECT_STAGE | INDIRECT_REFERENCE)
+        key[6 + 4 * i] &= 1023
     return tuple(key)
 
 
@@ -101,10 +118,10 @@ def main():
     for path in args.keys:
         if os.path.exists(path):
             for key in read_keys(path):
-                # both forms: the headset's (direct stages marked, their indirect path compiled out) and the one with every stage able to
-                # read an indirect coordinate, which the renderer falls back to for a key whose own form is not listed (a stage that does
-                # read one, in a scene no recording covered): never slower than before the marks
-                for form in (headset_key(key), stripped_key(key)):
+                # Known headset forms: general coordinates and the Q=1 specialization.
+                # The uniform-driven indirect form remains the fallback for untrained keys.
+                direct = headset_key(general_coordinates_key(key))
+                for form in (direct, affine_coordinates_key(direct), stripped_key(key)):
                     values, var = constants(form), variant(form)
                     for v in (var, var + 2) if table else (var,):
                         wanted[name(values, v)] = (values, v)

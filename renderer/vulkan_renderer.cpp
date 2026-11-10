@@ -11,6 +11,7 @@
 #include "late_aim.h"
 #include "texture_replacement.h"
 #include "post_effects.h"
+#include "texture_coordinates.h"
 #include "vulkan_renderer.h"
 #include "render_scale.h"
 #include "rebuild_gate.h"
@@ -966,6 +967,17 @@ bool VulkanRenderer::fused_destination_alpha(const gx::DrawPacket& draw) const {
     return draw.blend.mode==0 || (draw.blend.mode==2 && draw.blend.logic==3);   // no blending (logic COPY is a plain write)
 }
 static bool fuse_off() { static const bool off=std::getenv("UC_NO_FUSED_ALPHA")!=nullptr; return off; }
+static bool affine_coordinates_enabled() {
+    static const bool on=[] {
+        if (const char* value=std::getenv("UC_AFFINE_TEXCOORDS")) return *value && *value!='0';
+#ifdef __ANDROID__
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
 PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_pass) const {
     auto blend=draw.blend;
     const bool fused=!alpha_pass && !fuse_off() && fused_destination_alpha(draw);
@@ -1012,11 +1024,28 @@ PipelineKey VulkanRenderer::pipeline_key(const gx::DrawPacket& draw,bool alpha_p
         else key[68]&=~16u;
     }
     for(size_t i=0;i<4;++i) key[2]|=uint32_t(material.swaps[i])<<(i*8);
+    // Known indirect modes fold at build time; untrained keys retain a uniform-driven fallback.
+    // Quest defaults on. Other backends keep their existing keys unless explicitly enabled.
+    static const bool specialize_indirect=[] {
+        if (const char* value=std::getenv("UC_SPECIALIZE_INDIRECT")) return *value && *value!='0';
+#ifdef __ANDROID__
+        return true;
+#else
+        return false;
+#endif
+    }();
+    static const bool original_refraction=std::getenv("UC_VR_SCREEN_REFRACTION")!=nullptr;
+    const bool adapted=layers_>1 && specialize_indirect && !original_refraction && gx::vr_screen_refraction(draw);
     for(size_t i=0;i<material.stages;++i) {
         const auto& stage=material.stage[i];
         key[3+i*4]=stage.color; key[4+i*4]=stage.alpha; key[5+i*4]=stage.order; key[6+i*4]=stage.konst;
-        if(layers_>1 && draw.uniforms->ind_cmd[i]==0) key[5+i*4]|=kTevDirectStage;   // the headset: this stage's indirect path compiled out (pipeline_keys.h)
+        const uint32_t command=gx::effective_indirect_command(*draw.uniforms,uint32_t(i),adapted);
+        if(layers_>1 && command==0) key[5+i*4]|=kTevDirectStage;   // the headset: this stage's indirect path compiled out (pipeline_keys.h)
+        if(layers_>1 && specialize_indirect)
+            specialize_indirect_stage(key,uint32_t(i),command,draw.uniforms->indirect[9]);
     }
+    if (layers_>1 && affine_coordinates_enabled() && gx::unit_texture_q(*draw.uniforms,xform_coordinate_mask(key)))
+        key=affine_coordinates_key(key);
     return key;
 }
 VulkanRenderer::PipelineChoice VulkanRenderer::pipeline_for(const PipelineKey& requested) {
@@ -1297,8 +1326,21 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         // driver's own specialization left most of the 600 KB module in (a one-stage quad ran 160-200 instructions a fragment).
         if (!uber && !merge && layers_>1 && !probe_fragment_) {
             VkShaderModule folded=folded_module(spec_values,early_variant,table);
+            const auto general=general_coordinates_key(key);
+            if (!folded && general!=key) {   // an untrained affine variant keeps the general coordinate divide
+                auto values=spec_values; std::copy(general.begin()+1,general.begin()+68,values.begin());
+                folded=folded_module(values,early_variant,table);
+            }
+            if (!folded) {   // Untrained indirect modes keep the existing uniform-driven folded shader until their key is built.
+                const auto dynamic=dynamic_indirect_key(general);
+                auto values=spec_values;
+                std::copy(dynamic.begin()+1,dynamic.begin()+68,values.begin());
+                if (values!=spec_values) folded=folded_module(values,early_variant,table);
+            }
             if (!folded) {   // a key not listed for the build (pipeline_keys.quest): the module of the same key with every stage's indirect path in
                 auto all_indirect=spec_values;
+                const auto dynamic=dynamic_indirect_key(general);
+                std::copy(dynamic.begin()+1,dynamic.begin()+68,all_indirect.begin());
                 for (uint32_t stage=0;stage<std::min<uint32_t>(key[1],16);++stage) all_indirect[4+4*stage]&=~kTevDirectStage;
                 if (all_indirect!=spec_values) folded=folded_module(all_indirect,early_variant,table);
             }
@@ -1309,6 +1351,11 @@ VkPipeline VulkanRenderer::make_pipeline(const PipelineKey& key,bool uber) {
         mesh_vertex_input(binding,attributes);
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO}; input.vertexBindingDescriptionCount = 1; input.pVertexBindingDescriptions = &binding; input.vertexAttributeDescriptionCount = uint32_t(attributes.size()); input.pVertexAttributeDescriptions = attributes.data();
         if (xform_) { input.vertexBindingDescriptionCount = 0; input.vertexAttributeDescriptionCount = 0; stages[0].module = table ? table_vertex_module_ : xform_vertex_module_; }   // the pre-pass's draws read their vertices from its outputs
+        static const bool dynamic_coords=std::getenv("UC_DYNAMIC_XFORM_COORDS")!=nullptr;
+        const uint32_t coordinate_mask=dynamic_coords || uber ? 255u : xform_coordinate_mask(key);
+        const VkSpecializationMapEntry coordinate_entry{68,0,sizeof(uint32_t)};
+        const VkSpecializationInfo coordinate_spec{1,&coordinate_entry,sizeof coordinate_mask,&coordinate_mask};
+        if (xform_ && !merge) stages[0].pSpecializationInfo=&coordinate_spec;
         if (merge) {   // the ubershader with and without the alpha test (key word 0 bit 16), constant 67 only
             const uint32_t family=key[1];   // a family of draws with few stages (uber_merge.h), 0: the general module
             if (family>kUberFewStages || (family && !few_vertex_module_[family-1])) throw std::invalid_argument("small-draw ubershader family without its modules");
@@ -1386,7 +1433,12 @@ void VulkanRenderer::load_pipeline_cache() {
         for (const auto& recorded:load_pipeline_keys(cache_dir_/name))
             if (auto key=logic_ops_ ? static_key(recorded) : without_logic_op(static_key(recorded)); valid_pipeline_key(key,logic_ops_)) {
                 if (layers_>1) key=headset_direct_key(key);   // a key recorded before the headset marked its direct stages
+                key=general_coordinates_key(key);
                 if (known_keys_.insert(key).second) warm_keys_.push_back(key);
+                if (layers_>1 && affine_coordinates_enabled()) {
+                    const auto affine=affine_coordinates_key(key);
+                    if (known_keys_.insert(affine).second) warm_keys_.push_back(affine);
+                }
             }
     std::fprintf(stderr,"[pipeline] known pipeline keys=%zu\n",warm_keys_.size());
 }
@@ -3119,6 +3171,12 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     if (layers_>1 && !physical_indirect) for (size_t d=0;d<packet.draws.size();++d)
         for (size_t map=0;map<8;++map) if (const auto& texture=draw_texture(packet.draws[d],map); texture && texture->gpu_only && !texture->levels.empty())
             copy_dimensions[d][map]={texture->levels[0].width,texture->levels[0].height};
+    // Supply imageSize's remaining maps from the actual bound images below.
+    // Only indirect stages read sizes: ordinary direct textures must not split
+    // fragment-uniform merging just because their dimensions differ.
+    std::vector<uint32_t> size_maps(packet.draws.size());
+    if (layers_>1) for (size_t d=0;d<packet.draws.size();++d)
+        size_maps[d]=gx::indirect_size_maps(packet.draws[d],screen_refraction[d]);
     std::vector<std::array<uint64_t,17>> set_keys(layers_>1 ? packet.draws.size() : 0);   // per draw: image views, samplers, uniform offset
     // The headset: one descriptor set per distinct texture/sampler combination (the uniform block and the eye block are dynamic offsets)
     std::map<std::array<uint64_t,16>,uint32_t> set_of;
@@ -3183,6 +3241,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             std::array<VkDescriptorImageInfo,8> image{};
             std::array<bool,8> generated_mips{};   // the map's texture has GPU-made mips (auto_samplers_)
             for(size_t map=0;map<8;++map) {
+                const auto set_size=[&](VkExtent2D extent) {
+                    if ((size_maps[i]&(1u<<map)) && !copy_dimensions[i][map][0])
+                        copy_dimensions[i][map]={extent.width,extent.height};
+                };
                 const auto* chosen=&draw_texture(packet.draws[i],map);
                 if(*chosen)if(const auto alias=copy_aliases_.find(chosen->get());alias!=copy_aliases_.end() && !alias->second.requested.expired())chosen=&alias->second.rendered;
                 if(*chosen && (*chosen)->gpu_only) {
@@ -3203,6 +3265,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                             }
                         }
                         slot.copy_sources.push_back(*chosen);
+                        set_size(copied->second.extent);
                         image[map]={VK_NULL_HANDLE,copied->second.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                         if(copied->second.mips_pending && ((packet.draws[i].texture_wrap[map]>>5)&3) && std::find(copy_mips.begin(),copy_mips.end(),&copied->second)==copy_mips.end())
                             copy_mips.push_back(&copied->second);   // a mip filter (maxLod above 0): the levels are made before this packet's passes
@@ -3225,6 +3288,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                     found=texture_indices.emplace(source.get(),slot.textures.size()-1).first;
                 }
                 image[map]={VK_NULL_HANDLE,slot.textures[found->second]->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                set_size(slot.textures[found->second]->extent);
                 generated_mips[map]=slot.textures[found->second]->auto_mips;
             }
             if(i==0 || packet.draws[i].uniforms.block()!=packet.draws[i-1].uniforms.block() ||
@@ -3235,7 +3299,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 auto* uniform_at=static_cast<std::byte*>(slot.uniforms.mapped)+uniform_offset;
                 std::memcpy(uniform_at,&*packet.draws[i].uniforms,sizeof(gx::DrawUniform));
                 if (screen_refraction[i]) {
-                    const uint32_t direct=0;
+                    const uint32_t direct=gx::effective_indirect_command(*packet.draws[i].uniforms,0,true);
                     std::memcpy(uniform_at+offsetof(gx::DrawUniform,ind_cmd),&direct,sizeof direct);
                 }
                 std::array<uint32_t,kTevWords> tev{}; std::copy(gpu_draws[i].key.begin()+1,gpu_draws[i].key.begin()+68,tev.begin());
@@ -3835,6 +3899,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         cached=unbounded ? INFINITY : any ? gx::box_guest_pixels({x0,y0,x1,y1},v[2],v[3]) : 0.f;
         return cached;
     };
+    // The actual raster viewport, shared by attachment bounds and draw recording.
+    // Late aim shifts clip coordinates, not this viewport. Reticle scaling does
+    // change it, so apply the same centre/scale calculation in both places.
+    const auto reticle_viewport=[&](const gx::DrawPacket& draw,EfbViewport area) {
+        if (draw.reticle && crosshair_scale_>0 && crosshair_scale_!=1)
+            if (const auto center=gx::draw_center_ndc(draw))
+                gx::scale_viewport_about(*center,crosshair_scale_,area.x,area.y,area.width,area.height);
+        return area;
+    };
     auto record_pass=[&](const PassTarget& target, size_t first, size_t last, bool scene) {
     const bool initialized=*target.initialized;
     const bool efb_clear=efb_clear_.pending && target.color==efb_ && !overlay_frame;   // UC_FOLD_CLEAR: the copy's clear this pass applies first
@@ -3893,16 +3966,26 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             add(int64_t(r[0]) * target.extent.width / 640, int64_t(r[1]) * target.extent.height / 480,
                 (int64_t(r[0]) + r[2]) * target.extent.width / 640 + 1, (int64_t(r[1]) + r[3]) * target.extent.height / 480 + 1);
         }
+        bool bounded_reticle=false;
+        static const bool full_reticle_area=std::getenv("UC_FULL_RETICLE_AREA")!=nullptr;
         for (size_t d = first; d < last; ++d) {
             if (x0 == 0 && y0 == 0 && x1 == int64_t(target.extent.width) && y1 == int64_t(target.extent.height)) break;   // already everything
             const auto& draw = packet.draws[d];
             if (!gpu_draws[d].index_count || (!hud_draw.empty() && hud_draw[d]) || (!particle_draw.empty() && bool(particle_draw[d])!=particle_pass)) continue;
-            if (draw.reticle || draw.late_aim) { add(0, 0, target.extent.width, target.extent.height); continue; }   // scaled or moved after the fact
+            if (draw.reticle && crosshair_scale_<=0) continue;
+            if (draw.reticle || draw.late_aim) {
+                // Triangle clipping bounds fragments by the actual viewport,
+                // even after late aim. Keep the prior bound for line expansion.
+                if (full_reticle_area || gpu_draws[d].key[69]!=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+                    add(0,0,target.extent.width,target.extent.height); continue;
+                }
+                bounded_reticle=true;
+            }
             const auto v = draw.state->viewport.value_or(std::array<float,6>{0, 0, 640, 480, 0, 1});
-            const auto a = uc::efb_viewport(v, target.extent.width, target.extent.height);
+            const auto a = reticle_viewport(draw,uc::efb_viewport(v,target.extent.width,target.extent.height));
             int64_t ax = int64_t(std::floor(std::min(a.x, a.x + a.width))), ay = int64_t(std::floor(std::min(a.y, a.y + a.height)));
             int64_t bx = int64_t(std::ceil(std::max(a.x, a.x + a.width))) + 1, by = int64_t(std::ceil(std::max(a.y, a.y + a.height))) + 1;
-            if (draw.state->scissor) {   // the same rectangle the draw loop sets
+            if (draw.state->scissor && !draw.late_aim) {   // late aim may reset the scissor; retain its whole viewport
                 const auto& s = *draw.state->scissor;
                 ax = std::max(ax, int64_t(s[0]) * target.extent.width / 640); ay = std::max(ay, int64_t(s[1]) * target.extent.height / 480);
                 bx = std::min(bx, (int64_t(s[0]) + s[2]) * target.extent.width / 640); by = std::min(by, (int64_t(s[1]) + s[3]) * target.extent.height / 480);
@@ -3912,7 +3995,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = y1 = 1; }   // nothing drawn: one pixel
         render_area = {{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
         static const bool area_log = std::getenv("UC_GPU_PACKETS") != nullptr;   // the render area of the big passes, once per 2 s per kind
-        if (area_log && last - first >= 200) {
+        if (area_log && (last - first >= 200 || bounded_reticle)) {
             static std::map<std::string, std::chrono::steady_clock::time_point> logged;
             auto& at = logged[slot.timing_kind];
             if (std::chrono::steady_clock::now() - at > std::chrono::seconds(2)) {
@@ -3932,8 +4015,15 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
         fovea_attachment.shadingRateAttachmentTexelSize=fovea_texel_; rendering.pNext=&fovea_attachment;
     }
     const VkImageLayout depth_before=!initialized ? VK_IMAGE_LAYOUT_UNDEFINED : scene ? scene_depth_layout_ : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    // Attachment reuse depends on earlier depth tests, not unrelated vertex,
+    // compute or colour-copy work. Transfers/sampling explicitly transition back
+    // to this layout before reuse; scene upscalers may leave GENERAL and retain
+    // the broad dependency. Dolphin's PrepareForRenderPass uses the same split.
+    static const bool broad_depth=std::getenv("UC_BROAD_DEPTH_BARRIER")!=nullptr;
+    const bool depth_attachment=depth_before==VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL && !broad_depth;
     barrier(slot.command,target.depth,depth_before,VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            initialized ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,initialized ? VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
+            !initialized ? VK_PIPELINE_STAGE_2_NONE : depth_attachment ? depth_stages : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            !initialized ? 0 : depth_attachment ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,
             depth_stages,VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
     if (scene) scene_depth_layout_=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depth.imageView=target.depth_view; depth.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
@@ -4162,7 +4252,8 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 const float sx=target.extent.width/float(display_source[2]),sy=target.extent.height/float(display_source[3]);
                 area={(v[0]-1.f/12-display_source[0])*sx,(v[1]-1.f/12-display_source[1])*sy,v[2]*sx,v[3]*sy};
             }
-            VkViewport draw_viewport{area.x,area.y,area.width,area.height,v[4],v[5]};
+            const auto raster_area=reticle_viewport(draw,area);
+            VkViewport draw_viewport{raster_area.x,raster_area.y,raster_area.width,raster_area.height,v[4],v[5]};
             auto draw_scissor=scissor;
             if(draw.state->scissor && !overlay_frame) {
                 const auto& s=*draw.state->scissor;
@@ -4173,10 +4264,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 draw_scissor={{int32_t(x),int32_t(y)},{uint32_t(right-x),uint32_t(bottom-y)}};
             }
             if (draw.layer && crosshair_hidden()) continue;   // the headset's "Game crosshair: Hidden": no reticle quad or wake (the laser aims)
-            if (draw.reticle && crosshair_scale_!=1) {
-                if (crosshair_scale_<=0) continue;   // 0%: no crosshair (a Vulkan viewport needs a positive size)
-                if (const auto center=gx::draw_center_ndc(draw)) gx::scale_viewport_about(*center,crosshair_scale_,draw_viewport.x,draw_viewport.y,draw_viewport.width,draw_viewport.height);
-            }
+            if (draw.reticle && crosshair_scale_<=0) continue;   // 0%: no crosshair (a Vulkan viewport needs a positive size)
             float late_shift[2]{};   // clip-space translation of a late-aimed reticle quad, in NDC of the draw's viewport
 #ifdef UC_OPENXR
             if (xr_ && (draw.reticle || draw.late_aim || draw.wake)) xr_->finish_input();
@@ -4835,6 +4923,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             record_dlss5(slot.command,Dlss5Hook::present,{efb_,efb_view_,VK_FORMAT_R8G8B8A8_UNORM,efb_extent_,usage},origin,size,{0,0},packet.black_output);
             barrier(slot.command,efb_,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,all,any,all,any);
         }
+        // Direct XR presentation never reads this slot. Do not transition an
+        // unused image twice or mark an untouched image as initialized. Captures
+        // still prepare it for XrCompositor::copy_capture below.
+        if (!xr_direct || capture_xr) {
         barrier(slot.command,slot.image,slot.initialized ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 slot.initialized ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_NONE,slot.initialized ? VK_ACCESS_2_TRANSFER_READ_BIT : 0,VK_PIPELINE_STAGE_2_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT);
         VkImageBlit copy{}; copy.srcSubresource=copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,layers_};
@@ -4863,6 +4955,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
             barrier(slot.command,slot.ui_image,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,0,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             record_overlays(slot.ui_view,VK_ATTACHMENT_LOAD_OP_CLEAR);
             barrier(slot.command,slot.ui_image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
         }
     }
 #ifdef UC_OPENXR
@@ -5055,7 +5148,7 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     for (auto& texture : slot.textures) texture->initialized=true;
     if (packet.present && display) keep_frame_=false;
     if (packet.present && !overlay_frame) { frame_start_=true; ++frame_index_; scene_restore_copy_.reset(); dlss5_scene_.ready=false; frame_reticle_.clear(); }
-    slot.serial = serial; slot.submitted = true; slot.initialized |= packet.present && display; slot.copied=packet.present && display && (!xr_direct || capture_xr); slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
+    slot.serial = serial; slot.submitted = true; slot.copied=packet.present && display && (!xr_direct || capture_xr); slot.initialized |= slot.copied; slot.reported = false; last_serial_ = serial; next_slot_ = (next_slot_ + 1) % slots_.size();   // efb_initialized_/scene_initialized_ are set by the passes that wrote them
 #ifdef UC_OPENXR
     if (xr_ && packet.present && display && xr_->frame_open()) { xr_->end_frame(xr_frame_); if (xr_frame_) ++presentations_; xr_frame_ = false; }
 #endif

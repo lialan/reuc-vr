@@ -598,7 +598,13 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
         VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dependency.imageMemoryBarrierCount = 1; dependency.pImageMemoryBarriers = &b;
         vkCmdPipelineBarrier2(command, &dependency);
     };
-    barrier(layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+    // These pictures are produced by colour rendering or a copy, then left in
+    // TRANSFER_SRC. Keep unrelated vertex/compute work out of the dependency;
+    // other callers/layouts retain the conservative scope.
+    const bool transfer_picture=layout==VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier(layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            transfer_picture ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            transfer_picture ? VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_MEMORY_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     overlay_.upload(command, panel_.take_panel(), panel_.take_label());
     // The eye array arrives from xrWaitSwapchainImage in COLOR_ATTACHMENT_OPTIMAL and is released in it (XR_KHR_vulkan_enable2). Cleared,
@@ -646,8 +652,9 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());
     vkCmdEndRendering(command);
-    barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+            transfer_picture ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            transfer_picture ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
 }
 
 void XrCompositor::copy_capture(VkCommandBuffer command, VkImage destination, VkExtent2D size) {

@@ -30,9 +30,55 @@ inline PipelineKey without_logic_op(PipelineKey key) {
 // (key[5 + 4 * stage], specialization constant 4 + 4 * stage): tev.slang then compiles the indirect path out of that stage. Desktop keys never
 // set it (their recorded seed stays valid). Keys recorded before the bit existed are read as all-direct (headset_direct_key).
 constexpr uint32_t kTevDirectStage=1u<<16;
+// Indirect-stage specialization uses spare bits in the existing stage words:
+// order[17] marks it, order[18..23] selects the indirect map/coordinate,
+// konst[10..30] holds IND_CMD. The low order/konst fields keep their GX meaning.
+// Matrix coefficients and coordinate scales remain uniforms.
+constexpr uint32_t kTevIndirectStage=1u<<17;
+constexpr uint32_t kTevIndirectReferenceMask=63u<<18;
+inline void specialize_indirect_stage(PipelineKey& key,uint32_t stage,uint32_t command,uint32_t references) {
+    if (!command || (command&~0x1FFFFFu) || !(key[5+4*stage]&64)) return;
+    key[5+4*stage]=(key[5+4*stage]&~(kTevDirectStage|kTevIndirectReferenceMask))|kTevIndirectStage|
+        (((references>>((command&3)*6))&63u)<<18);
+    key[6+4*stage]=(key[6+4*stage]&1023u)|((command&0x1FFFFFu)<<10);
+}
+inline PipelineKey dynamic_indirect_key(PipelineKey key) {
+    for(uint32_t i=0;i<std::min<uint32_t>(key[1],16);++i) {
+        key[5+4*i]&=~(kTevIndirectStage|kTevIndirectReferenceMask);
+        key[6+4*i]&=1023u;
+    }
+    return key;
+}
+// Coordinates consumed by a known TEV shader. Dynamic indirect stages can select
+// any coordinate from IREF, so keep the general vertex path for those keys.
+// This masks outputs, not the packed pre-pass layout: that can contain extra
+// coordinates (including raw indirect inputs removed by the VR adaptation).
+inline uint32_t xform_coordinate_mask(const PipelineKey& key) {
+    uint32_t mask=key[1]==0 ? 1u : 0u;
+    for (uint32_t i=0;i<std::min<uint32_t>(key[1],16);++i) {
+        const uint32_t order=key[5+4*i];
+        if (!(order&64)) continue;
+        mask|=1u<<((order>>3)&7);
+        if (order&kTevDirectStage) continue;
+        if (!(order&kTevIndirectStage)) return 255u;
+        mask|=1u<<((order>>21)&7);
+    }
+    return mask;
+}
+// Stage-zero order bit 24: every consumed texture coordinate has Q=1.
+// This is a whole-shader property, including the no-stage texture-zero path.
+constexpr uint32_t kTevAffineCoordinates=1u<<24;
+inline PipelineKey general_coordinates_key(PipelineKey key) {
+    key[5]&=~kTevAffineCoordinates;
+    return key;
+}
+inline PipelineKey affine_coordinates_key(PipelineKey key) {
+    if (xform_coordinate_mask(key)) key[5]|=kTevAffineCoordinates;
+    return key;
+}
 inline PipelineKey headset_direct_key(PipelineKey key) {
     const uint32_t stages=std::min<uint32_t>(key[1],16);
-    for(uint32_t i=0;i<stages;++i) if(key[5+4*i]&kTevDirectStage) return key;   // already in the headset's form
+    for(uint32_t i=0;i<stages;++i) if(key[5+4*i]&(kTevDirectStage|kTevIndirectStage)) return key;   // already in the headset's form
     for(uint32_t i=0;i<stages;++i) key[5+4*i]|=kTevDirectStage;
     return key;
 }
