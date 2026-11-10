@@ -5,6 +5,7 @@
 # Needs: the translated game in generated/ (scripts/build.sh --translate-only), the Android SDK + NDK 27.3, JDK 17, the OpenXR loader
 # AAR unpacked (UC_OPENXR_DIR, default ~/Downloads/VR/deps/oxr), slangc (UC_SLANGC), Vulkan headers newer than the NDK's
 # (UC_VULKAN_HEADERS, default Homebrew's vulkan-headers). Settings may come from local.env.
+# UC_APP_VERSION / UC_APP_VERSION_CODE: the APK's versionName / versionCode (releases: 0.1.5 -> 105).
 # UC_QUEST_BUILD_DIR: another build folder (flag experiments side by side); UC_QUEST_CMAKE_ARGS: extra configure arguments (word-split).
 # ThinLTO is on by default (UC_THINLTO=OFF turns it off): with the PGO profile, the fight replay's guest CPU -1.5% more on the Quest.
 set -euo pipefail
@@ -56,7 +57,8 @@ echo "sdk.dir=$SDK" > "$ROOT/quest/local.properties"
 # Debug by default, as gse-recomp's Vulkan Quest builds: run-as (the runner's private game folder) needs a debuggable app. The native code is
 # the optimised build either way. UC_APK_TYPE=release for the signed release variant.
 TYPE="${UC_APK_TYPE:-debug}"; TASK="assemble$(echo "${TYPE:0:1}" | tr a-z A-Z)${TYPE:1}"
-( cd "$ROOT/quest" && JAVA_HOME="$JDK" ./gradlew --offline -q ":reuc:$TASK" -PdolSha256="$DOL_SHA" -PcommonKeyEmbedded="$KEY_EMBEDDED" )
+( cd "$ROOT/quest" && JAVA_HOME="$JDK" ./gradlew --offline -q ":reuc:$TASK" -PdolSha256="$DOL_SHA" -PcommonKeyEmbedded="$KEY_EMBEDDED" \
+  ${UC_APP_VERSION:+-PappVersionName="$UC_APP_VERSION"} ${UC_APP_VERSION_CODE:+-PappVersionCode="$UC_APP_VERSION_CODE"} )
 
 APK="$ROOT/quest/reuc/build/outputs/apk/$TYPE/reuc-$TYPE.apk"
 echo "[4/4] $APK ($(du -h "$APK" | cut -f1))"
