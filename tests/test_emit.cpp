@@ -282,6 +282,24 @@ int main() {
         t = emit_cr({cmpwi0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, beq, li(3, 1), blr, li(3, 2), blr});   // 9: too far
         CHECK(has(t, "op_cmpi") && !has(t, "cf0a"));
     }
+    {   // store groups: plain stores through one base (not r1) with only register operations and loads between them mark their pages once
+        auto has = [](const std::string& t, const std::string& s) { return t.find(s) != std::string::npos; };
+        auto emit = [&](const std::vector<uint32_t>& code) { auto q = make_prog(code); return uc::emit_function(q, q.an.functions[0], st); };
+        const size_t groups = st.store_groups;
+        std::string t = emit({stw(4, 0, 5), lwz(6, 8, 7), addi(8, 6, 1), stfs(1, 8, 5), stw(6, 4, 5), blr});
+        CHECK(has(t, "ppc::note_stores(c, 5, 0, 12u); ppc::op_stw<false, true>(c, 4, 5, 0);") && has(t, "ppc::op_stfs<false, true>(c, 1, 5, 8);"));
+        CHECK(has(t, "ppc::op_stw<false, true>(c, 6, 5, 4);") && st.store_groups == groups + 1);
+        t = emit({stw(4, 0, 5), stw(6, 0, 7), stw(6, 4, 5), blr});   // another store between: no group
+        CHECK(!has(t, "note_stores") && !has(t, "<false, true>"));
+        t = emit({stw(4, 0, 5), addi(5, 5, 4), stw(6, 4, 5), blr});   // the base changes
+        CHECK(!has(t, "note_stores"));
+        t = emit({stw(4, 0, 5), stw(4, 0x1000, 5), blr});   // more than 4096 bytes
+        CHECK(!has(t, "note_stores"));
+        t = emit({stw(4, 0, 1), stw(4, 4, 1), blr});   // r1: frame notes instead
+        CHECK(!has(t, "note_stores") && has(t, "frame_note"));
+        t = emit({stw(4, -16, 13), stw(4, 4, 13), blr});
+        CHECK(has(t, "ppc::note_stores(c, 13, -16, 24u);"));
+    }
     {   // Resume after calls that can reach a parked SDK call (here the indirect one) without splitting the original function; a call of a
         // closed function (the direct one) cannot park, so it gets no resume entry.
         Asm a;

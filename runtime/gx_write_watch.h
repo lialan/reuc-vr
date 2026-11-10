@@ -62,9 +62,21 @@ inline void frame_check(uint32_t address, uint32_t size) {
     const uint32_t at = address & 0x3FFFFFFFu;
     if (page_epoch[at >> 12] <= frame_check_cap || page_epoch[(at + size - 1) >> 12] <= frame_check_cap) [[unlikely]] frame_check_fail(address);
 }
+// A grouped store (ppc_rt.h, the translator's store groups) must find both of its pages marked with the current epoch: exactly what its own
+// barrier would have written there.
+UC_IMAGE_LOCAL inline uint64_t group_check_failures = 0;
+[[gnu::noinline, gnu::cold]] inline void group_check_fail(uint32_t address) {
+    if (++group_check_failures <= 20 || group_check_failures % 100000 == 0)
+        std::fprintf(stderr, "[group-check] grouped store at %08X without its marks (%llu so far)\n", address, (unsigned long long)group_check_failures);
+}
+inline void group_check(uint32_t address, uint32_t size) {
+    const uint32_t at = address & 0x3FFFFFFFu, last = (at + size - 1) & 0x3FFFFFFFu;
+    if (page_epoch[at >> 12] != write_epoch || page_epoch[last >> 12] != write_epoch) [[unlikely]] group_check_fail(address);
+}
 inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; ++watch_generation; frame_check_cap = 0; }
 #else
 inline void frame_check(uint32_t, uint32_t) {}
+inline void group_check(uint32_t, uint32_t) {}
 inline void watch_reset() { for (auto& epoch : page_epoch) epoch = 0; write_epoch = 2; ++watch_generation; }
 #endif
 }

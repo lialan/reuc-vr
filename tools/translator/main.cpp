@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
     std::printf("  of the fused: fcmp %zu  fcmp bit tests %zu  delayed compares %zu  record forms %zu\n", st.cr_fused_fp, st.cr_bit_tests, st.cr_delayed, st.cr_record_branches);
     std::printf("mmio-base loads/stores %zu (explicit MMIO test)  fifo-runs %zu (%zu stores)\n", st.mmio_sites, st.fifo_runs, st.fifo_run_stores);
     std::printf("framed stack stores %zu (no per-store barrier), frame notes %zu\n", st.framed_stores, st.frame_notes);
+    std::printf("store groups %zu (%zu stores, one page mark per group)\n", st.store_groups, st.grouped_stores);
     if (p.reg_cache) std::printf("reg-cache entry-loads %zu  flushes %zu  reloads %zu  leaf-functions %zu  leaf-calls %zu\n", st.reg_entry_loads, st.reg_flushes, st.reg_reloads, st.reg_leaves, st.reg_leaf_calls);
     if (verbose) for (uint32_t a : p.an.unresolved_bctr) std::printf("unresolved-switch-bctr %08X\n", a);
     return 0;

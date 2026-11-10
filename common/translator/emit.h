@@ -22,6 +22,7 @@ struct EmitStats {
     size_t mmio_sites = 0;                                                         // loads/stores from a hardware-register base (explicit MMIO test)
     size_t framed_stores = 0, frame_notes = 0;                                    // r1 stores without a per-store barrier, the frame notes that cover them
     size_t fifo_runs = 0, fifo_run_stores = 0;                                     // runs of FIFO stores decided once (uc::gx_fifo_burst), their stores
+    size_t store_groups = 0, grouped_stores = 0;                                   // runs of stores through one base whose pages are marked once, their stores
 };
 
 struct Program {
@@ -72,6 +73,9 @@ struct CrHints {
     // frame_note: the mark (ppc::frame_note) the instruction's interrupt poll writes after the poll's slow path.
     bool framed = false;
     std::string frame_note;
+    // A store of a store group (emit.cpp, mark_store_groups): a plain store through a base other than r1 whose pages ppc::note_stores marked
+    // before the group's first store; also ppc::op_*<false, true>.
+    bool grouped = false;
     // A store of a FIFO run (emit.cpp, fifo_runs): 1 = the run's first store, which decides the whole run (uc::gx_fifo_burst over
     // fifo_bytes bytes in fifo_stores stores), 2 = a later one; each appends in place when the run was taken.
     int fifo = 0;

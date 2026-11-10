@@ -1,5 +1,6 @@
 #include "check.h"
 #include "ppc_fixture.h"
+#include <vector>
 using namespace ppc;
 
 extern uint32_t g_mmio_last_addr, g_mmio_last_val;
@@ -67,5 +68,29 @@ int main() {
     for (int i = 0; i < 32; i += 4) wr32(c, 0x80002500 + i, 0xFFFFFFFF);
     c.r[3] = 0x80002500; c.r[4] = 0x14; op_dcbz(c, 3, 4);
     CHECK(rd32(c, 0x80002500) == 0 && rd32(c, 0x8000251C) == 0);
+    {   // a store group (translator store groups): note_stores + the grouped forms leave memory and the write watch as the plain stores do,
+        // here across a page boundary, through a small-data base and with every grouped form
+        auto run = [&](bool grouped, uint32_t base) {
+            gx::watch_reset();
+            for (uint32_t a = 0x80010F00; a < 0x80011200; a += 4) wr32(c, a, 0);
+            gx::watch_reset(); gx::watch_stamp();   // a later epoch than the setup's marks
+            c.r[5] = base; c.r[13] = base; c.r[6] = 0x11223344; c.f[1] = 1.5; c.ps1[1] = -2.0; c.gqr[0] = 0;
+            if (grouped) {
+                note_stores(c, 5, -8, 0x10C);   // [base - 8, base + 0x104)
+                op_stw<false, true>(c, 6, 5, -8); op_sth<false, true>(c, 6, 5, 0x40); op_stb<false, true>(c, 6, 5, 0x103);
+                op_stfs<false, true>(c, 1, 5, 4); op_stfd<false, true>(c, 1, 5, 0x80); op_psq_st<false, true>(c, 1, 5, 0xF0, 0, 0);
+                note_stores(c, 13, 0, 8); op_stw<false, true>(c, 6, 13, 0); op_stfd<false, true>(c, 1, 13, 0);
+            } else {
+                op_stw(c, 6, 5, -8); op_sth(c, 6, 5, 0x40); op_stb(c, 6, 5, 0x103);
+                op_stfs(c, 1, 5, 4); op_stfd(c, 1, 5, 0x80); op_psq_st(c, 1, 5, 0xF0, 0, 0);
+                op_stw(c, 6, 13, 0); op_stfd(c, 1, 13, 0);
+            }
+            std::vector<uint32_t> state;
+            for (uint32_t a = 0x80010F00; a < 0x80011200; a += 4) state.push_back(rd32(c, a));
+            for (uint32_t page = 0x0000F; page <= 0x00012; ++page) state.push_back(gx::page_epoch[page]);
+            return state;
+        };
+        for (uint32_t base : {0x80010F80u, 0x80010FF8u, 0x80011000u}) CHECK(run(true, base) == run(false, base));
+    }
     return 0;
 }

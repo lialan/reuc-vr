@@ -256,7 +256,7 @@ std::string emit_insn(const Program& p, const Function& f, uint32_t pc, uint32_t
     }
     std::string a = op_args(*op, w);
     if (op->rc) a += (a.empty() ? "" : ", ") + std::string(ppc::rc(w) && !(hints && hints->drop_rc) ? "true" : "false");
-    const std::string text = "ppc::op_" + name + (hints && hints->io ? "<true>" : hints && hints->framed ? "<false, true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
+    const std::string text = "ppc::op_" + name + (hints && hints->io ? "<true>" : hints && (hints->framed || hints->grouped) ? "<false, true>" : "") + "(c" + (a.empty() ? "" : ", " + a) + ");";
     if (hints && hints->fifo) {   // a store of a FIFO run (mark_fifo_runs)
         const std::string t = num(ppc::t(w));
         const std::string value = name == "stfs" ? "ppc::single_bits(c.f[" + t + "])" : "c.r[" + t + "]";
@@ -702,6 +702,7 @@ struct FnPlan {
     // copied for a later branch, the GPR bit of a folded fcmp/mfcr/rlwinm, an andi./andis. without its CR write
     std::vector<std::string> code;
     std::vector<RegEffect> code_eff;
+    std::vector<std::string> group_note;   // the page marks of a store group, at its first store (mark_store_groups)
     uint8_t cf_used = 0, cf_b_used = 0;   // CR fields whose compare operands wait in cf<field>a (and cf<field>b) for a later branch
     bool tail_end = false;              // the last instruction falls into the next function
 };
@@ -939,6 +940,70 @@ static bool mark_fifo_runs(const Function& f, FnPlan& plan, EmitStats& st) {
     return any;
 }
 
+// Store groups: two or more plain stores (stw, sth, stb, stfs, stfd, psq_st) through one base register other than r0 and r1 (r1 stores are
+// framed), in a straight line of at most 32 instructions with no label, and spanning at most 4096 bytes (so they touch the page of the span's
+// first byte and the page of its last, and only those). The group's write barrier is ppc::note_stores at its first store: those two marks;
+// its stores (ppc::op_*<false, true>) mark nothing. Between the stores only instructions that write no guest memory and call no native code
+// pass: register operations and loads (a load through the MMIO window reads a plain register file, gx_fifo.h and mmio.h); no other store, no
+// cache operation, no branch, call, trap or MMIO-marked access, and nothing that writes the base. So the write epoch (gx_write_watch.h, which
+// only native code advances) is the same at the marks as at each store, and nothing reads the marks in between on this thread: the page
+// table ends exactly as the per-store marks leave it. A group whose base is in the MMIO window stores to no RAM page (the window is far from
+// RAM, and the group spans 4 KiB); its marks land on pages nothing caches.
+static size_t store_size(const ppc::OpInfo* op, uint32_t w) {
+    if (!op) return 0;
+    const std::string n = op->name;
+    if (n == "psq_st") return (w >> 15) & 1 ? 4 : 8;   // W = 1: ps0 only; quantized forms store fewer bytes from the same address
+    return n == "stw" || n == "stfs" ? 4 : n == "stb" ? 1 : n == "sth" ? 2 : n == "stfd" ? 8 : 0;
+}
+static void mark_store_groups(const Function& f, FnPlan& plan, EmitStats& st) {
+    plan.group_note.assign(plan.n, std::string());
+    auto label = [&](size_t i) { return plan.labels.count(f.entry + uint32_t(i) * 4) != 0; };
+    auto member = [&](size_t i) -> size_t {   // the store's size when it can be in a group
+        if (!plan.comment[i].empty() || !plan.code[i].empty() || plan.hints[i].io || plan.hints[i].fifo || plan.hints[i].framed) return 0;
+        const uint32_t w = plan.words[i];
+        if (ppc::a(w) == 0 || ppc::a(w) == 1) return 0;
+        return store_size(ppc::decode(w), w);
+    };
+    auto disp = [&](size_t i) { const uint32_t w = plan.words[i]; return (w >> 26) == 60 ? int32_t(w << 20) >> 20 : int32_t(ppc::simm(w)); };
+    auto between = [&](size_t i, uint32_t base) {
+        if (!plan.comment[i].empty()) return true;   // a folded compare: no code
+        if (!plan.code[i].empty()) return !plan.code_eff[i].may.test(size_t(res::R + int(base)));   // register code of a fused sequence
+        const uint32_t w = plan.words[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        using ppc::Kind;
+        if (!op || plan.hints[i].io || plan.hints[i].fifo || op->kind == Kind::BR || op->kind == Kind::BC || op->kind == Kind::BCLR ||
+            op->kind == Kind::BCCTR || op->kind == Kind::SC || op->kind == Kind::UNSUP || (op->sub == ppc::Sub::X9 && ppc::oe(w))) return false;
+        const std::string n = op->name;
+        if (n == "tw" || n == "twi" || n.compare(0, 2, "st") == 0 || n.compare(0, 6, "psq_st") == 0 || n.compare(0, 2, "dc") == 0 ||
+            n.compare(0, 2, "ic") == 0) return false;
+        bool ok = false;
+        const RegEffect e = reg_effect(*op, w, op->rc && ppc::rc(w) && !plan.hints[i].drop_rc, ok);
+        return ok && !e.may.test(size_t(res::R + int(base)));
+    };
+    for (size_t i = 0; i < plan.n;) {
+        const size_t first = member(i);
+        if (!first) { ++i; continue; }
+        const uint32_t base = ppc::a(plan.words[i]);
+        int32_t lo = disp(i), hi = disp(i) + int32_t(first);
+        std::vector<size_t> group{i};
+        for (size_t j = i + 1; j < plan.n && j - i < 32 && !label(j); ++j) {
+            if (const size_t s = member(j); s && ppc::a(plan.words[j]) == base) {
+                const int32_t nlo = std::min(lo, disp(j)), nhi = std::max(hi, disp(j) + int32_t(s));
+                if (nhi - nlo > 4096) break;
+                lo = nlo; hi = nhi; group.push_back(j);
+                continue;
+            }
+            if (!between(j, base)) break;
+        }
+        if (group.size() >= 2) {
+            for (size_t k : group) plan.hints[k].grouped = true;
+            plan.group_note[i] = "ppc::note_stores(c, " + num(base) + ", " + num(lo) + ", " + num(hi - lo) + "u); ";
+            ++st.store_groups; st.grouped_stores += group.size();
+        }
+        i = group.back() + 1;
+    }
+}
+
 std::string emit_function(const Program& p, const Function& f, EmitStats& st, const CrLive* live, const std::unordered_map<uint32_t, LeafRegs>* leaves) {
     FnPlan plan;
     plan_function(p, f, live, st, plan);
@@ -959,6 +1024,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         st.mmio_sites += mark_mmio_bases({&words, &comment}, nodes, hints);
     }
     const bool fifo_fn = mark_fifo_runs(f, plan, st);
+    mark_store_groups(f, plan, st);
 
     // pass 2: register cache dataflow
     const bool local = p.reg_cache;
@@ -1135,7 +1201,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         std::string code = comment[i].empty() ? plan.code[i] : comment[i];
         if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
         else ++st.instructions;
-        code = frame_at[i] + code;
+        code = frame_at[i] + plan.group_note[i] + code;
         if (p.count_insns) code = "++ppc::g_guest_insns; " + code;
         o << "  /*" << hex8(pc) << "*/ { " << code << " }" << (fall_flush[i].empty() ? "" : " { " + fall_flush[i] + "}") << "\n";
     }

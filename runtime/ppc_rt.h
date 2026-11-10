@@ -145,6 +145,30 @@ PPC_INLINE void wr8_stack(Ctx& c, uint32_t ea, uint32_t v) { guest_note_stack(ea
 PPC_INLINE void wr32_framed(Ctx& c, uint32_t ea, uint32_t v) { gx::frame_check(ea, 4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
 PPC_INLINE void wr16_framed(Ctx& c, uint32_t ea, uint32_t v) { gx::frame_check(ea, 2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
 PPC_INLINE void wr8_framed(Ctx& c, uint32_t ea, uint32_t v) { gx::frame_check(ea, 1); *hp(c, ea) = uint8_t(v); }
+// Grouped stores (the translator's op_*<IO, true> with a base other than r1, emit.cpp mark_store_groups): note_stores marked both pages of
+// the group's span before its first store, and nothing between its stores can advance the write epoch, so the store itself marks nothing.
+template <bool IO = false> PPC_INLINE void wr32_grouped(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 4, v); return; }
+    gx::group_check(ea, 4); guest_store<uint32_t>(hp(c, ea), uc_bswap32(v));
+}
+template <bool IO = false> PPC_INLINE void wr16_grouped(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 2, v & 0xFFFF); return; }
+    gx::group_check(ea, 2); guest_store<uint16_t>(hp(c, ea), uc_bswap16(uint16_t(v)));
+}
+template <bool IO = false> PPC_INLINE void wr8_grouped(Ctx& c, uint32_t ea, uint32_t v) {
+    if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 1, v & 0xFF); return; }
+    gx::group_check(ea, 1); guest_store<uint8_t>(hp(c, ea), uint8_t(v));
+}
+PPC_INLINE void wr32_ram_grouped(Ctx& c, uint32_t ea, uint32_t v) { gx::group_check(ea, 4); v = uc_bswap32(v); std::memcpy(hp(c, ea), &v, 4); }
+PPC_INLINE void wr16_ram_grouped(Ctx& c, uint32_t ea, uint32_t v) { gx::group_check(ea, 2); uint16_t h = uc_bswap16(uint16_t(v)); std::memcpy(hp(c, ea), &h, 2); }
+PPC_INLINE void wr8_ram_grouped(Ctx& c, uint32_t ea, uint32_t v) { gx::group_check(ea, 1); *hp(c, ea) = uint8_t(v); }
+// A store group's barrier: the pages of [r[a] + lo, r[a] + lo + span), span <= 4096 (its first and last page).
+PPC_INLINE void note_stores(Ctx& c, int a, int32_t lo, uint32_t span) {
+#ifdef UC_DIAG_NO_GROUP_NOTE   // a test build only: the UC_DIAG_CHECK_FRAMES check must then report the grouped stores
+    return; (void)c; (void)a; (void)lo; (void)span;
+#endif
+    guest_note_small(c.r[a] + uint32_t(lo), span);
+}
 // The pages of [r1 + lo, r1 + hi): every r1-based store of the function lies in it.
 PPC_INLINE void frame_note(Ctx& c, int32_t lo, int32_t hi) {
 #ifdef UC_DIAG_NO_FRAME_NOTE   // a test build only: the rollback probe must then report the untracked stack writes
@@ -159,10 +183,11 @@ template <bool IO = false> PPC_INLINE double rdf64(Ctx& c, uint32_t ea) {
     uint64_t v = uc_bswap64(guest_load<uint64_t>(hp(c, ea))); double d; std::memcpy(&d, &v, 8); return d;
 }
 template <bool IO = false> PPC_INLINE void wrf32(Ctx& c, uint32_t ea, float v) { uint32_t b; std::memcpy(&b, &v, 4); wr32<IO>(c, ea, b); }
-template <bool IO = false> PPC_INLINE void wrf64(Ctx& c, uint32_t ea, double v) {
+template <bool IO = false, bool G = false> PPC_INLINE void wrf64(Ctx& c, uint32_t ea, double v) {   // G: a grouped store (no barrier of its own)
     uint64_t b; std::memcpy(&b, &v, 8);
     if (mmio_route<IO>(ea)) [[unlikely]] { mmio_write(ea, 4, uint32_t(b >> 32)); mmio_write(ea + 4, 4, uint32_t(b)); return; }
-    guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); guest_store<uint64_t>(hp(c, ea), uc_bswap64(b));
+    if constexpr (G) gx::group_check(ea, 8); else { guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); }
+    guest_store<uint64_t>(hp(c, ea), uc_bswap64(b));
 }
 
 PPC_INLINE uint32_t ea_d(Ctx& c, int a, int32_t d) { return (a ? c.r[a] : 0u) + uint32_t(d); }
@@ -350,8 +375,13 @@ PPC_LOAD_FAMILY(lbz, rd8, rd8_ram, PPC_ID)
 PPC_LOAD_FAMILY(lhz, rd16, rd16_ram, PPC_ID)
 PPC_LOAD_FAMILY(lha, rd16, rd16_ram, PPC_SX16)
 
+// F: the translator marked the pages this store writes (a frame note for r1, the store group's note otherwise); no barrier of its own.
 #define PPC_STORE_FAMILY(nm, WR, WRR, WRS, WRF) \
-    template <bool IO = false, bool F = false> PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (stack_base(a)) { if constexpr (F) WRF(c, e, c.r[t]); else WRS(c, e, c.r[t]); } else if (ram_base(a)) WRR(c, e, c.r[t]); else WR<IO>(c, e, c.r[t]); } \
+    template <bool IO = false, bool F = false> PPC_INLINE void op_##nm(Ctx& c, int t, int a, int32_t d) { \
+        const uint32_t e = ea_d(c, a, d); \
+        if (stack_base(a)) { if constexpr (F) WRF(c, e, c.r[t]); else WRS(c, e, c.r[t]); } \
+        else if (ram_base(a)) { if constexpr (F) WRR##_grouped(c, e, c.r[t]); else WRR(c, e, c.r[t]); } \
+        else { if constexpr (F) WR##_grouped<IO>(c, e, c.r[t]); else WR<IO>(c, e, c.r[t]); } } \
     template <bool IO = false> PPC_INLINE void op_##nm##u(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); WR<IO>(c, e, c.r[t]); c.r[a] = e; } \
     template <bool IO = false> PPC_INLINE void op_##nm##x(Ctx& c, int t, int a, int b) { WR<IO>(c, ea_x(c, a, b), c.r[t]); } \
     template <bool IO = false> PPC_INLINE void op_##nm##ux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; WR<IO>(c, e, c.r[t]); c.r[a] = e; }
@@ -390,11 +420,24 @@ template <bool IO = false> PPC_INLINE void op_lfdu(Ctx& c, int t, int a, int32_t
 template <bool IO = false> PPC_INLINE void op_lfdx(Ctx& c, int t, int a, int b) { c.f[t] = rdf64<IO>(c, ea_x(c, a, b)); }
 template <bool IO = false> PPC_INLINE void op_lfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; c.f[t] = rdf64<IO>(c, e); c.r[a] = e; }
 PPC_INLINE uint32_t single_bits(double v) { const float f = float(v); uint32_t bits; std::memcpy(&bits, &f, 4); return bits; }   // stfs's value
-template <bool IO = false, bool F = false> PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); const uint32_t bits = single_bits(c.f[t]); if (stack_base(a)) { if constexpr (F) wr32_framed(c, e, bits); else wr32_stack(c, e, bits); } else if (ram_base(a)) wr32_ram(c, e, bits); else wr32<IO>(c, e, bits); }
+template <bool IO = false, bool F = false> PPC_INLINE void op_stfs(Ctx& c, int t, int a, int32_t d) {
+    const uint32_t e = ea_d(c, a, d); const uint32_t bits = single_bits(c.f[t]);
+    if (stack_base(a)) { if constexpr (F) wr32_framed(c, e, bits); else wr32_stack(c, e, bits); }
+    else if (ram_base(a)) { if constexpr (F) wr32_ram_grouped(c, e, bits); else wr32_ram(c, e, bits); }
+    else { if constexpr (F) wr32_grouped<IO>(c, e, bits); else wr32<IO>(c, e, bits); }
+}
 template <bool IO = false> PPC_INLINE void op_stfsu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
 template <bool IO = false> PPC_INLINE void op_stfsx(Ctx& c, int t, int a, int b) { wrf32<IO>(c, ea_x(c, a, b), float(c.f[t])); }
 template <bool IO = false> PPC_INLINE void op_stfsux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf32<IO>(c, e, float(c.f[t])); c.r[a] = e; }
-template <bool IO = false, bool F = false> PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) { const uint32_t e = ea_d(c, a, d); if (ram_base(a)) { uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v); if (!stack_base(a)) { guest_note(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(e + 7); } else if constexpr (!F) guest_note_stack(e,8); else gx::frame_check(e, 8); std::memcpy(hp(c, e), &v, 8); } else wrf64<IO>(c, e, c.f[t]); }
+template <bool IO = false, bool F = false> PPC_INLINE void op_stfd(Ctx& c, int t, int a, int32_t d) {
+    const uint32_t e = ea_d(c, a, d);
+    if (ram_base(a)) {
+        uint64_t v; std::memcpy(&v, &c.f[t], 8); v = uc_bswap64(v);
+        if (!stack_base(a)) { if constexpr (F) gx::group_check(e, 8); else { guest_note(e); if ((e & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(e + 7); } }
+        else if constexpr (!F) guest_note_stack(e,8); else gx::frame_check(e, 8);
+        std::memcpy(hp(c, e), &v, 8);
+    } else wrf64<IO, F>(c, e, c.f[t]);
+}
 template <bool IO = false> PPC_INLINE void op_stfdu(Ctx& c, int t, int a, int32_t d) { uint32_t e = c.r[a] + uint32_t(d); wrf64<IO>(c, e, c.f[t]); c.r[a] = e; }
 template <bool IO = false> PPC_INLINE void op_stfdx(Ctx& c, int t, int a, int b) { wrf64<IO>(c, ea_x(c, a, b), c.f[t]); }
 template <bool IO = false> PPC_INLINE void op_stfdux(Ctx& c, int t, int a, int b) { uint32_t e = c.r[a] + c.r[b]; wrf64<IO>(c, e, c.f[t]); c.r[a] = e; }
@@ -593,11 +636,11 @@ template <bool IO = false, bool F = false> PPC_INLINE void psq_store(Ctx& c, int
     if (type < 4 && w && (stack || !mmio_route<IO>(ea))) [[likely]] {   // single float
         const float f = float(c.f[t]); uint32_t bits; std::memcpy(&bits, &f, 4);
         if (stack) { if constexpr (F) wr32_framed(c, ea, bits); else wr32_stack(c, ea, bits); }
-        else { guest_note(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] guest_note(ea + 3); guest_store<uint32_t>(hp(c, ea), uc_bswap32(bits)); }
+        else { if constexpr (F) gx::group_check(ea, 4); else { guest_note(ea); if ((ea & 0xFFFu) > 0xFFCu) [[unlikely]] guest_note(ea + 3); } guest_store<uint32_t>(hp(c, ea), uc_bswap32(bits)); }
         return;
     }
     if (type < 4 && !w && (stack || !mmio_route_n<IO>(ea, 8))) [[likely]] {   // float pair: one 8-byte write, one barrier stamp per page
-        if (!stack) { guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); ps_store_pair_guest(hp(c, ea), ps_pair(c, t)); }
+        if (!stack) { if constexpr (F) gx::group_check(ea, 8); else { guest_note(ea); if ((ea & 0xFFFu) > 0xFF8u) [[unlikely]] guest_note(ea + 7); } ps_store_pair_guest(hp(c, ea), ps_pair(c, t)); }
         else { if constexpr (!F) guest_note_stack(ea,8); else gx::frame_check(ea, 8); ps_store_pair(hp(c, ea), ps_pair(c, t)); }
         return;
     }
