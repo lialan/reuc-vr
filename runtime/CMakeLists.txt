@@ -25,7 +25,7 @@ if(UC_WII_COMMON_KEY_FILE)
 endif()
 target_include_directories(uc_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/common)   # common: host_compat.h for ppc_rt.h
 target_sources(uc_runtime PRIVATE gx_audit.cpp)
-target_sources(uc_runtime PRIVATE hle/gx.cpp hle/gx_queue.cpp hle/sdk_math.cpp hle/sdk_regs.cpp hle/leaf_gen.cpp)
+target_sources(uc_runtime PRIVATE hle/gx.cpp hle/gx_queue.cpp hle/sdk_math.cpp hle/sdk_regs.cpp hle/leaf_gen.cpp hle/game_math.cpp)
 if(WIN32)
   target_sources(uc_runtime PRIVATE savefs.cpp)
 else()

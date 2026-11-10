@@ -234,6 +234,11 @@ KPADEnableMotor Nop
 # --- Dolphin SDK matrix/vector library (mtx.a, runtime/hle/sdk_math.cpp): bit-exact native versions of the translated paired-single code.
 # Mapped by address because identified_sdk.txt lists other, unrelated functions under the same names.
 @80264680 ModelHistoryIdentity
+# In-place game 4x4 transpose, including both resume entries.
+@80137F78 MatrixTranspose4
+@80137F9C MatrixTranspose4Resume
+@801380B4 MatrixTranspose4Return
+@80394A10 MatrixEulerFinish
 @802646AC PSMTXCopy
 @802646E0 PSMTXConcat
 @80264DE0 PSMTXTransApply
@@ -248,6 +253,7 @@ KPADEnableMotor Nop
 @802657F0 PSQUATDotProduct
 @80265810 PSVECCrossProduct
 @801316C8 BoundsRecordInit   # 10-store init of a bounds record, called ~66 times per hit buffer
+@80046394 HitBufferDestruct   # destructor of the collision hit buffer (33 empty element destructors: dead frames and polls only)
 @800462E8 HitBufferConstruct   # constructor of the collision hit buffer (32+1 bounds records)
 @80137BC4 Leaf_80137BC4   # tools/leaf_hle.py: generated native leaf functions (4x4 matrix product, vec4 helpers, ...)
 @80139368 Leaf_80139368
@@ -264,7 +270,7 @@ KPADEnableMotor Nop
 @80139610 Leaf_80139610
 @800521A0 Leaf_800521A0
 @800AFCD8 Leaf_800AFCD8
-@80394374 Leaf_80394374
+@80394374 SinCosFIdx
 @8003EDD0 Leaf_8003EDD0
 @80367314 Leaf_80367314
 @80365C7C Leaf_80365C7C
@@ -274,6 +280,16 @@ KPADEnableMotor Nop
 @8037B388 Leaf_8037B388
 @8029C4AC Leaf_8029C4AC
 @80367660 Leaf_80367660
+@8005669C Leaf_8005669C
+@80078A00 Leaf_80078A00
+@800FFD14 Leaf_800FFD14
+@80138B1C Leaf_80138B1C
+@80235294 Leaf_80235294
+@802647AC Leaf_802647AC
+@80273674 Leaf_80273674
+@80365C28 Leaf_80365C28
+@80374210 Leaf_80374210
+@80394BC8 Leaf_80394BC8
 @80064C34 VectorAddStep
 @802447D8 UiPhysicsStep
 @80211734 TimelineStep
