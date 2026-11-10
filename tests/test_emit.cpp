@@ -233,6 +233,55 @@ int main() {
         CHECK(t.find("UC_ENTER(0x80003100u);") != std::string::npos);
         CHECK(t.find("UC_ENTER") < t.find("L_80003100:;"));
     }
+    {   // compare fusion (plan_function); tests/e2e cmpfuse runs every form against the unfused translation
+        auto emit_cr = [&](const std::vector<uint32_t>& code) {
+            auto q = make_prog(code);
+            const uc::CrLive live = uc::analyze_cr(q);
+            return uc::emit_function(q, q.an.functions[0], st, &live);
+        };
+        auto has = [](const std::string& t, const std::string& s) { return t.find(s) != std::string::npos; };
+        const uint32_t fcmpu = 0xFC011000u, cror_le = 0x4C401382u, cror_ge = 0x4C411382u, bne = 0x4082000Cu, beq = 0x4182000Cu;
+        // fcmp + cror (LT|EQ or GT|EQ) + branch on EQ: one comparison when the branch is the field's last reader; the branch reads the operands
+        // from the register copy, so they are loaded at the entry
+        std::string t = emit_cr({fcmpu, cror_le, bne, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "if (!((c.f[1] <= c.f[2])))") && !has(t, "op_fcmpu") && !has(t, "op_cror"));
+        CHECK(has(t, "c.f[1] = ctx.f[1]; c.f[2] = ctx.f[2];"));
+        t = emit_cr({fcmpu, cror_ge, beq, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "if ((c.f[1] >= c.f[2]))"));
+        t = emit_cr({fcmpu, cror_le, bne, beq, li(3, 1), blr, li(3, 2), blr});   // a second reader of the field keeps the CR write
+        CHECK(has(t, "op_fcmpu") && has(t, "op_cror"));
+        t = emit_cr({fcmpu, 0x4180000Cu /* blt */, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "if ((c.f[1] < c.f[2]))") && !has(t, "op_fcmpu"));
+        t = emit_cr({fcmpu, 0x4183000Cu /* bso: unordered */, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "c.f[1] != c.f[1] || c.f[2] != c.f[2]") && !has(t, "xer_so"));
+        // fcmp, cror, mfcr, rlwinm.: one bit of the compare as 0/1, and the branch on that register
+        const uint32_t fcmpo = 0xFC010040u, mfcr0 = 0x7C000026u, rlwinm_dot = 0x54001FFFu;
+        t = emit_cr({fcmpo, cror_ge, mfcr0, rlwinm_dot, bne, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "c.r[0] = uint32_t(c.f[1] >= c.f[0]); }") && has(t, "!((int32_t(c.r[0]) == 0))"));
+        CHECK(!has(t, "op_mfcr") && !has(t, "op_rlwinm") && !has(t, "cr0("));
+        t = emit_cr({fcmpo, cror_ge, mfcr0, rlwinm_dot, 0x40820010u /* bne +16 */, beq, li(3, 1), blr, li(3, 2), blr});   // cr0 read twice
+        CHECK(has(t, "c.r[0] = uint32_t(c.f[1] >= c.f[0]); ppc::cr0(c, c.r[0]);"));
+        // mfcr + rlwinm reads only the fields under the mask: the cr1 compare is dead
+        t = emit_cr({0x2C830000u /* cmpwi cr1,r3,0 */, mfcr0, 0x54001FFEu /* rlwinm r0,r0,3,31,31 */, blr});
+        CHECK(has(t, "cr1 is never read") && has(t, "op_mfcr"));
+        // an integer record form whose only reader is the next branch: the branch tests the result register
+        t = emit_cr({0x5460063Fu /* rlwinm. r0,r3,0,24,31 */, beq, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "ppc::op_rlwinm(c, 3, 0, 0, 24, 31, false);") && has(t, "if ((int32_t(c.r[0]) == 0))"));
+        t = emit_cr({0x70600001u /* andi. r0,r3,1 */, beq, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "c.r[0] = c.r[3] & 1u;") && !has(t, "op_andi_"));
+        // a compare whose branch comes a few instructions later keeps its operands in locals
+        const uint32_t cmpwi0 = 0x2C030000u /* cmpwi r3,0 */, stw0 = 0x90850000u /* stw r4,0(r5) */;
+        t = emit_cr({cmpwi0, stw0, beq, li(3, 1), blr, li(3, 2), blr});
+        CHECK(has(t, "uint32_t cf0a;") && has(t, "cf0a = c.r[3];") && has(t, "(int32_t(cf0a) == 0)") && !has(t, "op_cmpi"));
+        t = emit_cr({cmpwi0, stw0, 0x40820010u /* bne +16 */, beq, li(3, 1), blr, li(3, 2), blr});   // a second reader of cr0
+        CHECK(has(t, "op_cmpi") && !has(t, "cf0a"));
+        t = emit_cr({cmpwi0, stw0, 0x4183000Cu /* bso */, li(3, 1), blr, li(3, 2), blr});   // SO is XER[SO] at the compare: not delayed
+        CHECK(has(t, "op_cmpi") && !has(t, "cf0a"));
+        t = emit_cr({cmpwi0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, beq, li(3, 1), blr, li(3, 2), blr});   // 8 between: still
+        CHECK(has(t, "cf0a"));
+        t = emit_cr({cmpwi0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, stw0, beq, li(3, 1), blr, li(3, 2), blr});   // 9: too far
+        CHECK(has(t, "op_cmpi") && !has(t, "cf0a"));
+    }
     {   // Resume after calls that can reach a parked SDK call (here the indirect one) without splitting the original function; a call of a
         // closed function (the direct one) cannot park, so it gets no resume entry.
         Asm a;

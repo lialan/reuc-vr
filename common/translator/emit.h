@@ -14,6 +14,9 @@ struct EmitStats {
     size_t functions = 0, instructions = 0, invalid = 0, traps_midfunc = 0, unresolved_bctr = 0, oe_traps = 0, unsupported = 0;
     size_t indirect_tail = 0, secondary_entries = 0, fallthrough_tail = 0;
     size_t cr_dead_compares = 0, cr_fused_branches = 0, cr_dropped_records = 0;   // condition-register writes that were never read
+    // parts of cr_fused_branches: fcmp folded into a branch (with or without cror), fcmp [cror] mfcr rlwinm folded into one GPR bit, an
+    // integer compare whose branch comes a few instructions later (operands in cf<field>a/b), a record form tested by the next branch
+    size_t cr_fused_fp = 0, cr_bit_tests = 0, cr_delayed = 0, cr_record_branches = 0;
     size_t reg_entry_loads = 0, reg_flushes = 0, reg_reloads = 0;                  // register-cache copies emitted
     size_t reg_leaf_calls = 0, reg_leaves = 0;                                     // calls that sync only what a leaf callee touches, such callees
     size_t mmio_sites = 0;                                                         // loads/stores from a hardware-register base (explicit MMIO test)
@@ -44,7 +47,11 @@ struct CrLive {
 CrLive analyze_cr(const Program& p);
 
 // What the emitter may drop or fuse for one instruction (from CrLive); the default emits every CR write.
-struct FusedCmp { std::string lhs, rhs; };   // the compare feeding the next conditional branch, as C++ operands
+struct FusedCmp {   // the compare feeding a conditional branch, as C++ operands
+    std::string lhs, rhs;
+    bool fp = false;                  // a floating-point compare: CR bit 3 is "unordered" (a NaN operand), not XER[SO]
+    const char* equal_op = nullptr;   // fcmp + cror (LT|EQ or GT|EQ) + branch on EQ: the operator that replaces bit 2 ("<=" or ">=")
+};
 struct CrHints {
     bool drop_rc = false;                 // the record form's CR write is never read
     const FusedCmp* fused = nullptr;      // a conditional branch tests this compare directly instead of reading CR

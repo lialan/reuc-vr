@@ -1,13 +1,13 @@
 add_executable(gen_e2e_dols gen_e2e_dols.cpp)
 target_include_directories(gen_e2e_dols PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_SOURCE_DIR}/runtime ${CMAKE_SOURCE_DIR}/common)
 
-set(E2E_PROGRAMS loop calls jt0 jt1 jt2 jt9 indirect float ps datawords badbctr illegal_exec secondary fallthrough outside crflow)
+set(E2E_PROGRAMS loop calls jt0 jt1 jt2 jt9 indirect float ps datawords badbctr illegal_exec secondary fallthrough outside crflow cmpfuse cmpfuse_nocr)
 foreach(p ${E2E_PROGRAMS})
   set(gen ${CMAKE_CURRENT_BINARY_DIR}/gen_${p})
   add_custom_command(
     OUTPUT ${gen}/game_decl.h ${gen}/game_table.cpp ${gen}/game_000.cpp
     COMMAND gen_e2e_dols ${p} ${gen}/${p}.dol
-    COMMAND translator --dol ${gen}/${p}.dol --out ${gen} --shard 100000
+    COMMAND translator --dol ${gen}/${p}.dol --out ${gen} --shard 100000 $<$<STREQUAL:${p},cmpfuse_nocr>:--no-cr-opt>
     COMMAND ${CMAKE_COMMAND} -DGEN=${gen} -P ${CMAKE_CURRENT_SOURCE_DIR}/current_generation.cmake
     DEPENDS gen_e2e_dols translator ${CMAKE_CURRENT_SOURCE_DIR}/current_generation.cmake
     COMMENT "translate e2e program ${p}")
@@ -23,6 +23,7 @@ set_tests_properties(e2e_illegal_exec PROPERTIES PASS_REGULAR_EXPRESSION "guest 
 set_tests_properties(e2e_outside PROPERTIES PASS_REGULAR_EXPRESSION "guest trap at 80003100.*not inside any translated function")
 
 add_test(NAME translator_drops_dead_cr COMMAND ${CMAKE_COMMAND} -DGEN=${CMAKE_CURRENT_BINARY_DIR}/gen_crflow -P ${CMAKE_CURRENT_SOURCE_DIR}/check_cr_opt.cmake)
+add_test(NAME translator_fuses_compares COMMAND ${CMAKE_COMMAND} -DGEN=${CMAKE_CURRENT_BINARY_DIR}/gen_cmpfuse -P ${CMAKE_CURRENT_SOURCE_DIR}/check_cmp_fusion.cmake)
 
 add_test(NAME translator_deterministic
   COMMAND ${CMAKE_COMMAND} -DTRANSLATOR=$<TARGET_FILE:translator> -DDOL=${CMAKE_CURRENT_BINARY_DIR}/gen_jt1/jt1.dol

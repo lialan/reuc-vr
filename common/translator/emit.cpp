@@ -167,7 +167,10 @@ static std::string branch_action(const Program& p, const Function& f, uint32_t p
 // Branch condition from a compare that was not written to CR: bit 0..3 of BI = LT GT EQ SO of that compare.
 static std::string fused_cond(const FusedCmp& cmp, uint32_t bo, uint32_t bi) {
     const unsigned bit = bi & 3;
-    std::string e = bit == 3 ? "c.xer_so != 0" : "(" + cmp.lhs + (bit == 0 ? " < " : bit == 1 ? " > " : " == ") + cmp.rhs + ")";
+    std::string e;
+    if (cmp.equal_op) e = "(" + cmp.lhs + " " + cmp.equal_op + " " + cmp.rhs + ")";   // false for a NaN operand, as the bit cror builds
+    else if (bit == 3) e = cmp.fp ? "(" + cmp.lhs + " != " + cmp.lhs + " || " + cmp.rhs + " != " + cmp.rhs + ")" : "c.xer_so != 0";
+    else e = "(" + cmp.lhs + (bit == 0 ? " < " : bit == 1 ? " > " : " == ") + cmp.rhs + ")";   // all false for a NaN operand, as fcmp
     return (bo & 8) ? e : "!(" + e + ")";
 }
 
@@ -275,6 +278,28 @@ constexpr uint8_t kAllCr = 0xFF;
 uint8_t fld(uint32_t f) { return uint8_t(1u << (f & 7)); }
 bool fp_name(const std::string& n) { return n[0] == 'f' || n == "mffs" || n.compare(0, 3, "ps_") == 0 || n.compare(0, 4, "mtfs") == 0; }
 
+// The CR fields an mfcr rT really reads: all of them, unless the next instruction is rlwinm rT,rT,sh,mb,me, which overwrites rT with the
+// bits under its mask (rT's whole mfcr value dies there, so only the fields those bits come from are read).
+uint8_t mfcr_fields(const Program& p, uint32_t pc, uint32_t w) {
+    uint32_t next = 0;
+    const ppc::OpInfo* nop = p.img.word(pc + 4, next) ? ppc::decode(next) : nullptr;
+    if (!nop || std::string(nop->name) != "rlwinm" || ppc::t(next) != ppc::t(w) || ppc::a(next) != ppc::t(w)) return kAllCr;
+    const uint32_t mb = ppc::mb(next), me = ppc::me(next), sh = ppc::sh(next) & 31;
+    const uint32_t mask = mb <= me ? (0xFFFFFFFFu >> mb) & (0xFFFFFFFFu << (31 - me)) : ((0xFFFFFFFFu >> mb) | (0xFFFFFFFFu << (31 - me)));
+    const uint32_t bits = sh ? (mask >> sh) | (mask << (32 - sh)) : mask;   // the CR word bits that survive the rotate and mask
+    uint8_t used = 0;
+    for (unsigned i = 0; i < 8; ++i) if (bits & (0xFu << (28 - 4 * i))) used |= fld(i);
+    return used;
+}
+// The register an integer record-form instruction compares with zero (cr0 = its sign, and XER[SO]), -1 for forms this does not know.
+int rc_dest(const std::string& n, uint32_t w) {
+    static const std::set<std::string> arithmetic{"add", "addc", "adde", "addze", "addme", "subf", "subfc", "subfe", "subfze", "subfme", "neg", "mullw", "mulhw", "mulhwu", "divw", "divwu"};
+    static const std::set<std::string> logical{"and", "andc", "or", "orc", "xor", "nor", "nand", "eqv", "slw", "srw", "sraw", "srawi", "cntlzw", "extsb", "extsh", "rlwinm", "rlwnm", "rlwimi"};
+    if (arithmetic.count(n)) return int(ppc::t(w));   // rD
+    if (logical.count(n)) return int(ppc::a(w));      // rA
+    return -1;
+}
+
 struct CrEffect { uint8_t use = 0, def = 0; };   // fields read, fields fully overwritten
 CrEffect cr_effect(const ppc::OpInfo& op, uint32_t w) {
     using ppc::Kind;
@@ -336,6 +361,7 @@ std::vector<CrNode> cr_nodes(const Program& p, const Function& f) {
         if (((name == "twi" || name == "tw") && ppc::t(w) == 31) || (op->sub == ppc::Sub::X9 && ppc::oe(w)) || op->kind == Kind::UNSUP) { nd.fall = false; continue; }
         const CrEffect fx = cr_effect(*op, w);
         nd.use = fx.use; nd.def = fx.def;
+        if (name == "mfcr") nd.use = mfcr_fields(p, pc, w);
         switch (op->kind) {
             case Kind::SC: nd.call = {Callee::Hle, 0, 0}; break;
             case Kind::BR: case Kind::BC: {
@@ -499,12 +525,13 @@ struct FnPlanView { const std::vector<uint32_t>* words; const std::vector<std::s
 
 // Control flow of one instruction as emit_insn writes it.
 RegNode reg_node(const Program& p, const Function& f, uint32_t pc, uint32_t w, const CrHints& h, const RegSet& fused_use, bool comment,
-                 const std::unordered_map<uint32_t, LeafRegs>* leaves) {
+                 const RegEffect* replaced, const std::unordered_map<uint32_t, LeafRegs>* leaves) {
     using ppc::Kind;
     RegNode nd;
     auto index = [&](uint32_t t) { return int((t - f.entry) / 4); };
     const ppc::OpInfo* op = ppc::decode(w);
     if (comment) return nd;   // a dead or folded compare: no code
+    if (replaced) { nd.eff = *replaced; return nd; }   // straight-line code of a fused sequence (FnPlan::code)
     if (!op || ((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31) || (op->sub == ppc::Sub::X9 && ppc::oe(w)) ||
         op->kind == Kind::UNSUP) { nd.fall = false; nd.exit = true; return nd; }
     auto use = [&](int i) { nd.eff.use.set(size_t(i)); };
@@ -671,6 +698,11 @@ struct FnPlan {
     std::vector<std::string> comment;   // a dead or folded compare: emitted as this comment
     std::vector<FusedCmp> fused;        // compare operands for the branch at i
     std::vector<RegSet> fused_use;
+    // straight-line code of a fused sequence, emitted instead of the instruction (its register effect in code_eff): a compare's operands
+    // copied for a later branch, the GPR bit of a folded fcmp/mfcr/rlwinm, an andi./andis. without its CR write
+    std::vector<std::string> code;
+    std::vector<RegEffect> code_eff;
+    uint8_t cf_used = 0, cf_b_used = 0;   // CR fields whose compare operands wait in cf<field>a (and cf<field>b) for a later branch
     bool tail_end = false;              // the last instruction falls into the next function
 };
 static void plan_function(const Program& p, const Function& f, const CrLive* live, EmitStats& st, FnPlan& plan) {
@@ -698,47 +730,161 @@ static void plan_function(const Program& p, const Function& f, const CrLive* liv
     auto& comment = plan.comment; comment.assign(n, std::string());
     auto& fused = plan.fused; fused.assign(n, FusedCmp{});
     auto& fused_use = plan.fused_use; fused_use.assign(n, RegSet());
-    const std::vector<uint8_t>* after = nullptr;   // CR fields still readable after each instruction
-    if (live) { auto it = live->out.find(f.entry); if (it != live->out.end()) after = &it->second; }
-    for (size_t i = 0; i < n; ++i) {
-        const uint32_t pc = f.entry + uint32_t(i) * 4;
-        uint32_t& w = words[i];
-        p.img.word(pc, w);
-        const ppc::OpInfo* op = after ? ppc::decode(w) : nullptr;
-        if (op && op->kind != ppc::Kind::UNSUP && !(op->sub == ppc::Sub::X9 && ppc::oe(w)) && !((std::string(op->name) == "twi" || std::string(op->name) == "tw") && ppc::t(w) == 31)) {
-            const uint8_t live_after = (*after)[i];
-            const std::string name = op->name;
-            if (name == "cmp" || name == "cmpl" || name == "cmpi" || name == "cmpli") {
-                const uint32_t field = ppc::crfd(w);
-                uint32_t next = 0;
-                const ppc::OpInfo* nop = pc + 4 < f.end && !labels.count(pc + 4) && p.img.word(pc + 4, next) ? ppc::decode(next) : nullptr;
-                if (!(live_after & fld(field))) { comment[i] = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
-                else if (nop && (nop->kind == ppc::Kind::BC || nop->kind == ppc::Kind::BCLR) && !ppc::lk(next) && (ppc::bo(next) & 4) && !(ppc::bo(next) & 16) &&
-                         (ppc::bi(next) >> 2) == field && !((*after)[i + 1] & fld(field))) {
-                    // the only reader is the next branch: test the operands there and skip the CR write
-                    const std::string a = "c.r[" + num(ppc::a(w)) + "]";
-                    const bool is_signed = name == "cmp" || name == "cmpi";
-                    const std::string lhs = is_signed ? "int32_t(" + a + ")" : a;
-                    std::string rhs;
-                    RegSet u;
-                    u.set(size_t(res::R + int(ppc::a(w)))); u.set(size_t(res::SO));
-                    if (name == "cmp" || name == "cmpl") { rhs = is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]"; u.set(size_t(res::R + int(ppc::b(w)))); }
-                    else rhs = is_signed ? num(ppc::simm(w)) : num(ppc::uimm(w)) + "u";
-                    fused[i + 1] = {lhs, rhs};
-                    fused_use[i + 1] = u;
-                    hints[i + 1].fused = &fused[i + 1];
-                    comment[i] = "/* cr" + num(field) + " compare is folded into the next branch */";
-                    ++st.cr_fused_branches;
-                }
-            } else if (op->rc && ppc::rc(w) && !(live_after & fld(fp_name(name) ? 1 : 0))) {
-                hints[i].drop_rc = true;
-                ++st.cr_dropped_records;
-            }
-        }
-    }
+    auto& code = plan.code; code.assign(n, std::string());
+    auto& code_eff = plan.code_eff; code_eff.assign(n, RegEffect{});
+    plan.cf_used = plan.cf_b_used = 0;
+    for (size_t i = 0; i < n; ++i) p.img.word(f.entry + uint32_t(i) * 4, words[i]);
     uint32_t last = 0;
     p.img.word(f.end - 4, last);
     plan.tail_end = !is_terminator_word(last) && p.an.is_entry(f.end);
+    const std::vector<uint8_t>* after = nullptr;   // CR fields still readable after each instruction
+    if (live) { auto it = live->out.find(f.entry); if (it != live->out.end()) after = &it->second; }
+    if (!after) return;
+    // instruction j as part of a straight line from an earlier one: inside the function and not a label (no other path joins there)
+    auto inline_op = [&](size_t j) -> const ppc::OpInfo* {
+        return j < n && !labels.count(f.entry + uint32_t(j) * 4) ? ppc::decode(words[j]) : nullptr;
+    };
+    auto plain_op = [&](const ppc::OpInfo* o, uint32_t w) {   // emitted as its ppc::op_* (not a trap)
+        return o && o->kind != ppc::Kind::UNSUP && !(o->sub == ppc::Sub::X9 && ppc::oe(w)) && !((std::string(o->name) == "twi" || std::string(o->name) == "tw") && ppc::t(w) == 31);
+    };
+    // instruction j is a plain conditional branch (no CTR, no link) on `field`, reached only from the instruction before it, and the
+    // field's last reader
+    auto last_reader = [&](size_t j, uint32_t field) {
+        const ppc::OpInfo* b = inline_op(j);
+        const uint32_t w = j < n ? words[j] : 0;
+        return b && (b->kind == ppc::Kind::BC || b->kind == ppc::Kind::BCLR) && !ppc::lk(w) && (ppc::bo(w) & 4) && !(ppc::bo(w) & 16) &&
+               (ppc::bi(w) >> 2) == field && !((*after)[j] & fld(field)) && !hints[j].fused;
+    };
+    auto fuse = [&](size_t j, FusedCmp cmp, RegSet use) { fused[j] = std::move(cmp); fused_use[j] = use; hints[j].fused = &fused[j]; };
+    auto regs = [](std::initializer_list<int> list) { RegSet u; for (int r : list) u.set(size_t(r)); return u; };
+    std::vector<char> claimed(n, 0);   // a later instruction of a sequence an earlier one folded
+    for (size_t i = 0; i < n; ++i) {
+        if (claimed[i]) continue;
+        const uint32_t w = words[i];
+        const ppc::OpInfo* op = ppc::decode(w);
+        if (!plain_op(op, w)) continue;
+        const uint8_t live_after = (*after)[i];
+        const std::string name = op->name;
+        if (name == "cmp" || name == "cmpl" || name == "cmpi" || name == "cmpli") {
+            const uint32_t field = ppc::crfd(w);
+            const bool is_signed = name == "cmp" || name == "cmpi", reg_rhs = name == "cmp" || name == "cmpl";
+            const std::string imm = is_signed ? num(ppc::simm(w)) : num(ppc::uimm(w)) + "u";
+            if (!(live_after & fld(field))) { comment[i] = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
+            else if (last_reader(i + 1, field)) {
+                // the only reader is the next branch: test the operands there and skip the CR write
+                const std::string a = "c.r[" + num(ppc::a(w)) + "]";
+                const std::string lhs = is_signed ? "int32_t(" + a + ")" : a;
+                const std::string rhs = reg_rhs ? (is_signed ? "int32_t(c.r[" + num(ppc::b(w)) + "])" : "c.r[" + num(ppc::b(w)) + "]") : imm;
+                RegSet u = regs({res::R + int(ppc::a(w)), res::SO});
+                if (reg_rhs) u.set(size_t(res::R + int(ppc::b(w))));
+                fuse(i + 1, {lhs, rhs}, u);
+                comment[i] = "/* cr" + num(field) + " compare is folded into the next branch */";
+                ++st.cr_fused_branches;
+            } else {
+                // The branch that reads the field comes a few instructions later (the scheduler moved work in between): up to 8 straight-line
+                // instructions that neither read nor write the field, branch, call or trap. The compare copies its operands into locals and the
+                // branch compares those. Not for a branch on SO: that bit is XER[SO] at the compare, which an instruction between may change.
+                size_t reader = 0;
+                for (size_t j = i + 1; j <= i + 9; ++j) {
+                    const ppc::OpInfo* o2 = inline_op(j);
+                    if (!o2) break;
+                    if (o2->kind == ppc::Kind::BC || o2->kind == ppc::Kind::BCLR) {
+                        if (j > i + 1 && last_reader(j, field) && (ppc::bi(words[j]) & 3) != 3) reader = j;
+                        break;
+                    }
+                    if (j == i + 9 || !plain_op(o2, words[j]) || o2->kind == ppc::Kind::BR || o2->kind == ppc::Kind::BCCTR || o2->kind == ppc::Kind::SC) break;
+                    const CrEffect fx = cr_effect(*o2, words[j]);
+                    if (((fx.use | fx.def) & fld(field)) || std::string(o2->name) == "mfcr") break;
+                }
+                if (reader) {
+                    const std::string var = "cf" + num(field), a = var + "a", b = var + "b";
+                    plan.cf_used |= fld(field);
+                    if (reg_rhs) plan.cf_b_used |= fld(field);
+                    code[i] = a + " = c.r[" + num(ppc::a(w)) + "];" + (reg_rhs ? " " + b + " = c.r[" + num(ppc::b(w)) + "];" : "");
+                    code_eff[i].use = regs({res::R + int(ppc::a(w))});
+                    if (reg_rhs) code_eff[i].use.set(size_t(res::R + int(ppc::b(w))));
+                    const std::string rhs = reg_rhs ? (is_signed ? "int32_t(" + b + ")" : b) : imm;
+                    fuse(reader, {is_signed ? "int32_t(" + a + ")" : a, rhs}, RegSet());
+                    ++st.cr_fused_branches; ++st.cr_delayed;
+                }
+            }
+        } else if (name == "fcmpu" || name == "fcmpo") {
+            // fcmp writes only its CR field (ppc_rt.h fcmp: LT, GT or EQ, or SO alone for a NaN operand; no FPSCR bit). The C++ comparisons of
+            // the two doubles give the same bits (each is false for a NaN operand), so a branch, a cror or an mfcr bit that reads it can test
+            // the operands instead.
+            const uint32_t field = ppc::crfd(w);
+            const std::string lhs = "c.f[" + num(ppc::a(w)) + "]", rhs = "c.f[" + num(ppc::b(w)) + "]";
+            const RegSet u = regs({res::F + int(ppc::a(w)), res::F + int(ppc::b(w))});
+            const ppc::OpInfo* o1 = inline_op(i + 1);
+            const uint32_t n1 = i + 1 < n ? words[i + 1] : 0;
+            // cror EQ, LT|GT, EQ of this field: EQ becomes "<=" (or ">=")
+            const bool is_cror = o1 && std::string(o1->name) == "cror" && ppc::t(n1) == 4 * field + 2 && ppc::b(n1) == 4 * field + 2 &&
+                                 (ppc::a(n1) == 4 * field || ppc::a(n1) == 4 * field + 1);
+            const char* const cror_op = is_cror ? (ppc::a(n1) == 4 * field ? "<=" : ">=") : nullptr;
+            // [cror] mfcr rT; rlwinm[.] rT,rT,sh,31,31 taking one bit of this field: rT = that comparison as 0 or 1
+            const size_t m = i + (is_cror ? 2 : 1), rl = m + 1;
+            const ppc::OpInfo* o3 = inline_op(m);
+            const ppc::OpInfo* o4 = o3 && std::string(o3->name) == "mfcr" ? inline_op(rl) : nullptr;
+            const uint32_t n3 = m < n ? words[m] : 0, n4 = rl < n ? words[rl] : 0;
+            const uint32_t bit = (ppc::sh(n4) + 31) & 31;   // the CR bit that the rotate brings to bit 31
+            const char* bit_op = nullptr;
+            if (o4 && std::string(o4->name) == "rlwinm" && ppc::t(n4) == ppc::t(n3) && ppc::a(n4) == ppc::t(n3) && ppc::mb(n4) == 31 && ppc::me(n4) == 31 && bit / 4 == field) {
+                if (cror_op) { if (bit == 4 * field + 2) bit_op = cror_op; }
+                else if (bit % 4 == 0) bit_op = "<"; else if (bit % 4 == 1) bit_op = ">"; else if (bit % 4 == 2) bit_op = "==";
+            }
+            const bool bit_rc = bit_op && ppc::rc(n4);
+            // the field is not read after the sequence (rlwinm. rewrites cr0 as a whole)
+            const bool field_dead = bit_op && ((bit_rc && field == 0) || !((*after)[rl] & fld(field)));
+            if (!(live_after & fld(field))) { comment[i] = "/* cr" + num(field) + " is never read */"; ++st.cr_dead_compares; }
+            else if (bit_op && field_dead) {
+                const uint32_t T = ppc::t(n3);
+                const std::string reg = "c.r[" + num(T) + "]";
+                const bool cr0_live = (*after)[rl] & fld(0);
+                const bool cr0_branch = bit_rc && cr0_live && last_reader(rl + 1, 0);   // the record form's only reader is the next branch
+                code[rl] = reg + " = uint32_t(" + lhs + " " + bit_op + " " + rhs + ");";
+                code_eff[rl].use = u;
+                code_eff[rl].may.set(size_t(res::R + int(T))); code_eff[rl].must.set(size_t(res::R + int(T)));
+                if (bit_rc && cr0_live && !cr0_branch) {
+                    code[rl] += " ppc::cr0(c, " + reg + ");";
+                    code_eff[rl].use.set(size_t(res::SO));
+                    code_eff[rl].may.set(size_t(res::CR)); code_eff[rl].must.set(size_t(res::CR));
+                } else if (bit_rc) ++st.cr_dropped_records;
+                if (cr0_branch) fuse(rl + 1, {"int32_t(" + reg + ")", "0"}, regs({res::R + int(T), res::SO}));
+                comment[i] = "/* cr" + num(field) + " compare is folded into the bit test below */";
+                if (is_cror) { comment[i + 1] = "/* cror is folded into the bit test below */"; claimed[i + 1] = 1; }
+                comment[m] = "/* mfcr is folded into the bit test below */";
+                claimed[m] = claimed[rl] = 1;
+                ++st.cr_fused_branches; ++st.cr_bit_tests;
+            } else if (last_reader(i + 1, field)) {
+                fuse(i + 1, {lhs, rhs, true, nullptr}, u);
+                comment[i] = "/* cr" + num(field) + " compare is folded into the next branch */";
+                ++st.cr_fused_branches; ++st.cr_fused_fp;
+            } else if (is_cror && last_reader(i + 2, field) && (ppc::bi(words[i + 2]) & 3) == 2) {
+                // fcmp, cror, branch on EQ: one <= (or >=) test; the field is dead after the branch
+                fuse(i + 2, {lhs, rhs, true, cror_op}, u);
+                comment[i] = "/* cr" + num(field) + " compare, cror and branch are folded into one test */";
+                comment[i + 1] = "/* cror is folded into the next branch */";
+                claimed[i + 1] = 1;
+                ++st.cr_fused_branches; ++st.cr_fused_fp;
+            }
+        } else if ((name == "andi_" || name == "andis_" || (op->rc && ppc::rc(w) && rc_dest(name, w) >= 0)) && (live_after & fld(0)) && last_reader(i + 1, 0)) {
+            // an integer record form whose only reader is the next branch: the branch compares the result register with zero (cr0 is its sign
+            // and XER[SO], which nothing between can change)
+            const bool andi = name == "andi_" || name == "andis_";
+            const int D = andi ? int(ppc::a(w)) : rc_dest(name, w);
+            if (andi) {   // always a record form: written as the plain AND
+                const std::string imm = num(name == "andi_" ? ppc::uimm(w) : ppc::uimm(w) << 16) + "u";
+                code[i] = "c.r[" + num(D) + "] = c.r[" + num(ppc::t(w)) + "] & " + imm + ";";
+                code_eff[i].use = regs({res::R + int(ppc::t(w))});
+                code_eff[i].may.set(size_t(res::R + D)); code_eff[i].must.set(size_t(res::R + D));
+            } else hints[i].drop_rc = true;
+            fuse(i + 1, {"int32_t(c.r[" + num(D) + "])", "0"}, regs({res::R + D, res::SO}));
+            ++st.cr_dropped_records; ++st.cr_fused_branches; ++st.cr_record_branches;
+        } else if (op->rc && ppc::rc(w) && !(live_after & fld(fp_name(name) ? 1 : 0))) {
+            hints[i].drop_rc = true;
+            ++st.cr_dropped_records;
+        }
+    }
 }
 
 
@@ -809,7 +955,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     // the loads and stores from a hardware-register base keep the explicit MMIO test (fastmem builds)
     {
         std::vector<RegNode> nodes(n);
-        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), plan.code[i].empty() ? nullptr : &plan.code_eff[i], leaves);
         st.mmio_sites += mark_mmio_bases({&words, &comment}, nodes, hints);
     }
     const bool fifo_fn = mark_fifo_runs(f, plan, st);
@@ -822,7 +968,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     std::vector<std::string> frame_at(n);     // a frame note at the start of the instruction (after its label)
     if (local) {
         std::vector<RegNode> nodes(n);
-        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), leaves);
+        for (size_t i = 0; i < n; ++i) nodes[i] = reg_node(p, f, f.entry + uint32_t(i) * 4, words[i], hints[i], fused_use[i], !comment[i].empty(), plan.code[i].empty() ? nullptr : &plan.code_eff[i], leaves);
         // Control-flow edges. Dirty = written since the last sync on *every* path: where paths with different dirty sets meet over a forward
         // edge, the edge itself flushes the difference (a join after a conditional write stores there, once); over a back edge the loop head
         // keeps the union (the loop runs without stores) and the entry path keeps those registers current instead (the liveness below makes
@@ -953,6 +1099,9 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     }
 
     // pass 3: text
+    std::string cf_decl;   // compare operands waiting for a later branch (plan_function)
+    for (uint32_t field = 0; field < 8; ++field)
+        if (plan.cf_used & fld(field)) cf_decl += "  uint32_t cf" + num(field) + "a" + (plan.cf_b_used & fld(field) ? ", cf" + num(field) + "b" : std::string()) + ";\n";
     std::ostringstream o;
     if (has_sec) o << "static void body_" << hex8(f.entry) << "(ppc::Ctx& c, uint32_t at) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
     else o << "void " << fn_name(f.entry) << "(ppc::Ctx& c) {\n  UC_ENTER(0x" << hex8(f.entry) << "u);\n";
@@ -960,6 +1109,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
         // a resume through a secondary entry (rare) loads what is read from there on; the normal entry only what the entry reads
         o << "  ppc::Ctx& ctx = c;\n  {\n  ppc::Ctx c; c.mem = ctx.mem;\n";
         if (fifo_fn) o << "  bool fifo_ = false;\n";
+        o << cf_decl;
         if (has_sec) {
             o << "  if (at != 0) [[unlikely]] switch (at) { ";
             for (uint32_t t : sit->second) {
@@ -970,7 +1120,10 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
             o << "default: break; }\n";
         }
         o << "  " << copy_text(entry_load, false) << "\n";
-    } else if (fifo_fn) o << "  bool fifo_ = false;\n";
+    } else {
+        if (fifo_fn) o << "  bool fifo_ = false;\n";
+        o << cf_decl;
+    }
     if (!local && has_sec) {
         o << "  switch (at) { ";
         for (uint32_t t : sit->second) o << "case 0x" << hex8(t) << "u: goto L_" << hex8(t) << "; ";
@@ -979,7 +1132,7 @@ std::string emit_function(const Program& p, const Function& f, EmitStats& st, co
     for (size_t i = 0; i < n; ++i) {
         const uint32_t pc = f.entry + uint32_t(i) * 4;
         if (labels.count(pc)) o << "L_" << hex8(pc) << ":;\n";
-        std::string code = comment[i];
+        std::string code = comment[i].empty() ? plan.code[i] : comment[i];
         if (code.empty()) code = emit_insn(p, f, pc, words[i], st, &hints[i]);
         else ++st.instructions;
         code = frame_at[i] + code;
@@ -1039,7 +1192,7 @@ static Closed analyze_closed(const Program& p, const CrLive* live) {
         bool ok = true;
         if (plan.tail_end) { if (p.cfg.hle.count(f.entry) || !p.an.is_entry(f.end)) ok = false; else c.callees.push_back(f.end); }
         for (size_t i = 0; i < plan.n && ok; ++i) {
-            const RegNode nd = reg_node(p, f, f.entry + uint32_t(i) * 4, plan.words[i], plan.hints[i], plan.fused_use[i], !plan.comment[i].empty(), nullptr);
+            const RegNode nd = reg_node(p, f, f.entry + uint32_t(i) * 4, plan.words[i], plan.hints[i], plan.fused_use[i], !plan.comment[i].empty(), plan.code[i].empty() ? nullptr : &plan.code_eff[i], nullptr);
             if (nd.call || nd.tail) { if (nd.callee) c.callees.push_back(nd.callee); else ok = false; }
             c.regs.touched |= nd.eff.use | nd.eff.may;
             c.regs.written |= nd.eff.may;

@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     std::printf("secondary-entries %zu  fallthrough-tails %zu  OE-traps %zu  unsupported %zu  jump-tables %zu  files %zu\n",
                 st.secondary_entries, st.fallthrough_tail, st.oe_traps, st.unsupported, p.an.jump_tables.size(), out.files.size());
     std::printf("cr-dead-compares %zu  cr-fused-branches %zu  cr-dropped-records %zu\n", st.cr_dead_compares, st.cr_fused_branches, st.cr_dropped_records);
+    std::printf("  of the fused: fcmp %zu  fcmp bit tests %zu  delayed compares %zu  record forms %zu\n", st.cr_fused_fp, st.cr_bit_tests, st.cr_delayed, st.cr_record_branches);
     std::printf("mmio-base loads/stores %zu (explicit MMIO test)  fifo-runs %zu (%zu stores)\n", st.mmio_sites, st.fifo_runs, st.fifo_run_stores);
     std::printf("framed stack stores %zu (no per-store barrier), frame notes %zu\n", st.framed_stores, st.frame_notes);
     if (p.reg_cache) std::printf("reg-cache entry-loads %zu  flushes %zu  reloads %zu  leaf-functions %zu  leaf-calls %zu\n", st.reg_entry_loads, st.reg_flushes, st.reg_reloads, st.reg_leaves, st.reg_leaf_calls);

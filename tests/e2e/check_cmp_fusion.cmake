@@ -1,0 +1,16 @@
+# The translator must fold every compare of the cmpfuse program (e2e_cmpfuse only proves the results; e2e_cmpfuse_nocr runs it unfolded).
+include(${GEN}/game_sources.cmake)
+file(READ ${UC_GENERATED_INCLUDE_DIR}/game_000.cpp text)
+foreach(needle "ppc::op_fcmp" "ppc::op_cror" "ppc::op_mfcr" "ppc::op_cmp" "ppc::op_andi_" "ppc::cr0(")
+  string(FIND "${text}" "${needle}" pos)
+  if(NOT pos EQUAL -1)
+    message(FATAL_ERROR "'${needle}' is still in the translated cmpfuse program")
+  endif()
+endforeach()
+foreach(needle "uint32_t cf0a, cf0b;" "cf0a = c.r[8]; cf0b = c.r[9];" "cf5a = c.r[8];" "(c.f[1] <= c.f[2])" "c.r[6] = uint32_t(c.f[1] >= c.f[2]);"
+               "c.f[1] != c.f[1] || c.f[2] != c.f[2]" "ppc::op_and(c, 8, 12, 9, false);" "ppc::op_subf(c, 12, 9, 8, false);" "c.r[12] = c.r[8] & 1u;")
+  string(FIND "${text}" "${needle}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "expected '${needle}' in the translated cmpfuse program")
+  endif()
+endforeach()
