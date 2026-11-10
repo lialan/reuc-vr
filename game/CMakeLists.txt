@@ -78,6 +78,8 @@ if(DEFINED UC_GENERATED_INCLUDE_DIR AND EXISTS ${UC_GENERATED_INCLUDE_DIR}/game_
   target_link_libraries(uc_game PUBLIC uc_runtime uc_intro uc_game_pacing uc_game_input uc_prompt_hooks uc_mods)
   if(UC_MSVC_FRONTEND)
     target_compile_options(uc_game PRIVATE /O2)
+  elseif(ANDROID AND UC_FAST_CODEGEN)
+    target_compile_options(uc_game PRIVATE -O3)
   else()
     target_compile_options(uc_game PRIVATE -O2)
   endif()

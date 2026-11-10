@@ -5,6 +5,7 @@
 # Needs: the translated game in generated/ (scripts/build.sh --translate-only), the Android SDK + NDK 27.3, JDK 17, the OpenXR loader
 # AAR unpacked (UC_OPENXR_DIR, default ~/Downloads/VR/deps/oxr), slangc (UC_SLANGC), Vulkan headers newer than the NDK's
 # (UC_VULKAN_HEADERS, default Homebrew's vulkan-headers). Settings may come from local.env.
+# UC_QUEST_BUILD_DIR: another build folder (flag experiments side by side); UC_QUEST_CMAKE_ARGS: extra configure arguments (word-split).
 # ThinLTO is on by default (UC_THINLTO=OFF turns it off): with the PGO profile, the fight replay's guest CPU -1.5% more on the Quest.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,7 +20,7 @@ SLANGC="${UC_SLANGC:-$(command -v slangc || true)}"
 # with the fight replay); otherwise project/pgo/uc-quest.profdata, when present, is the optimizer's profile. UC_QUEST_PGO=off: neither.
 PGO_MODE="${UC_QUEST_PGO:-use}"
 PGO_PROFILE="$ROOT/project/pgo/uc-quest.profdata"
-BUILD="$ROOT/build-android"; PGO_ARGS=(-DUC_PGO_GENERATE=OFF -DUC_PGO_PROFILE="$PGO_PROFILE")
+BUILD="${UC_QUEST_BUILD_DIR:-$ROOT/build-android}"; PGO_ARGS=(-DUC_PGO_GENERATE=OFF -DUC_PGO_PROFILE="$PGO_PROFILE")
 if [ "$PGO_MODE" = generate ]; then BUILD="$ROOT/build-android-pgo"; PGO_ARGS=(-DUC_PGO_GENERATE=ON)
 elif [ "$PGO_MODE" = off ]; then PGO_ARGS=(-DUC_PGO_GENERATE=OFF -DUC_PGO_PROFILE="$ROOT/project/pgo/none.profdata"); fi
 APP="$ROOT/quest/reuc/src/main"
@@ -36,7 +37,7 @@ KEY_ARGS=(-DUC_WII_COMMON_KEY_FILE="${UC_WII_COMMON_KEY_FILE:-}"); KEY_EMBEDDED=
 echo "[1/4] Configure and build libmain.so (arm64-v8a)"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DUC_SLANGC="$SLANGC" -DUC_THINLTO="${UC_THINLTO:-ON}" \
-  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" -DUC_DOL_SHA256="$DOL_SHA" "${KEY_ARGS[@]}" "${PGO_ARGS[@]}" > "$BUILD.configure.log" 2>&1 \
+  -DUC_TARGET_CPU="${UC_TARGET_CPU:-cortex-a78c}" -DVulkan_INCLUDE_DIR="$VKH" -DUC_OPENXR_DIR="$OXR" -DUC_DOL_SHA256="$DOL_SHA" "${KEY_ARGS[@]}" "${PGO_ARGS[@]}" ${UC_QUEST_CMAKE_ARGS:-} > "$BUILD.configure.log" 2>&1 \
   || { echo "ERROR: configure failed (see $BUILD.configure.log)" >&2; tail -20 "$BUILD.configure.log" >&2; exit 1; }
 cmake --build "$BUILD" --target uc || { echo "ERROR: build failed" >&2; exit 1; }
 grep -h "PGO profile" "$BUILD.configure.log" || echo "PGO: $PGO_MODE (no profile in use)"

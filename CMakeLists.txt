@@ -101,6 +101,18 @@ elseif(UC_THINLTO AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_link_options("LINKER:--thinlto-cache-dir=${CMAKE_BINARY_DIR}/lto-cache")
   endif()
 endif()
+# Android code generation for speed (measured on the Quest 3, fightvr replay, PGO builds, guest Mcycles: 19577 default -> 19403): the
+# translated game at -O3 like the rest, no stack protector (the NDK's default puts a canary in every function with a local array), no frame
+# pointer (one more register), the ThinLTO backend at -O3 (lld's default is -O2 whatever the compile level) and identical-code folding of
+# functions whose address is never taken. -U_FORTIFY_SOURCE breaks the NDK's jni.h in SDL. OFF for simpleperf's --call-graph fp.
+option(UC_FAST_CODEGEN "Android: -O3 translated code, no stack protector, no frame pointer, --lto-O3, --icf=safe" ${ANDROID})
+if(ANDROID AND UC_FAST_CODEGEN)
+  add_compile_options(-fno-stack-protector -fomit-frame-pointer)
+  add_link_options(-Wl,--icf=safe -Wl,-O2)
+  if(UC_THINLTO)
+    add_link_options(-Wl,--lto-O3)
+  endif()
+endif()
 enable_testing()
 # The headset output (OpenXR): on by default for Android (Quest); UC_OPENXR_DIR is the unpacked Khronos loader AAR (openxr_loader_for_android).
 option(UC_OPENXR "OpenXR headset output" ${ANDROID})
