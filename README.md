@@ -50,6 +50,7 @@ When you report a problem, please say what GPU, driver and Windows version you u
   - [4. Updating](#4-updating)
 - [In-game menu and controls](#in-game-menu-and-controls)
   - [Ultrawide and the HUD](#ultrawide-and-the-hud)
+- [Playing on Meta Quest 3 (VR)](#playing-on-meta-quest-3-vr)
 - [Multiplayer (online co-op)](#multiplayer-online-co-op)
 - [Known issues](#known-issues)
 - [Reporting problems](#reporting-problems)
@@ -254,6 +255,69 @@ The launcher checks for a new release when it starts and offers **Update** or **
 - Ultrawide is on by default and follows the shape of the window, also while you resize it. Turn it off with `"ultrawide": false` in the `graphics` section of `config.json` or with `--no-ultrawide` (there is no switch in the launcher) to get the old 16:9 picture stretched over the window.
 - **HUD position** (launcher display page and the in-game menu's main tab, applied at once): **Automatic**, **Centre (16:9)** or **Screen edges**. Automatic keeps the health, ammo and weapon panel at the screen edges up to about 21:9 and in the middle on wider screens.
 - In online co-op, deterministic runs and recorded demos the game keeps its 16:9 picture, stretched over a wide window. This keeps all players in sync.
+
+## Playing on Meta Quest 3 (VR)
+
+The VR build runs the game natively on a Meta Quest 3 as a standalone app: no PC, no streaming. It is a single APK file and contains **no game files**. It plays straight from **your own disc image** of the North American release (`RBUE08`), which you copy to the headset yourself. The image is read in place every time: it is not unpacked or copied.
+
+### What you need
+
+- A Meta Quest 3 with **developer mode** on (Meta Horizon app on your phone → *Devices* → your headset → *Headset settings* → *Developer mode*).
+- A USB-C cable and a computer with [`adb`](https://developer.android.com/tools/releases/platform-tools), or [SideQuest](https://sidequestvr.com/) (which includes it).
+- Your own `RBUE08` disc image as **`.wbfs`** (one file) or **`.iso`**. Dump it from your disc with a Wii and homebrew software. Other regions (`RBUP08`, `RBUJ08`) do not work. `.rvz`, `.ciso`, `.wia` and split `.wbf1` files are not read: convert them to a plain `.iso` or a single `.wbfs` first (Dolphin: *right-click the game → Convert File…*).
+- The **Wii common key** as a 16-byte file named **`common-key.bin`**. Wii discs are encrypted with it, and the app does not include it. You can take it from your own Wii (the `keys.bin` that BootMii writes when you back up the NAND holds it).
+
+### Install
+
+1. Download **`UmbrellaChroniclesVR-X.Y.Z.apk`** from the Releases page.
+2. Connect the headset over USB and accept the *Allow USB debugging* prompt inside it. Then install the app and copy your image and the key:
+   ```
+   adb install -r UmbrellaChroniclesVR-X.Y.Z.apk
+   adb shell mkdir -p /sdcard/UmbrellaChronicles
+   adb push RBUE08.wbfs /sdcard/UmbrellaChronicles/
+   adb push common-key.bin /sdcard/UmbrellaChronicles/
+   ```
+   With SideQuest: drag the APK onto its window to install it, and use its file manager to copy both files into a folder `UmbrellaChronicles` at the top of the headset's storage. Any file name ending in `.wbfs` or `.iso` works. The app also looks in `/sdcard/Download/`; keep `common-key.bin` in the same folder as the image.
+3. In the headset open **Library → Unknown sources → Umbrella Chronicles VR**. On the first start Android's *All files access* screen opens: turn the switch on for the app (it needs it to read the image from shared storage), go back and start the app again.
+
+If something is missing or wrong, the app shows a short message and writes it into `HOW-TO-ADD-THE-GAME.txt` in `/sdcard/Android/data/org.uc.umbrellachronicles.vr/files/`. The usual ones: no image found, an image of another game or region, or no `common-key.bin` next to the image. If the app closes right after starting without a message, check that the image really is `RBUE08` and that the key file is the right one (`adb logcat -s uc` shows the reason). More details for builders are in [docs/quest.md](docs/quest.md).
+
+### Controls (Touch controllers)
+
+The gun hand plays the Wii Remote. Pick it in the VR menu (**Gun hand**); pulling the trigger of the other hand also switches hands.
+
+| Action | Control |
+| --- | --- |
+| Aim | Point the gun hand's controller |
+| Fire, confirm in menus | Trigger |
+| Reload | Grip, or pull the trigger while pointing away from the screen |
+| Action, pick up items | A (X with the left hand) |
+| Knife | Hold A and swing the controller |
+| Grenade | Hold A and pull the trigger |
+| Next weapon | B (Y with the left hand) |
+| Shake prompts | Shake the controller |
+| Pause (the game's menu) | Thumbstick click |
+| VR menu | Menu button (left controller) |
+
+In the VR menu, point at an item and pull the trigger to change it; the menu button closes it. Its **Controls** page shows this table in the headset.
+
+### VR menu
+
+- **Sight**, **Laser**, **Game crosshair**, **Gun model**: how you aim (point shooting, red dot or holographic sight; laser and dot, dot only or off; the game's own reticle shown or hidden; the gun model is hidden by default).
+- **Gun hand**, **Dual wield**: left or right hand; dual wield gives the other hand to player 2.
+- **Screen distance**, **HUD position**, **Recentre view**: where the game's screen floats. Use **Recentre view** after you move or turn around.
+- **Display**: resolution per eye, render scale, foveation, edge smoothing, sharpening, post-effect shading, draw merging and glow. Lower settings run faster.
+- **Display rate**, **Show stats** (frame times), **Reset game**.
+
+Settings and saves are kept on the headset.
+
+### Updating and removing
+
+Install a newer APK over the old one (`adb install -r …`); settings and saves stay. Uninstalling the app (`adb uninstall org.uc.umbrellachronicles.vr`) deletes its settings and saves; your image and key in `/sdcard/UmbrellaChronicles` stay.
+
+### Known limits on Quest
+
+- The frame rate is not yet a steady 60 FPS in heavy scenes.
 
 ## Multiplayer (online co-op)
 
