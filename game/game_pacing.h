@@ -10,6 +10,9 @@ PacingMode pacing_for_limit(std::optional<uint32_t> fps_limit, uint32_t game_hz_
 // The headset's space warp (warp_hz > 0: half the display rate) replaces the step of every limit above 30, none and unlimited with its timer
 // step; 30 or less keeps the original 30 Hz (the harness reaches the fight there, through the retrace clock its fast-forward speeds up).
 PacingMode pacing_with_space_warp(std::optional<uint32_t> fps_limit, uint32_t warp_hz, uint32_t game_hz_override, bool unlock_60fps);
+// The presentation limit beside that step: a limit above 30 but below the headset's step (72 Hz without space warp under the default 60)
+// rises to the step, or the limiter would drop the frames the step makes; every other limit stays.
+std::optional<uint32_t> frame_limit_with_step(std::optional<uint32_t> fps_limit, uint32_t step_hz);
 void game_pacing_set_mode(PacingMode);   // any thread; the guest picks it up at its next frame wait
 // Pause: the game clock steps by zero (its step and step_scale are 0), the game keeps looping and rendering. Any thread.
 void game_pacing_set_paused(bool);

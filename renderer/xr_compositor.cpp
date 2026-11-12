@@ -328,7 +328,10 @@ bool XrCompositor::space_warp() const {
     return wanted && warp_motion_.swapchain && warp_depth_.swapchain;
 }
 void XrCompositor::announce_space_warp() {
-    const uint32_t hz = space_warp() ? uint32_t(config_.settings.refresh > 0 ? config_.settings.refresh : 90) / 2 : 0;
+    // The game's step: half the display rate with space warp; without it, the display rate itself at 72 Hz (the Quest 3's lowest: it has no
+    // 60, and the game's 60 into 72 refreshes repeats 12 frames a second), else the frame limit's.
+    const uint32_t refresh = uint32_t(config_.settings.refresh > 0 ? config_.settings.refresh : 90);
+    const uint32_t hz = space_warp() ? refresh / 2 : refresh <= 72 ? refresh : 0;
     std::fprintf(stderr, "[vulkan-xr] space warp %s%s; game step %s\n", space_warp() ? (!space_warp_vectors() ? "on, head only (no vectors)" : space_warp_flat_depth() ? (space_warp_head_in_vectors() ? "on, flat depth" : "on, flat depth, no head in the vectors") : space_warp_head_in_vectors() ? "on" : "on, no head in the vectors") : "off",
                  space_warp_supported_ ? "" : " (runtime has no XR_FB_space_warp)", hz ? std::to_string(hz).append(" Hz").c_str() : "from the frame limit");
     if (space_warp_step_) space_warp_step_(hz);

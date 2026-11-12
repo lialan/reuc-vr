@@ -834,8 +834,14 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
             }
         }
     };
+#ifdef UC_OPENXR
+    uint32_t limited_step_hz=0;   // the headset step the frame limiter last followed (frame_limit_with_step)
+#endif
     auto render_pending = [&]() -> bool {
         bool progressed = false;
+#ifdef UC_OPENXR
+        if(const uint32_t hz=space_warp_hz.load(); hz!=limited_step_hz) { limited_step_hz=hz; frame_limit.set_limit(uc::frame_limit_with_step(options.fps_limit,hz)); }
+#endif
         service_overlay();   // the refresh cadence also holds between the packets of a drained burst
         if (!pending) {
             if(scene_commands.empty() && (!packets.detached() || frame_limit.ready(true,std::chrono::steady_clock::now()))) {
@@ -1071,6 +1077,7 @@ static int real_main(int argc, char** argv,uc::Options& startup_options) {
         targets.fps_limit=[&](std::optional<uint32_t> limit) {
             options.fps_limit=limit; frame_limit.set_limit(limit);
 #ifdef UC_OPENXR
+            frame_limit.set_limit(uc::frame_limit_with_step(limit,space_warp_hz.load()));
             if(!network)uc::game_pacing_set_mode(pacing_with_warp(limit,space_warp_hz.load()));
 #else
             if(!network)uc::game_pacing_set_mode(uc::pacing_for_limit(limit,options.game_hz,options.unlock_60fps));

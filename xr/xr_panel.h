@@ -7,7 +7,7 @@ extern "C" {
 #endif
 enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_DISPLAY,XP_CONTROLS,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
 /* The Display page (XP_DISPLAY opens it): the picture's size and what the GPU spends on it, all but the eye size applied live. */
-enum { XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_SHARPEN,XD_POST,XD_MERGE,XD_GLOW,XD_SPACE_WARP,XD_BACK,XD_COUNT };
+enum { XD_PRESET,XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_SHARPEN,XD_POST,XD_MERGE,XD_GLOW,XD_SPACE_WARP,XD_BACK,XD_COUNT };
 /* The Controls page (XP_CONTROLS opens it): what each Touch input does in the game, read only, and the Vibration switch. */
 enum { XC_FIRE,XC_RELOAD,XC_ACTION,XC_KNIFE,XC_GRENADE,XC_WEAPON,XC_SHAKE,XC_PAUSE,XC_MENU,XC_HAND,XC_VIBRATION,XC_BACK,XC_COUNT };
 #define XP_MAX2(a,b) ((int)(a)>(int)(b)?(int)(a):(int)(b))
@@ -17,6 +17,12 @@ enum { XC_FIRE,XC_RELOAD,XC_ACTION,XC_KNIFE,XC_GRENADE,XC_WEAPON,XC_SHAKE,XC_PAU
  * Display page with "Render scale" (the game's own picture per eye; HOTD4 draws into the eye image directly and has none), "Edge
  * smoothing", "Post-effect shading" and "Draw merging". Foveation here foveates the game's own picture (renderer/fovea_map.h). */
 enum { XP_SAVE=1,XP_CROSSHAIR_CHANGED=2,XP_SCREEN_CHANGED=4,XP_HUD_CHANGED=8,XP_RATE_CHANGED=16,XP_RECENTER=32,XP_RESTART=64,XP_HAND_CHANGED=128,XP_FOVEATION_CHANGED=256,XP_SCALE_CHANGED=512,XP_SPACE_WARP_CHANGED=1024 };
+/* The Display page's presets: each sets the display rate, space warp, render scale and foveation together (measured on the Quest 3, live
+ * train fight: docs/spikes/S23-quest-spacewarp.md). render_scale 0 is native. */
+typedef struct { const char *name; int refresh,space_warp,foveation; float render_scale; } XpPreset;
+#define XP_PRESET_COUNT 3
+extern const XpPreset xp_presets[XP_PRESET_COUNT];
+int xp_preset_of(const LgXrSettings *settings);   /* the preset the settings match, -1 none (Custom) */
 typedef struct {
     int open,hover,dirty;float c[3],right[3],up[3],n[3],hw,hh;
     int test_frames,service_frames,coin,reset_armed;

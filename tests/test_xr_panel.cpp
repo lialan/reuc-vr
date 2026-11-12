@@ -58,6 +58,32 @@ int main() {
     CHECK(xp_menu_button(&panel, 1, 0) && !panel.open);
     CHECK(xp_menu_button(&panel, 1, 0) && panel.open && panel.page == 0);
 
+    // Preset: cycles 90 Hz space warp -> 120 Hz space warp -> 60 Hz, setting all four values; anything else reads Custom
+    {
+        XpPanel shown{}; shown.open = 1; shown.page = 1; LgXrSettings p = LG_XR_SETTINGS_DEFAULT; p.render_scale = 1.5f;
+        const float rates[] = { 72, 80, 90, 120, 60 };
+        xp_items(&shown, &p, hand, 1, 2208, 2064, items);
+        CHECK(std::strcmp(items[XD_PRESET].label, "Preset") == 0 && std::strcmp(items[XD_PRESET].value, "Custom") == 0);
+        const unsigned all = XP_SAVE | XP_RATE_CHANGED | XP_SPACE_WARP_CHANGED | XP_SCALE_CHANGED | XP_FOVEATION_CHANGED;
+        CHECK(xp_choose(&shown, &p, &hand, XD_PRESET, rates, 5) == all);
+        CHECK(p.refresh == 90 && p.space_warp == 1 && p.render_scale == 0 && p.foveation == 3 && xp_preset_of(&p) == 0);
+        xp_items(&shown, &p, hand, 1, 2208, 2064, items);
+        CHECK(std::strcmp(items[XD_PRESET].value, "90 Hz, space warp") == 0);
+        CHECK(xp_choose(&shown, &p, &hand, XD_PRESET, rates, 5) == all);
+        CHECK(p.refresh == 120 && p.space_warp == 1 && p.render_scale == xp_presets[1].render_scale && xp_preset_of(&p) == 1);
+        CHECK(xp_choose(&shown, &p, &hand, XD_PRESET, rates, 5) == all);
+        CHECK(p.refresh == 72 && p.space_warp == 0 && xp_preset_of(&p) == 2);
+        xp_items(&shown, &p, hand, 1, 2208, 2064, items);
+        CHECK(std::strcmp(items[XD_PRESET].value, "72 Hz, no space warp") == 0);
+        CHECK(xp_choose(&shown, &p, &hand, XD_PRESET, rates, 5) == all && xp_preset_of(&p) == 0);
+        // changing one of its values by hand leaves the preset
+        CHECK(xp_choose(&shown, &p, &hand, XD_SPACE_WARP, rates, 5) && xp_preset_of(&p) == -1);
+        // a display without a preset's rate skips that preset
+        const float no72[] = { 90, 120 };
+        p = LG_XR_SETTINGS_DEFAULT; p.refresh = 120; p.space_warp = 1; p.foveation = 3; p.render_scale = xp_presets[1].render_scale;
+        CHECK(xp_choose(&shown, &p, &hand, XD_PRESET, no72, 2) == all && xp_preset_of(&p) == 0);
+    }
+
     // an explicit render scale caps the eyes at the picture's rows (xr_android.cpp): the Display page shows the size in use
     {
         XpPanel shown{}; shown.open = 1; shown.page = 1; LgXrSettings capped = cfg;

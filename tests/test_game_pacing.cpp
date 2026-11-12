@@ -640,6 +640,10 @@ int main() {
         CHECK(is(uc::pacing_with_space_warp(0,36,0,false),false,36));
         CHECK(is(uc::pacing_with_space_warp(30,45,0,false),false,0));
         CHECK(is(uc::pacing_with_space_warp(60,0,0,false),true,0));
+        CHECK(is(uc::pacing_with_space_warp(60,72,0,false),false,72));   // 72 Hz without space warp: the game at the display rate
+        // the presentation limit rises to a step above it (72 under 60), never falls, and leaves 30, none and unlimited alone
+        CHECK(uc::frame_limit_with_step(60,72)==72u && uc::frame_limit_with_step(60,45)==60u && uc::frame_limit_with_step(60,0)==60u);
+        CHECK(uc::frame_limit_with_step(30,72)==30u && !uc::frame_limit_with_step(std::nullopt,72) && uc::frame_limit_with_step(0,72)==0u);
     }
     {   // live mode change: picked up at the next frame wait
         uc::game_pacing_init(false);

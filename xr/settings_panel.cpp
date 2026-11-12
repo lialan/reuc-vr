@@ -25,7 +25,7 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
         int row=-1;const bool read=std::fscanf(command,"%d",&row)==1;std::fclose(command);
         if(std::remove(action_file)==0 && read) {
             effects|=xp_choose(&panel_,&cfg,&hand,row,rates.data(),int(rates.size()));
-            std::fprintf(stderr,"[xr-panel-test] page %d row %d effects %u scale %.3g foveation %d fxaa %d post %d merge %d\n",panel_.page,row,effects,cfg.render_scale,cfg.foveation,cfg.fxaa,cfg.post_shading,cfg.merge);
+            std::fprintf(stderr,"[xr-panel-test] page %d row %d effects %u scale %.3g foveation %d fxaa %d post %d merge %d refresh %d space_warp %d preset %d\n",panel_.page,row,effects,cfg.render_scale,cfg.foveation,cfg.fxaa,cfg.post_shading,cfg.merge,cfg.refresh,cfg.space_warp,xp_preset_of(&cfg));
         }
     }
     float head[3];for(int i=0;i<3;++i)head[i]=.5f*(scene.overlay_eyes()[0][i]+scene.overlay_eyes()[1][i]);

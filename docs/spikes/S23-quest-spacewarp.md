@@ -76,6 +76,27 @@ head's motion in them (Meta's sample) and a flat depth image**. Diagnostics: `UC
 
 Foveation was already high (the maximum) in all. The owner's settings were set to 120 Hz, render scale 2.25, space warp on.
 
+## Display presets (2026-11-12)
+
+The Display page's first row, **Preset**, sets refresh, space warp, render scale and foveation (high); `xp_preset_of` shows Custom for any
+other combination. The owner asked for 60 Hz without space warp, but the Quest 3 refuses 60 (`xrRequestDisplayRefreshRateFB` returns
+`XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB`; the runtime then sat at 72) and the game's 60 into 72 refreshes showed 11-14 stale a second.
+So the third preset is **72 Hz with the game at 72**: without space warp at 72 Hz or below the game steps at the display rate (compositor
+`announce_space_warp`) and the frame limiter rises to the step (`frame_limit_with_step`), or it would drop the 61st-72nd frames.
+
+Live fight, same APK, harness settings; game speed is game seconds per wall second from `[game-pacing]` over the 25 s window:
+
+| preset | runtime | stale a second | GPU | game speed |
+|---|---|---|---|---|
+| 72 Hz, no SW, 2.25x | 69-73/72 | 0-5 | 81-89% | 1.002x |
+| 90 Hz SW, native | 43-46/90 | 0-9 | 90-97% | 1.022x |
+| 120 Hz SW, 2.25x | 57-61/120 | 0-8 | 84-89% | 1.000x |
+| (72 @ 2.0x / 90 @ 2.75x / 120 @ 2.0x) | 71-74 / 42-46 / 56-61 | 0-4 / 0-7 / 0-11 | 79-87% | 0.99-1.04x |
+
+One step lower in render scale frees GPU but leaves the same few stale frames: they are the fight's hitches, not GPU load, so the presets
+keep the sharper scales. Game speed varies ~3% per window (the timer step catching up after a hitch) and averages real time. The preset
+row was driven live through `UC_XR_TEST_PANEL_FILE` (Custom -> 90 -> 120 -> 72): each applied its refresh, space warp mode and step.
+
 ## Not done / follow-ups
 
 - Controller and gun overlay: zero vectors (hand motion updates at 45 Hz).

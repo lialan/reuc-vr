@@ -4,6 +4,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* 90 Hz: the game at 45 with space warp, native eyes. 120 Hz: the game at 60 with space warp; native cannot hold 60, 2.25x holds 60-61
+ * (85% GPU). 72 Hz: no space warp, the game at 72 (the display rate: the Quest 3 has no 60 Hz, XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB). */
+const XpPreset xp_presets[XP_PRESET_COUNT] = {
+    { "90 Hz, space warp", 90, 1, 3, 0.0f },
+    { "120 Hz, space warp", 120, 1, 3, 2.25f },
+    { "72 Hz, no space warp", 72, 0, 3, 2.25f },
+};
+int xp_preset_of(const LgXrSettings *cfg)
+{
+    for (int i = 0; i < XP_PRESET_COUNT; i++) {
+        const XpPreset *p = &xp_presets[i];
+        if (cfg->refresh == p->refresh && !cfg->space_warp == !p->space_warp && cfg->foveation == p->foveation &&
+            fabsf(cfg->render_scale - p->render_scale) < .001f) return i;
+    }
+    return -1;
+}
 int xp_count(const XpPanel *menu) { return menu->page == 2 ? XC_COUNT : menu->page ? XD_COUNT : XP_COUNT; }
 /* The game's controls on the Touch controllers (game/xr_android.cpp maps them to the Wii Remote's buttons; the knife and the shakes
  * come from the gun's swings). The gun hand's lower face button is A on the right controller, X on the left. */
@@ -19,8 +35,10 @@ static void controls_items(const LgXrSettings *cfg,XmItem *it)
 }
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
-    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Space warp", "Back" };
+    static const char *const labels[XD_COUNT] = { "Preset", "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Space warp", "Back" };
     for (int i = 0; i < XD_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
+    const int preset = xp_preset_of(cfg);
+    snprintf(it[XD_PRESET].value, 40, "%s", preset < 0 ? "Custom" : xp_presets[preset].name);
     char res[24];
     if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
     else snprintf(res, sizeof res, "%d", cfg->resolution);
@@ -70,10 +88,20 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }
 
-static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
+static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item,const float *rates,int nrates)
 {
     unsigned effects=XP_SAVE;
     switch(item) {
+    case XD_PRESET:{/* the next preset after the one in use (the first from Custom), skipping any the headset's display rates lack */
+        const int at=xp_preset_of(cfg);int k=-1;
+        for(int step=1;step<=XP_PRESET_COUNT&&k<0;++step){
+            const int i=(at+step+XP_PRESET_COUNT)%XP_PRESET_COUNT;int ok=!nrates;
+            for(int r=0;r<nrates;++r)if((int)(rates[r]+.5f)==xp_presets[i].refresh)ok=1;
+            if(ok&&i!=at)k=i;}
+        if(k<0)return 0;
+        const XpPreset *q=&xp_presets[k];
+        cfg->refresh=q->refresh;cfg->space_warp=q->space_warp;cfg->foveation=q->foveation;cfg->render_scale=q->render_scale;
+        effects|=XP_RATE_CHANGED|XP_SPACE_WARP_CHANGED|XP_SCALE_CHANGED|XP_FOVEATION_CHANGED;break;}
     case XD_RES:{/* smaller sizes at the headset's proportions, then its panel */
         static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{LG_XR_NATIVE_WIDTH,LG_XR_NATIVE_HEIGHT}};int k=0;
         while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
@@ -100,7 +128,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     if(p->page==2){
         if(item==XC_VIBRATION){cfg->vibration=!cfg->vibration;p->dirty=1;return XP_SAVE;}
         if(item==XC_BACK){p->page=0;p->hover=-1;p->dirty=1;}return 0;}
-    if(p->page){p->reset_armed=0;return display_choose(p,cfg,item);}
+    if(p->page){p->reset_armed=0;return display_choose(p,cfg,item,rates,nrates);}
     static const float screens[]={2,2.5f,3,4,5};const int armed=p->reset_armed;
     unsigned effects=XP_SAVE;p->reset_armed=0;
     switch(item) {

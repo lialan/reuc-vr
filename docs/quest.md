@@ -26,6 +26,16 @@ An unpacked disc (`/sdcard/UmbrellaChronicles/game/DATA/sys/main.dol`, as older 
 refresh with an even cadence, at the full eye resolution. Without it, heavy scenes run at about 50 fps and the picture alternates between
 one and two refreshes. Details: `docs/spikes/S23-quest-spacewarp.md`.
 
+**Display > Preset** sets the display rate, space warp, render scale and foveation (high) together; any other combination shows Custom:
+
+| Preset | Display | Game | Render scale |
+|---|---|---|---|
+| 90 Hz, space warp | 90 Hz | 45 fps | native |
+| 120 Hz, space warp | 120 Hz | 60 fps | 2.25x |
+| 72 Hz, no space warp | 72 Hz | 72 fps | 2.25x |
+
+The Quest 3 has no 60 Hz mode (72 is its lowest), so the preset without space warp runs the game at 72 to match the display.
+
 ## Building the APK
 
 See the header of `scripts/build-quest.sh`. The build translates `main.dol` from `UC_INSTALL_DIR` and records its SHA-256 in the APK. At start-up the game checks the `main.dol` inside the player's image against it.
