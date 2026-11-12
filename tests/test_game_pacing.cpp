@@ -633,6 +633,7 @@ int main() {
         CHECK(is(uc::pacing_for_limit(0,0,false),false,480));             // unlimited: the 480 Hz ceiling
         CHECK(is(uc::pacing_for_limit(1000,0,false),false,480));
         CHECK(is(uc::pacing_for_limit(144,240,false),false,240));         // --game-hz wins
+        CHECK(is(uc::pacing_for_limit(60,45,false),false,45));            // below 60 too (the headset's space warp: 45 Hz under a 60 limit)
     }
     {   // live mode change: picked up at the next frame wait
         uc::game_pacing_init(false);

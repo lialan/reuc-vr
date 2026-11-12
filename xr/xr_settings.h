@@ -17,6 +17,8 @@ typedef struct {
     int sharpen;                /* vr.cfg "sharpen off|low|medium|high": RCAS-style sharpening in the screen pass (0..3) */
     int glow;                   /* vr.cfg "glow on|off": the glow around lights (the renderer's bloom); off saves GPU time (r020: ~0.7 ms a frame) */
     int vibration;              /* vr.cfg "vibration on|off": the game's own rumble (WPADControlMotor) on the gun hand's controller */
+    int space_warp;             /* vr.cfg "space_warp on|off": Meta Application SpaceWarp (XR_FB_space_warp): the game steps and renders at half the
+                                 * display rate (45 at 90 Hz) and the runtime synthesizes every other frame from motion vectors and depth */
 } LgXrSettings;
 /* The settings panel's render scales after native, largest first */
 #define LG_XR_RENDER_SCALES {2.75f,2.5f,2.25f,2.0f,1.5f,1.25f,1.0f}
@@ -70,7 +72,7 @@ typedef struct {
 #define LG_XR_DEFAULT_SHOW_GUN 1
 #endif
 #define LG_XR_SETTINGS_VERSION 14
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,LG_XR_DEFAULT_SHOW_GUN,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1,0,1,1}
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_DEFAULT_HEIGHT,LG_XR_DEFAULT_WIDTH,LG_XR_DEFAULT_REFRESH,0,LASER_ON,1,0,1,LG_XR_DEFAULT_SHOW_GUN,0,0,1,LG_XR_DEFAULT_FOVEATION,LG_XR_SETTINGS_VERSION,LG_XR_DEFAULT_RENDER_SCALE,LG_XR_DEFAULT_FXAA,0,1,0,1,1,0}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);

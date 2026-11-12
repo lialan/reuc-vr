@@ -98,6 +98,8 @@ XrCompositor::XrCompositor(XrConfig config, XrPlatform platform)
 #endif
         refresh_control_ = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         if (refresh_control_) extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+        space_warp_supported_ = has(XR_FB_SPACE_WARP_EXTENSION_NAME);   // enabled whenever offered; the Display page decides per frame
+        if (space_warp_supported_) extensions.push_back(XR_FB_SPACE_WARP_EXTENSION_NAME);
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
 #ifdef __ANDROID__
         XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -254,6 +256,8 @@ void XrCompositor::attach(VkInstance instance, VkPhysicalDevice physical, VkDevi
         panel_.set_eye_size(int(width_), int(height_));
         overlay_depth_image_ = overlay_.depth_image();
         std::fprintf(stderr, "[vulkan-xr] stereo swapchain %ux%u x2, %u images, format %d rendered as %d\n", width_, height_, count, int(format), int(render_format_));
+        if (space_warp_supported_) create_space_warp(formats);
+        announce_space_warp();
     } catch (...) { detach(); throw; }
 }
 
@@ -316,6 +320,77 @@ void XrCompositor::create_screen_pass(const std::filesystem::path& shaders) {
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 160}, {VK_DESCRIPTOR_TYPE_SAMPLER, 32}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets = 32; pool.poolSizeCount = 2; pool.pPoolSizes = sizes;
     vk(vkCreateDescriptorPool(device_, &pool, nullptr, &pool_), "descriptor pool");
+}
+
+bool XrCompositor::space_warp() const {
+    static const char* forced = std::getenv("UC_SPACE_WARP");
+    const bool wanted = forced && *forced ? *forced != '0' : config_.settings.space_warp != 0;
+    return wanted && warp_motion_.swapchain && warp_depth_.swapchain;
+}
+void XrCompositor::announce_space_warp() {
+    const uint32_t hz = space_warp() ? uint32_t(config_.settings.refresh > 0 ? config_.settings.refresh : 90) / 2 : 0;
+    std::fprintf(stderr, "[vulkan-xr] space warp %s%s; game step %s\n", space_warp() ? "on" : "off",
+                 space_warp_supported_ ? "" : " (runtime has no XR_FB_space_warp)", hz ? std::to_string(hz).append(" Hz").c_str() : "from the frame limit");
+    if (space_warp_step_) space_warp_step_(hz);
+}
+void XrCompositor::WarpTarget::acquire(const char* what) {
+    XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    xr_check(xrAcquireSwapchainImage(swapchain, &acquire, &index), what);
+    XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout = XR_INFINITE_DURATION;
+    xr_check(xrWaitSwapchainImage(swapchain, &ready), what);
+}
+void XrCompositor::WarpTarget::release() {
+    XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xr_check(xrReleaseSwapchainImage(swapchain, &info), "release OpenXR space warp image");
+}
+// The motion vectors (RGBA16F: NDC xy, z) and the depth, both eyes as array layers, at the runtime's recommended size (Meta's XrSpaceWarp
+// sample: a quarter of the eye in each direction). The images arrive from xrWaitSwapchainImage in COLOR_ATTACHMENT_OPTIMAL and
+// DEPTH_STENCIL_ATTACHMENT_OPTIMAL and go back in them (XR_KHR_vulkan_enable2).
+void XrCompositor::create_space_warp(const std::vector<int64_t>& formats) {
+    XrSystemSpaceWarpPropertiesFB warp{XR_TYPE_SYSTEM_SPACE_WARP_PROPERTIES_FB};
+    XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES}; properties.next = &warp;
+    xr_check(xrGetSystemProperties(instance_, system_, &properties), "OpenXR space warp properties");
+    const auto has = [&](VkFormat f) { return std::find(formats.begin(), formats.end(), int64_t(f)) != formats.end(); };
+    for (auto f : {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM}) if (has(f)) { warp_depth_format_ = f; break; }
+    if (!warp.recommendedMotionVectorImageRectWidth || !warp.recommendedMotionVectorImageRectHeight || !has(VK_FORMAT_R16G16B16A16_SFLOAT)
+        || warp_depth_format_ == VK_FORMAT_UNDEFINED) {
+        std::fprintf(stderr, "[vulkan-xr] space warp unavailable: motion %ux%u, RGBA16F %d, depth format %d\n", warp.recommendedMotionVectorImageRectWidth,
+                     warp.recommendedMotionVectorImageRectHeight, int(has(VK_FORMAT_R16G16B16A16_SFLOAT)), int(warp_depth_format_));
+        return;
+    }
+    warp_extent_ = {warp.recommendedMotionVectorImageRectWidth, warp.recommendedMotionVectorImageRectHeight};
+    const auto make = [&](WarpTarget& target, VkFormat format, XrSwapchainUsageFlags usage, VkImageAspectFlags aspect, const char* what) {
+        XrSwapchainCreateInfo swap{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        swap.usageFlags = usage; swap.format = format; swap.sampleCount = 1; swap.width = warp_extent_.width; swap.height = warp_extent_.height;
+        swap.faceCount = 1; swap.arraySize = 2; swap.mipCount = 1;
+        xr_check(xrCreateSwapchain(session_, &swap, &target.swapchain), what);
+        uint32_t count = 0; xr_check(xrEnumerateSwapchainImages(target.swapchain, 0, &count, nullptr), what);
+        std::vector<XrSwapchainImageVulkanKHR> images(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xr_check(xrEnumerateSwapchainImages(target.swapchain, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())), what);
+        for (const auto& image : images) {
+            target.images.push_back(image.image);
+            VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; view.image = image.image;
+            view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; view.format = format; view.subresourceRange = {aspect, 0, 1, 0, 2};
+            VkImageView created = VK_NULL_HANDLE; vk(vkCreateImageView(device_, &view, nullptr, &created), what);
+            target.views.push_back(created);
+        }
+    };
+    make(warp_motion_, VK_FORMAT_R16G16B16A16_SFLOAT, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, "OpenXR space warp motion swapchain");
+    make(warp_depth_, warp_depth_format_, XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, "OpenXR space warp depth swapchain");
+    std::fprintf(stderr, "[vulkan-xr] space warp swapchains %ux%u x2 (motion RGBA16F, depth format %d)\n", warp_extent_.width, warp_extent_.height, int(warp_depth_format_));
+}
+// The space warp images of this frame: motion 0 (nothing moves) and depth at the far plane, so the runtime reprojects by the head's pose alone.
+void XrCompositor::record_space_warp(VkCommandBuffer command) {
+    VkRenderingAttachmentInfo motion{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; motion.imageView = warp_motion_.views.at(warp_motion_.index);
+    motion.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; motion.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; motion.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    motion.clearValue.color = {{0, 0, 0, 0}};
+    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; depth.imageView = warp_depth_.views.at(warp_depth_.index);
+    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil = {1, 0};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO}; rendering.renderArea.extent = warp_extent_; rendering.layerCount = 1; rendering.viewMask = 0b11;
+    rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &motion; rendering.pDepthAttachment = &depth;
+    vkCmdBeginRendering(command, &rendering);
+    vkCmdEndRendering(command);
 }
 
 void XrCompositor::poll() {
@@ -471,6 +546,8 @@ bool XrCompositor::begin_frame() {
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout = XR_INFINITE_DURATION;
     const auto t2 = std::chrono::steady_clock::now();
     xr_check(xrWaitSwapchainImage(swapchain_, &ready), "wait OpenXR eye array");
+    warp_frame_ = space_warp();   // fixed for the frame: a panel change applies from the next one
+    if (warp_frame_) { warp_motion_.acquire("acquire OpenXR space warp motion"); warp_depth_.acquire("acquire OpenXR space warp depth"); }
     xr_time(2, t2, std::chrono::steady_clock::now());
     return true;
 }
@@ -532,6 +609,7 @@ void XrCompositor::finish_input() {
     if (effects & XP_SCALE_CHANGED) render_scale_changed_ = true;
     if (effects & XP_RECENTER) recenter();
     if ((effects & XP_RESTART) && config_.restart) config_.restart();
+    if (effects & (XP_SPACE_WARP_CHANGED | XP_RATE_CHANGED)) announce_space_warp();   // the game's step follows (half the display rate, or the limit's)
     const auto& haptics = panel_.haptics();
     for (int h = 0; h < 2; ++h) if (haptics[h].milliseconds) rumble(h, haptics[h].amplitude, haptics[h].milliseconds);
     // The game's own vibration (WPADControlMotor: shots, hits, prompts): each player's motor on that player's gun hand. The game's taps are a frame
@@ -665,6 +743,7 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());
     vkCmdEndRendering(command);
+    if (warp_frame_) record_space_warp(command);
     barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
             transfer_picture ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             transfer_picture ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -701,10 +780,23 @@ void XrCompositor::end_frame(bool rendered) {
     if (!frame_open_) return;
     if (rendered && !acquired_) throw std::logic_error("OpenXR frame has no acquired eye image");
     if (acquired_) { XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}; xr_check(xrReleaseSwapchainImage(swapchain_, &release), "release OpenXR eye array"); acquired_ = false; }
+    const bool warp = warp_frame_;
+    if (warp) { warp_motion_.release(); warp_depth_.release(); warp_frame_ = false; }
     std::array<XrCompositionLayerProjectionView, 2> views{{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}}};
+    std::array<XrCompositionLayerSpaceWarpInfoFB, 2> warps{{{XR_TYPE_COMPOSITION_LAYER_SPACE_WARP_INFO_FB}, {XR_TYPE_COMPOSITION_LAYER_SPACE_WARP_INFO_FB}}};
     for (unsigned i = 0; i < 2; ++i) {
         views[i].pose = views_[i].pose; views[i].fov = views_[i].fov;
         views[i].subImage.swapchain = swapchain_; views[i].subImage.imageRect.extent = {int32_t(width_), int32_t(height_)}; views[i].subImage.imageArrayIndex = i;
+        if (!warp) continue;
+        // The vectors hold the scene's own motion in the layer's space (the game's camera and actors); the runtime adds the head's.
+        auto& w = warps[i];
+        w.motionVectorSubImage.swapchain = warp_motion_.swapchain; w.motionVectorSubImage.imageArrayIndex = i;
+        w.motionVectorSubImage.imageRect.extent = {int32_t(warp_extent_.width), int32_t(warp_extent_.height)};
+        w.depthSubImage.swapchain = warp_depth_.swapchain; w.depthSubImage.imageArrayIndex = i;
+        w.depthSubImage.imageRect.extent = w.motionVectorSubImage.imageRect.extent;
+        w.appSpaceDeltaPose.orientation.w = 1;   // the layer's space (space_) does not move between frames
+        w.minDepth = 0; w.maxDepth = 1; w.nearZ = warp_near_; w.farZ = warp_far_;
+        views[i].next = &w;
     }
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION}; projection.space = space_; projection.viewCount = 2; projection.views = views.data();
     const auto layer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
@@ -752,6 +844,7 @@ void XrCompositor::detach() {
     if (device_) {
         overlay_.shutdown();
         for (auto view : views_array_) vkDestroyImageView(device_, view, nullptr);
+        for (auto* target : {&warp_motion_, &warp_depth_}) for (auto view : target->views) vkDestroyImageView(device_, view, nullptr);
         if (pool_) vkDestroyDescriptorPool(device_, pool_, nullptr);
         for (auto pipeline : pipelines_) if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
         if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
@@ -764,6 +857,8 @@ void XrCompositor::detach() {
     pool_ = VK_NULL_HANDLE; for (auto& p : pipelines_) p = VK_NULL_HANDLE; layout_ = VK_NULL_HANDLE; set_layout_ = VK_NULL_HANDLE; sampler_ = VK_NULL_HANDLE; vertex_ = fragment_ = VK_NULL_HANDLE;
     if (profile_ && destroy_profile_) destroy_profile_(profile_); profile_ = XR_NULL_HANDLE;
     if (swapchain_) xrDestroySwapchain(swapchain_); swapchain_ = XR_NULL_HANDLE;
+    for (auto* target : {&warp_motion_, &warp_depth_}) { if (target->swapchain) xrDestroySwapchain(target->swapchain); *target = WarpTarget{}; }
+    warp_frame_ = false; warp_extent_ = {}; warp_depth_format_ = VK_FORMAT_UNDEFINED;
     if (space_) xrDestroySpace(space_); space_ = XR_NULL_HANDLE;
     if (base_space_) xrDestroySpace(base_space_); base_space_ = XR_NULL_HANDLE;
     lg_xr_actions_destroy(&actions_);

@@ -19,7 +19,7 @@ static void controls_items(const LgXrSettings *cfg,XmItem *it)
 }
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
-    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Back" };
+    static const char *const labels[XD_COUNT] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Space warp", "Back" };
     for (int i = 0; i < XD_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     char res[24];
     if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
@@ -40,6 +40,7 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
     snprintf(it[XD_POST].value, 40, "%s", cfg->post_shading ? "Coarse (faster)" : "Full");
     snprintf(it[XD_MERGE].value, 40, "%s", cfg->merge ? "On" : "Off");
     snprintf(it[XD_GLOW].value, 40, "%s", cfg->glow ? "On" : "Off (faster)");
+    snprintf(it[XD_SPACE_WARP].value, 40, "%s", cfg->space_warp ? "On (half rate)" : "Off");   /* the game at half the display rate */
 }
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
@@ -87,6 +88,7 @@ static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
     case XD_POST:cfg->post_shading=!cfg->post_shading;break;
     case XD_MERGE:cfg->merge=!cfg->merge;break;
     case XD_GLOW:cfg->glow=!cfg->glow;break;
+    case XD_SPACE_WARP:cfg->space_warp=!cfg->space_warp;effects|=XP_SPACE_WARP_CHANGED;break;
     case XD_BACK:p->page=0;p->hover=-1;effects=0;break;
     default:return 0;
     }

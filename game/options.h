@@ -84,7 +84,7 @@ struct Options {
     // (at most 480), 31..60 the retrace-locked 60 Hz update, 30 or less the original 30 Hz. --game-hz still wins. Unset keeps the previous behaviour:
     // presentation capped at 240, step from unlock_60fps / game_hz.
     std::optional<uint32_t> fps_limit;
-    uint32_t game_hz = 0;    // experimental: game step above 60 Hz from a wall-clock timer (61..480); 0 keeps the retrace-locked step
+    uint32_t game_hz = 0;    // experimental: game step from a wall-clock timer (31..480; the headset's space warp uses 45); 0 keeps the retrace-locked step
     bool input_probe = false;
     bool gx_gaps = false, audio_audit = false; // diagnostics: reports in <exe>/debug at exit
     std::filesystem::path test_control,save_root,config,capture_dir;

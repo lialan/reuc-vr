@@ -210,7 +210,7 @@ std::variant<Options, std::string> parse_options(std::span<const std::string_vie
             else if (arg == "--fps-limit") { if (number != 0 && (number < 20 || number > 1000)) return "invalid value for --fps-limit"; options.fps_limit = number; }
             else if (arg == "--det-frames") options.det_frames = number;
             else if (arg == "--stop-retrace") options.stop_retrace = number;
-            else if (arg == "--game-hz") { if (number < 61 || number > 480) return "invalid value for --game-hz"; options.game_hz = number; }
+            else if (arg == "--game-hz") { if (number < 31 || number > 480) return "invalid value for --game-hz"; options.game_hz = number; }
             else options.seconds = number;
         } else return "unknown option " + std::string(arg);
     }
