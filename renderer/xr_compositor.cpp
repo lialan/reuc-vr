@@ -329,7 +329,7 @@ bool XrCompositor::space_warp() const {
 }
 void XrCompositor::announce_space_warp() {
     const uint32_t hz = space_warp() ? uint32_t(config_.settings.refresh > 0 ? config_.settings.refresh : 90) / 2 : 0;
-    std::fprintf(stderr, "[vulkan-xr] space warp %s%s; game step %s\n", space_warp() ? "on" : "off",
+    std::fprintf(stderr, "[vulkan-xr] space warp %s%s; game step %s\n", space_warp() ? (!space_warp_vectors() ? "on, head only (no vectors)" : space_warp_head_in_vectors() ? "on" : "on, no head in the vectors") : "off",
                  space_warp_supported_ ? "" : " (runtime has no XR_FB_space_warp)", hz ? std::to_string(hz).append(" Hz").c_str() : "from the frame limit");
     if (space_warp_step_) space_warp_step_(hz);
 }

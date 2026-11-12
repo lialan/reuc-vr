@@ -111,6 +111,10 @@ public:
     // Each projection view then carries a motion vector image (NDC, RGBA16F) and a depth image at the runtime's recommended size, and the
     // runtime synthesizes every other displayed frame: the game runs at half the display rate.
     bool space_warp() const;
+    // The Display page's tests: "Head only" (space_warp 2): no motion pass (no motion, far depth); "No head in vectors" (3): the vectors'
+    // previous positions through this frame's eye instead of last frame's (the head's motion left out of them).
+    bool space_warp_vectors() const { return config_.settings.space_warp != 2; }
+    bool space_warp_head_in_vectors() const { return config_.settings.space_warp != 3; }
     bool space_warp_frame() const { return warp_frame_; }   // this frame's eye array came with motion and depth images (begin_frame)
     // The renderer's motion pass (space_warp_frame() only): this frame's motion and depth images (both eyes as layers, COLOR_ATTACHMENT /
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, left so). first: no pass has written them this frame (the pass clears them); later passes load.

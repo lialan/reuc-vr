@@ -224,6 +224,7 @@ private:
         Buffer xform_jobs, xform_chunks, xform_positions, xform_attributes, xform_indices;   // the vertex pre-pass (xform_): its input table, outputs and the rebased indices
         VkDescriptorPool xform_pool = VK_NULL_HANDLE; VkDescriptorSet xform_set = VK_NULL_HANDLE;
         Buffer xform_previous;   // the headset's space warp: last frame's view position per pre-pass position (xr_motion.slang)
+        Buffer warp_frame;       // and its eye rows (xr_motion.slang WarpEyes)
         VkDescriptorPool warp_pool = VK_NULL_HANDLE; VkDescriptorSet warp_set = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<const gx::MeshBuffers>> mesh_refs;   // keeps the meshes this submission draws alive until its fence completed
         std::vector<std::shared_ptr<Texture>> textures;   // shared through texture_pool_: one GPU image per texture, not one per slot
@@ -573,7 +574,7 @@ private:
     VkPipeline warp_pipeline_ = VK_NULL_HANDLE;
     bool warp_track_ = false;
     uint64_t warp_draw_count_ = 0, warp_call_count_ = 0;   // the [space-warp] line: world draws the pass took, draw calls it issued
-    std::optional<std::array<float,32>> warp_eyes_;
+    std::optional<std::array<float,32>> warp_eyes_, warp_eyes_prev_;   // prev: the last presented frame's (the vectors' previous positions)
     void record_warp_pass(Slot& slot, const std::vector<WarpDraw>& draws);
     // The headset's texture table (UC_TEX_MERGE=1, needs xform_ and descriptor indexing): every packet's distinct texture/sampler sets as one
     // array of combined image samplers (set 1); a draw's first entry travels with its vertices (the pre-pass writes it), so draws that differ
