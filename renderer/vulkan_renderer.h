@@ -563,7 +563,10 @@ private:
     // The headset's space warp (XrCompositor::space_warp): the motion pass (xr_motion.slang) draws the frame's depth-writing world draws
     // again into the runtime's motion and depth images, from the pre-pass's positions. warp_track_: this display frame feeds tracker_ and
     // writes previous positions; warp_eyes_: the frame's eye rows (game view -> Vulkan clip) at one near/far, from its first such draw.
-    struct WarpDraw { uint32_t first, count, kind; };
+    struct WarpDraw { uint32_t first, count, kind; VkViewport viewport; };   // viewport: the draw's in the EFB (pixels)
+    // The EFB rectangle the eyes show (pixels u0, v0, u1, v1; the last presented frame's): the eye image is this rectangle stretched, so the
+    // motion pass maps a draw's EFB viewport through it. Empty (u1 <= u0): the whole EFB.
+    std::array<float,4> warp_display_{};
     VkShaderModule warp_vertex_ = VK_NULL_HANDLE, warp_fragment_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout warp_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout warp_layout_ = VK_NULL_HANDLE;

@@ -7,6 +7,9 @@
 
 namespace uc {
 struct WarpDepthRange { float near_plane, far_plane; };
+// The planes the motion pass uses, in metres, whatever the game's lenses: a frame's first world draw can be a distant backdrop with its own
+// lens (near 40 m was seen), which would leave everything closer without depth or vectors. D24 resolves ~1 cm at 5 m with these.
+constexpr WarpDepthRange kWarpPlanesMetres{.1f, 1000.f};
 // p: a GL-convention perspective projection, column-major (gl_from_vulkan). In the projection's units; the near plane at least min_near
 // (the game's world lens has its near plane at 1 mm: a 24-bit depth image then resolves ~1.5 m at 5 m, useless to the runtime); an
 // infinite (or unusable) far plane becomes 10^4 times the near one, which the depth image cannot tell from infinity. None: not a

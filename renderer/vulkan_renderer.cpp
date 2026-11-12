@@ -4473,18 +4473,21 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
                 // Space warp: the world's triangles that write depth into the eyes' EFB go to the motion pass. The frame's first one fixes
                 // the eye rows and the depth planes the pass uses for all of them (its lens: the world's).
                 if (warp_track_ && warp_prev[d][0] && !culled && target.color==efb_ && !particle_pass && draw.primitive!=0xA8 && draw.primitive!=0xB0 && draw.primitive!=0xB8) {
-                    if (!warp_eyes_) {   // the world lens with the near plane at least 10 cm (space_warp.h): the depth image's precision
+                    if (!warp_eyes_) {   // the eyes' frustums with the motion pass's fixed planes (space_warp.h kWarpPlanesMetres)
                         const auto gl=gl_from_vulkan(draw.transforms->projection);
                         const float scale=stereo_->settings().scale > 0 ? stereo_->settings().scale : 1.f;   // game units per metre
-                        if (const auto range=warp_depth_range(gl.data(),.1f*scale)) {
-                            xr::Matrix lens; warp_projection(gl.data(),*range,lens.data());
+                        if (warp_depth_range(gl.data())) {   // a perspective lens: only its form is kept (lg_stereo_eye_projection)
+                            const WarpDepthRange range{kWarpPlanesMetres.near_plane*scale,kWarpPlanesMetres.far_plane*scale};
+                            xr::Matrix lens; warp_projection(gl.data(),range,lens.data());
                             std::array<float,32> eyes; stereo_view_block(stereo_->transforms(lens,LG_STEREO_WORLD),eyes.data()); warp_eyes_=eyes;
-                            xr_->set_warp_depth_range(range->near_plane/scale,range->far_plane/scale);
+                            xr_->set_warp_depth_range(kWarpPlanesMetres.near_plane,kWarpPlanesMetres.far_plane);
                         }
                     }
                     if (warp_eyes_) {   // consecutive draws of one kind are one range of the packet's rebased indices: one draw call
-                        const WarpDraw next{xform_draws[d].first,info.index_count,warp_prev[d][0]};
-                        if (!warp_draws.empty() && warp_draws.back().kind==next.kind && warp_draws.back().first+warp_draws.back().count==next.first) warp_draws.back().count+=next.count;
+                        const WarpDraw next{xform_draws[d].first,info.index_count,warp_prev[d][0],draw_viewport};
+                        const auto& last=warp_draws.empty() ? next : warp_draws.back();
+                        const bool same_view=last.viewport.x==next.viewport.x && last.viewport.y==next.viewport.y && last.viewport.width==next.viewport.width && last.viewport.height==next.viewport.height;
+                        if (!warp_draws.empty() && last.kind==next.kind && same_view && last.first+last.count==next.first) warp_draws.back().count+=next.count;
                         else warp_draws.push_back(next);
                         ++warp_draw_count_;
                     }
@@ -4944,6 +4947,10 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
 #ifdef UC_OPENXR
     // UC_SPACE_WARP_VECTORS=0 (diagnostics): no motion pass, so the runtime gets no motion and far depth (head pose only), for A/B
     static const bool warp_vectors=[] { const char* v=std::getenv("UC_SPACE_WARP_VECTORS"); return !v || *v!='0'; }();
+    if (xr_ && packet.present && display)   // the displayed EFB rectangle, as the screen pass reads it (see xr_direct below)
+        warp_display_={float(uint64_t(display_source[0])*efb_extent_.width/640),float(uint64_t(display_source[1])*efb_extent_.height/480),
+                       float(std::max<uint64_t>(uint64_t(display_source[0])*efb_extent_.width/640+1,uint64_t(display_source[0]+display_source[2])*efb_extent_.width/640)),
+                       float(std::max<uint64_t>(uint64_t(display_source[1])*efb_extent_.height/480+1,uint64_t(display_source[1]+display_source[3])*efb_extent_.height/480))};
     if (warp_vectors && !warp_draws.empty() && xr_frame_ && xr_->space_warp_frame()) record_warp_pass(slot,warp_draws);
 #endif
     // UC_FOLD_CLEAR: no EFB pass of this packet took a waiting clear. An empty packet (no draws, copy, present or clear: one follows every
@@ -5333,8 +5340,16 @@ void VulkanRenderer::record_warp_pass(Slot& slot, const std::vector<WarpDraw>& d
     vkCmdBeginRendering(slot.command,&rendering);
     vkCmdBindPipeline(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,warp_pipeline_);
     vkCmdBindDescriptorSets(slot.command,VK_PIPELINE_BIND_POINT_GRAPHICS,warp_layout_,0,1,&slot.warp_set,0,nullptr);
-    const VkViewport viewport{0,0,float(target.extent.width),float(target.extent.height),0,1}; const VkRect2D scissor{{0,0},target.extent};
-    vkCmdSetViewport(slot.command,0,1,&viewport); vkCmdSetScissor(slot.command,0,1,&scissor);
+    const VkRect2D scissor{{0,0},target.extent};
+    vkCmdSetScissor(slot.command,0,1,&scissor);
+    // A draw's EFB viewport lands in the eye image through the displayed rectangle (stretched to the eye), so here likewise: the motion
+    // and depth images then line up with the eye picture pixel for pixel (in normalized coordinates).
+    const bool known=warp_display_[2]>warp_display_[0] && warp_display_[3]>warp_display_[1];
+    const float u0=known ? warp_display_[0] : 0, v0=known ? warp_display_[1] : 0;
+    const float sx=float(target.extent.width)/(known ? warp_display_[2]-warp_display_[0] : float(efb_extent_.width));
+    const float sy=float(target.extent.height)/(known ? warp_display_[3]-warp_display_[1] : float(efb_extent_.height));
+    const auto mapped=[&](const VkViewport& v) { return VkViewport{(v.x-u0)*sx,(v.y-v0)*sy,v.width*sx,v.height*sy,0,1}; };
+    VkViewport bound{}; bool have_bound=false;
     vkCmdBindIndexBuffer(slot.command,slot.xform_indices.buffer,0,VK_INDEX_TYPE_UINT32);
     static const bool flip_y=[] { const char* v=std::getenv("UC_SPACE_WARP_FLIP_Y"); return v && *v=='1'; }();
     WarpPush push{};
@@ -5346,14 +5361,20 @@ void VulkanRenderer::record_warp_pass(Slot& slot, const std::vector<WarpDraw>& d
     uint32_t kind=push.kind;
     for (const auto& draw:draws) {
         if (draw.kind!=kind) { kind=draw.kind; vkCmdPushConstants(slot.command,warp_layout_,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,uint32_t(offsetof(WarpPush,kind)),4,&kind); }
+        const VkViewport viewport=mapped(draw.viewport);
+        if (!have_bound || viewport.x!=bound.x || viewport.y!=bound.y || viewport.width!=bound.width || viewport.height!=bound.height) {
+            vkCmdSetViewport(slot.command,0,1,&viewport); bound=viewport; have_bound=true;
+        }
         vkCmdDrawIndexed(slot.command,draw.count,1,draw.first,0,0);
     }
     vkCmdEndRendering(slot.command);
     warp_call_count_+=draws.size();
     static auto since=std::chrono::steady_clock::now();
     if (std::chrono::steady_clock::now()-since>std::chrono::seconds(2)) {
-        std::fprintf(stderr,"[space-warp] 2 s: %llu world draws in %llu draw calls; near %.3f far %.1f m\n",(unsigned long long)warp_draw_count_,(unsigned long long)warp_call_count_,
-                     xr_->warp_near(),xr_->warp_far());
+        const auto& v=draws.front().viewport;
+        std::fprintf(stderr,"[space-warp] 2 s: %llu world draws in %llu draw calls; near %.3f far %.1f m; EFB %ux%u, displayed %.0f,%.0f..%.0f,%.0f, a draw's viewport %.0f,%.0f %.0fx%.0f\n",
+                     (unsigned long long)warp_draw_count_,(unsigned long long)warp_call_count_,xr_->warp_near(),xr_->warp_far(),efb_extent_.width,efb_extent_.height,
+                     warp_display_[0],warp_display_[1],warp_display_[2],warp_display_[3],v.x,v.y,v.width,v.height);
         warp_draw_count_=warp_call_count_=0; since=std::chrono::steady_clock::now();
     }
 }
