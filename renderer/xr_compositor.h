@@ -113,8 +113,11 @@ public:
     bool space_warp() const;
     // The Display page's tests: "Head only" (space_warp 2): no motion pass (no motion, far depth); "No head in vectors" (3): the vectors'
     // previous positions through this frame's eye instead of last frame's (the head's motion left out of them).
+    // "Flat depth" (4) and "Flat depth, no head" (5): the vectors, but the depth image cleared to the far plane after the motion pass
+    // (no positional reprojection: the near handrails' disocclusions).
     bool space_warp_vectors() const { return config_.settings.space_warp != 2; }
-    bool space_warp_head_in_vectors() const { return config_.settings.space_warp != 3; }
+    bool space_warp_head_in_vectors() const { return config_.settings.space_warp != 3 && config_.settings.space_warp != 5; }
+    bool space_warp_flat_depth() const { return config_.settings.space_warp == 4 || config_.settings.space_warp == 5; }
     bool space_warp_frame() const { return warp_frame_; }   // this frame's eye array came with motion and depth images (begin_frame)
     // The renderer's motion pass (space_warp_frame() only): this frame's motion and depth images (both eyes as layers, COLOR_ATTACHMENT /
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, left so). first: no pass has written them this frame (the pass clears them); later passes load.
@@ -211,5 +214,13 @@ private:
     VkExtent2D warp_extent_{};
     VkFormat warp_depth_format_ = VK_FORMAT_UNDEFINED;
     float warp_near_ = .1f, warp_far_ = 1e4f;   // metres: the depth image's projection (cleared to far: everything at the far plane)
+    // UC_CAPTURE_WARP=N (diagnostics): the Nth frame with a motion pass, its motion, depth and eye images, written as warp-capture-*.raw
+    // into the working directory after the frame (warp-capture.txt: sizes, formats, planes, eye poses).
+    struct Readback { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; VkDeviceSize size = 0; };
+    std::array<Readback, 3> capture_{};   // motion, depth, eyes
+    VkPhysicalDevice physical_ = VK_NULL_HANDLE;
+    unsigned capture_frames_ = 0; bool capture_pending_ = false;
+    void capture_warp(VkCommandBuffer command);
+    void write_warp_capture();
 };
 }  // namespace uc

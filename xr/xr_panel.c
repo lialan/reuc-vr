@@ -40,7 +40,7 @@ static void display_items(const LgXrSettings *cfg,int running_resolution,int run
     snprintf(it[XD_POST].value, 40, "%s", cfg->post_shading ? "Coarse (faster)" : "Full");
     snprintf(it[XD_MERGE].value, 40, "%s", cfg->merge ? "On" : "Off");
     snprintf(it[XD_GLOW].value, 40, "%s", cfg->glow ? "On" : "Off (faster)");
-    snprintf(it[XD_SPACE_WARP].value, 40, "%s", cfg->space_warp == 3 ? "No head in vectors (test)" : cfg->space_warp == 2 ? "Head only (test)" : cfg->space_warp ? "On (half rate)" : "Off");   /* the game at half the display rate; 2, 3: tests (xr_compositor.h) */
+    snprintf(it[XD_SPACE_WARP].value, 40, "%s", cfg->space_warp == 5 ? "Flat depth, no head (test)" : cfg->space_warp == 4 ? "Flat depth (test)" : cfg->space_warp == 3 ? "No head in vectors (test)" : cfg->space_warp == 2 ? "Head only (test)" : cfg->space_warp ? "On (half rate)" : "Off");   /* the game at half the display rate; 2, 3: tests (xr_compositor.h) */
 }
 void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locked,int running_resolution,int running_width,XmItem *it)
 {
@@ -88,7 +88,7 @@ static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item)
     case XD_POST:cfg->post_shading=!cfg->post_shading;break;
     case XD_MERGE:cfg->merge=!cfg->merge;break;
     case XD_GLOW:cfg->glow=!cfg->glow;break;
-    case XD_SPACE_WARP:cfg->space_warp=(cfg->space_warp+1)%4;effects|=XP_SPACE_WARP_CHANGED;break;
+    case XD_SPACE_WARP:cfg->space_warp=(cfg->space_warp+1)%6;effects|=XP_SPACE_WARP_CHANGED;break;
     case XD_BACK:p->page=0;p->hover=-1;effects=0;break;
     default:return 0;
     }
