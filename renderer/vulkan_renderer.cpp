@@ -4945,13 +4945,11 @@ bool VulkanRenderer::render(const gx::FramePacket& packet, bool display,uint64_t
     else if (!scene_only && !overlay_frame && (!efb_initialized_ || scene_draws<packet.draws.size())) { record_pass(efb_target,scene_draws,packet.draws.size(),false); record_layer(glow_,2); record_layer(hud_,1); }
     if (hudless_wanted && !hudless_taken_ && packet.present) take_hudless();
 #ifdef UC_OPENXR
-    // UC_SPACE_WARP_VECTORS=0 (diagnostics): no motion pass, so the runtime gets no motion and far depth (head pose only), for A/B
-    static const bool warp_vectors=[] { const char* v=std::getenv("UC_SPACE_WARP_VECTORS"); return !v || *v!='0'; }();
     if (xr_ && packet.present && display)   // the displayed EFB rectangle, as the screen pass reads it (see xr_direct below)
         warp_display_={float(uint64_t(display_source[0])*efb_extent_.width/640),float(uint64_t(display_source[1])*efb_extent_.height/480),
                        float(std::max<uint64_t>(uint64_t(display_source[0])*efb_extent_.width/640+1,uint64_t(display_source[0]+display_source[2])*efb_extent_.width/640)),
                        float(std::max<uint64_t>(uint64_t(display_source[1])*efb_extent_.height/480+1,uint64_t(display_source[1]+display_source[3])*efb_extent_.height/480))};
-    if (warp_vectors && !warp_draws.empty() && xr_frame_ && xr_->space_warp_frame() && xr_->space_warp_vectors()) record_warp_pass(slot,warp_draws);
+    if (!warp_draws.empty() && xr_frame_ && xr_->space_warp_frame() && xr_->space_warp_vectors()) record_warp_pass(slot,warp_draws);
 #endif
     // UC_FOLD_CLEAR: no EFB pass of this packet took a waiting clear. An empty packet (no draws, copy, present or clear: one follows every
     // present in the fight) leaves the EFB alone, so the clear waits on; anything else may read or write the EFB from here on.

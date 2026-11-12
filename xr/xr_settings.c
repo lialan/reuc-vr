@@ -20,7 +20,7 @@ void xr_settings_save(const LgXrSettings *c)
     else fprintf(f, "render_scale native\n");
     static const char *const SHARPEN_NAME[] = {"off", "low", "medium", "high"};
     fprintf(f, "fxaa %s\npost_shading %s\nmerge %s\nglow %s\nsharpen %s\nvibration %s\nspace_warp %s\n", c->fxaa ? "on" : "off", c->post_shading ? "coarse" : "full", c->merge ? "on" : "off",
-            c->glow ? "on" : "off", SHARPEN_NAME[c->sharpen < 0 || c->sharpen > 3 ? 0 : c->sharpen], c->vibration ? "on" : "off", c->space_warp == 5 ? "flatnohead" : c->space_warp == 4 ? "flat" : c->space_warp == 3 ? "nohead" : c->space_warp == 2 ? "head" : c->space_warp ? "on" : "off");
+            c->glow ? "on" : "off", SHARPEN_NAME[c->sharpen < 0 || c->sharpen > 3 ? 0 : c->sharpen], c->vibration ? "on" : "off", c->space_warp ? "on" : "off");
     fclose(f);
 }
 
@@ -128,7 +128,7 @@ void xr_settings_set(LgXrSettings *c,const char *key,const char *val)
         else if (!strcmp(key, "merge")) c->merge = strcmp(val, "off") != 0;
         else if (!strcmp(key, "glow")) c->glow = strcmp(val, "off") != 0;
         else if (!strcmp(key, "vibration")) c->vibration = strcmp(val, "off") != 0;
-        else if (!strcmp(key, "space_warp")) c->space_warp = !strcmp(val, "on") ? 1 : !strcmp(val, "head") ? 2 : !strcmp(val, "nohead") ? 3 : !strcmp(val, "flat") ? 4 : !strcmp(val, "flatnohead") ? 5 : 0;
+        else if (!strcmp(key, "space_warp")) c->space_warp = strcmp(val, "off") != 0;   /* on (or a test build's head, nohead, flat, flatnohead) */
         else if (!strcmp(key, "sharpen")) c->sharpen = !strcmp(val, "low") ? 1 : !strcmp(val, "medium") ? 2 : !strcmp(val, "high") ? 3 : 0;
         else if (!strcmp(key, "foveation")) {
             for (int i = 0; i < 4; i++) if (!strcmp(val, FOVEATION_NAME[i])) c->foveation = i;

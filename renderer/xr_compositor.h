@@ -13,6 +13,7 @@
 #include "../xr/xr_actions.h"
 #include "../xr/xr_settings.h"
 #include "xr_overlay.h"
+#include <cstdlib>
 #include <functional>
 #include "gx_transforms.h"
 #include "gl_clip.h"
@@ -115,9 +116,14 @@ public:
     // previous positions through this frame's eye instead of last frame's (the head's motion left out of them).
     // "Flat depth" (4) and "Flat depth, no head" (5): the vectors, but the depth image cleared to the far plane after the motion pass
     // (no positional reprojection: the near handrails' disocclusions).
-    bool space_warp_vectors() const { return config_.settings.space_warp != 2; }
-    bool space_warp_head_in_vectors() const { return config_.settings.space_warp != 3 && config_.settings.space_warp != 5; }
-    bool space_warp_flat_depth() const { return config_.settings.space_warp == 4 || config_.settings.space_warp == 5; }
+    // What the runtime gets (S23; the owner compared all in the headset): the vectors with the head's motion in them (Meta's sample) and
+    // the depth image at the far plane. With the real depth the runtime's positional reprojection ghosted near geometry (the handrails at
+    // ~0.3 m) whenever the head moved. Diagnostics: UC_SPACE_WARP_VECTORS=0 (no motion pass), UC_SPACE_WARP_NO_HEAD=1 (the head left out
+    // of the vectors), UC_SPACE_WARP_DEPTH=1 (the motion pass's real depth).
+    static bool env_flag(const char* name) { const char* v = std::getenv(name); return v && *v == '1'; }
+    bool space_warp_vectors() const { static const bool off = [] { const char* v = std::getenv("UC_SPACE_WARP_VECTORS"); return v && *v == '0'; }(); return !off; }
+    bool space_warp_head_in_vectors() const { static const bool no_head = env_flag("UC_SPACE_WARP_NO_HEAD"); return !no_head; }
+    bool space_warp_flat_depth() const { static const bool depth = env_flag("UC_SPACE_WARP_DEPTH"); return !depth; }
     bool space_warp_frame() const { return warp_frame_; }   // this frame's eye array came with motion and depth images (begin_frame)
     // The renderer's motion pass (space_warp_frame() only): this frame's motion and depth images (both eyes as layers, COLOR_ATTACHMENT /
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, left so). first: no pass has written them this frame (the pass clears them); later passes load.

@@ -46,18 +46,6 @@ int main() {
     CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 1);
     xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
     CHECK(std::strcmp(items[XD_SPACE_WARP].value, "On (half rate)") == 0);
-    CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 2);   // head only (test)
-    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
-    CHECK(std::strcmp(items[XD_SPACE_WARP].value, "Head only (test)") == 0);
-    CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 3);   // no head in the vectors (test)
-    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
-    CHECK(std::strcmp(items[XD_SPACE_WARP].value, "No head in vectors (test)") == 0);
-    CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 4);   // flat depth (test)
-    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
-    CHECK(std::strcmp(items[XD_SPACE_WARP].value, "Flat depth (test)") == 0);
-    CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 5);   // flat depth, no head (test)
-    xp_items(&panel, &cfg, hand, 1, 2208, 2064, items);
-    CHECK(std::strcmp(items[XD_SPACE_WARP].value, "Flat depth, no head (test)") == 0);
     CHECK(xp_choose(&panel, &cfg, &hand, XD_SPACE_WARP, nullptr, 0) == (XP_SAVE | XP_SPACE_WARP_CHANGED) && cfg.space_warp == 0);
     const int level = cfg.foveation;
     CHECK(xp_choose(&panel, &cfg, &hand, XD_FOVEATION, nullptr, 0) == (XP_SAVE | XP_FOVEATION_CHANGED) && cfg.foveation == (level + 1) % 4);
@@ -104,7 +92,8 @@ int main() {
     xr_settings_load(&loaded);
     CHECK(loaded.fxaa == cfg.fxaa && loaded.post_shading == 1 && loaded.merge == 0 && loaded.glow == 0 && loaded.sharpen == 2 && loaded.foveation == cfg.foveation);
     CHECK(loaded.space_warp == 1);
-    { LgXrSettings warp = LG_XR_SETTINGS_DEFAULT; xr_settings_set(&warp, "space_warp", "on"); CHECK(warp.space_warp == 1); xr_settings_set(&warp, "space_warp", "head"); CHECK(warp.space_warp == 2); xr_settings_set(&warp, "space_warp", "nohead"); CHECK(warp.space_warp == 3); xr_settings_set(&warp, "space_warp", "flat"); CHECK(warp.space_warp == 4); xr_settings_set(&warp, "space_warp", "flatnohead"); CHECK(warp.space_warp == 5); xr_settings_set(&warp, "space_warp", "off"); CHECK(warp.space_warp == 0); }
+    { LgXrSettings warp = LG_XR_SETTINGS_DEFAULT; xr_settings_set(&warp, "space_warp", "on"); CHECK(warp.space_warp == 1); xr_settings_set(&warp, "space_warp", "off"); CHECK(warp.space_warp == 0);
+      xr_settings_set(&warp, "space_warp", "flat"); CHECK(warp.space_warp == 1); }   // a test build's value reads as on
     LgXrSettings parsed = LG_XR_SETTINGS_DEFAULT;
     xr_settings_set(&parsed, "fxaa", "off"); xr_settings_set(&parsed, "post_shading", "coarse"); xr_settings_set(&parsed, "merge", "off"); xr_settings_set(&parsed, "glow", "off"); xr_settings_set(&parsed, "sharpen", "high");
     CHECK(parsed.fxaa == 0 && parsed.post_shading == 1 && parsed.merge == 0 && parsed.glow == 0 && parsed.sharpen == 3);
