@@ -53,6 +53,29 @@ The vectors make the synthesized frames move. This measure cannot tell the y con
 (global shift ~0.05 px), so a whole-frame direction test was inconclusive: the convention rests on the reasoning above and the owner's
 look in the headset.
 
+## Owner's look, and what On sends (2026-11-12)
+
+In the headset the owner saw the world ghost on head movement with the vectors and the real depth, with or without the head's motion in
+the vectors, and nothing with Head only (no vectors, far depth). Captures (`UC_CAPTURE_WARP=N`: frames N and N+1's motion, depth and eye
+images) showed the data itself right: the depth lines up with the eye picture exactly (edge overlap best at shift 0, not flipped, not
+swapped), and frame N+1's vectors carry frame N's picture to frame N+1's best read as the spec defines them (error 4.6/6.5 per eye vs
+8.6/11.2 without vectors, 10.7/13.6 reversed, worse at half or double size). The runtime's positional reprojection by that depth is what
+ghosted (the handrails at ~0.3 m). The owner then found the vectors with the depth at the far plane clean, so **On = the vectors with the
+head's motion in them (Meta's sample) and a flat depth image**. Diagnostics: `UC_SPACE_WARP_VECTORS=0`, `UC_SPACE_WARP_NO_HEAD=1`,
+`UC_SPACE_WARP_DEPTH=1` (real depth).
+
+## 120 Hz (game at 60), live fight
+
+| | runtime | stale a second | app GPU |
+|---|---|---|---|
+| native 3.07x (2064x2208), harness defaults | 41-46/120 | 30-41 | 16-19 ms, GPU 99% |
+| 2.75x (1851x1980), glow off, coarse post | 47-52/120 | 18-27 | 14-17 ms, 97-98% |
+| 2.5x (1683x1800), harness defaults | 53-58/120 | 4-16 | 13-15 ms, 94-96% |
+| 2.5x, glow off, coarse post | mostly 60, dips 56-57 | 0-13 | 12-13 ms, 92-95% |
+| **2.25x (1514x1620), harness defaults (glow on)** | **60-61/120** | **0** | **~11 ms, 85%** |
+
+Foveation was already high (the maximum) in all. The owner's settings were set to 120 Hz, render scale 2.25, space warp on.
+
 ## Not done / follow-ups
 
 - Controller and gun overlay: zero vectors (hand motion updates at 45 Hz).

@@ -1,4 +1,4 @@
-# Latest: Application SpaceWarp (90 Hz display, game at 45) — awaiting the owner's look
+# Latest: Application SpaceWarp — accepted in the headset; owner set to 120 Hz, render scale 2.25
 
 Updated 2026-11-12. Branch `worktree-appsw` (from `main` f280916). Details and numbers: [S23](docs/spikes/S23-quest-spacewarp.md).
 
@@ -6,7 +6,9 @@ Updated 2026-11-12. Branch `worktree-appsw` (from `main` f280916). Details and n
   with motion vectors and depth from a motion pass over the pre-pass's positions; the game steps on a 45 Hz timer.
 - Live fight, native eyes, same APK: off 46-54/90 with 36-46 stale refreshes a second (GPU 99%); on 45/90, 0 stale, 22.2 ms frames,
   motion pass ~free after merging draws (55k world draws per 2 s in ~4k calls).
-- Not yet established: that the vectors' direction is right in the headset (reasoned, not seen: the fight's camera hardly moves), and
+- Owner verdict (2026-11-12): real depth ghosted on head movement; vectors + flat depth are clean, now what On sends. Vectors verified
+  from captures (UC_CAPTURE_WARP). At 120 Hz only render scale 2.25 holds 60 (0 stale, GPU 85%); 2.5 dips; native 41-46. See S23.
+- Superseded note:
   how it looks and feels worn. The owner should try it, ideally on a moving-camera rail section, and compare with Space warp off.
 - Diagnostics: `UC_SPACE_WARP_VECTORS=0` (head pose only), `UC_SPACE_WARP_FLIP_Y=1` (y negated), `[space-warp]` stats line.
 - Test builds were installed as versionName `0.1.5-appsw`, versionCode 105 (equal to the owner's release so either installs over the
