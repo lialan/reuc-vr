@@ -634,6 +634,12 @@ int main() {
         CHECK(is(uc::pacing_for_limit(1000,0,false),false,480));
         CHECK(is(uc::pacing_for_limit(144,240,false),false,240));         // --game-hz wins
         CHECK(is(uc::pacing_for_limit(60,45,false),false,45));            // below 60 too (the headset's space warp: 45 Hz under a 60 limit)
+        // the headset's space warp: its step replaces limits above 30, none and unlimited; 30 keeps the original pacing; off: the limit's
+        CHECK(is(uc::pacing_with_space_warp(60,45,0,false),false,45));
+        CHECK(is(uc::pacing_with_space_warp(std::nullopt,45,0,false),false,45));
+        CHECK(is(uc::pacing_with_space_warp(0,36,0,false),false,36));
+        CHECK(is(uc::pacing_with_space_warp(30,45,0,false),false,0));
+        CHECK(is(uc::pacing_with_space_warp(60,0,0,false),true,0));
     }
     {   // live mode change: picked up at the next frame wait
         uc::game_pacing_init(false);

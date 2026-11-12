@@ -112,6 +112,16 @@ public:
     // runtime synthesizes every other displayed frame: the game runs at half the display rate.
     bool space_warp() const;
     bool space_warp_frame() const { return warp_frame_; }   // this frame's eye array came with motion and depth images (begin_frame)
+    // The renderer's motion pass (space_warp_frame() only): this frame's motion and depth images (both eyes as layers, COLOR_ATTACHMENT /
+    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL, left so). first: no pass has written them this frame (the pass clears them); later passes load.
+    // A frame without a pass gets them cleared in record() (no motion, everything at the far plane).
+    struct WarpTarget { VkImageView motion = VK_NULL_HANDLE, depth = VK_NULL_HANDLE; VkExtent2D extent{}; bool first = false; };
+    WarpTarget warp_target();
+    VkFormat warp_depth_format() const { return warp_depth_format_; }
+    // The depth images' projection this frame, in metres (the layer space's units): submitted as nearZ / farZ.
+    void set_warp_depth_range(float near_m, float far_m) { warp_near_ = near_m; warp_far_ = far_m; }
+    float warp_near() const { return warp_near_; }
+    float warp_far() const { return warp_far_; }
     // Before attach(): told the game's step whenever space warp turns on or off or the display rate changes under it (render thread): half
     // the display rate, or 0 for the step the frame limit chooses (uc_main: game_pacing_set_mode). Called at attach with the saved setting.
     void set_space_warp_step(std::function<void(uint32_t game_hz)> step) { space_warp_step_ = std::move(step); }
@@ -186,14 +196,14 @@ private:
     bool controller_aim_enabled_=true;
     VkImage overlay_depth_image_ = VK_NULL_HANDLE;
     // Space warp: one two-layer swapchain each for the motion vectors and the depth, at warp_extent_ (XrSystemSpaceWarpPropertiesFB).
-    struct WarpTarget {
+    struct WarpSwapchain {
         XrSwapchain swapchain = XR_NULL_HANDLE; std::vector<VkImage> images; std::vector<VkImageView> views; uint32_t index = 0;
         void acquire(const char* what);
         void release();
     };
     std::function<void(uint32_t)> space_warp_step_;
-    bool space_warp_supported_ = false, warp_frame_ = false;
-    WarpTarget warp_motion_, warp_depth_;
+    bool space_warp_supported_ = false, warp_frame_ = false, warp_written_ = false;
+    WarpSwapchain warp_motion_, warp_depth_;
     VkExtent2D warp_extent_{};
     VkFormat warp_depth_format_ = VK_FORMAT_UNDEFINED;
     float warp_near_ = .1f, warp_far_ = 1e4f;   // metres: the depth image's projection (cleared to far: everything at the far plane)

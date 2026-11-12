@@ -7,6 +7,9 @@ struct PacingMode { bool unlock_60=false; uint32_t game_hz=0; };
 // The game update rate a frame rate limit chooses (Options::fps_limit): 30 or less the original 30 Hz, 31..60 the retrace-locked 60 Hz,
 // above 60 or unlimited (0) a timer step at the limit (480 Hz ceiling); game_hz_override (--game-hz) wins.
 PacingMode pacing_for_limit(std::optional<uint32_t> fps_limit, uint32_t game_hz_override, bool unlock_60fps);
+// The headset's space warp (warp_hz > 0: half the display rate) replaces the step of every limit above 30, none and unlimited with its timer
+// step; 30 or less keeps the original 30 Hz (the harness reaches the fight there, through the retrace clock its fast-forward speeds up).
+PacingMode pacing_with_space_warp(std::optional<uint32_t> fps_limit, uint32_t warp_hz, uint32_t game_hz_override, bool unlock_60fps);
 void game_pacing_set_mode(PacingMode);   // any thread; the guest picks it up at its next frame wait
 // Pause: the game clock steps by zero (its step and step_scale are 0), the game keeps looping and rendering. Any thread.
 void game_pacing_set_paused(bool);

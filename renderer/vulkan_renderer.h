@@ -223,6 +223,8 @@ private:
         Buffer vertices, indices, pixels, uniforms, palettes, banks, motions;   // vertices/indices: this frame's non-mesh draws; motions: MotionBlock per scene draw
         Buffer xform_jobs, xform_chunks, xform_positions, xform_attributes, xform_indices;   // the vertex pre-pass (xform_): its input table, outputs and the rebased indices
         VkDescriptorPool xform_pool = VK_NULL_HANDLE; VkDescriptorSet xform_set = VK_NULL_HANDLE;
+        Buffer xform_previous;   // the headset's space warp: last frame's view position per pre-pass position (xr_motion.slang)
+        VkDescriptorPool warp_pool = VK_NULL_HANDLE; VkDescriptorSet warp_set = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<const gx::MeshBuffers>> mesh_refs;   // keeps the meshes this submission draws alive until its fence completed
         std::vector<std::shared_ptr<Texture>> textures;   // shared through texture_pool_: one GPU image per texture, not one per slot
         std::vector<std::shared_ptr<const gx::TexturePixels>> copy_sources;
@@ -558,6 +560,18 @@ private:
     VkDescriptorSetLayout xform_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout xform_layout_ = VK_NULL_HANDLE;
     VkPipeline xform_pipeline_ = VK_NULL_HANDLE;
+    // The headset's space warp (XrCompositor::space_warp): the motion pass (xr_motion.slang) draws the frame's depth-writing world draws
+    // again into the runtime's motion and depth images, from the pre-pass's positions. warp_track_: this display frame feeds tracker_ and
+    // writes previous positions; warp_eyes_: the frame's eye rows (game view -> Vulkan clip) at one near/far, from its first such draw.
+    struct WarpDraw { uint32_t first, count, kind; };
+    VkShaderModule warp_vertex_ = VK_NULL_HANDLE, warp_fragment_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout warp_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout warp_layout_ = VK_NULL_HANDLE;
+    VkPipeline warp_pipeline_ = VK_NULL_HANDLE;
+    bool warp_track_ = false;
+    uint64_t warp_draw_count_ = 0, warp_call_count_ = 0;   // the [space-warp] line: world draws the pass took, draw calls it issued
+    std::optional<std::array<float,32>> warp_eyes_;
+    void record_warp_pass(Slot& slot, const std::vector<WarpDraw>& draws);
     // The headset's texture table (UC_TEX_MERGE=1, needs xform_ and descriptor indexing): every packet's distinct texture/sampler sets as one
     // array of combined image samplers (set 1); a draw's first entry travels with its vertices (the pre-pass writes it), so draws that differ
     // only in their textures merge into one run. Pipelines with key bit kTexTableKeyBit use the TEX_TABLE modules and table_layout_.

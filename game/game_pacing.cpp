@@ -100,6 +100,10 @@ PacingMode pacing_for_limit(std::optional<uint32_t> fps_limit,uint32_t game_hz_o
     if(limit==0 || limit>60) return {unlock_60fps,limit ? std::min(limit,480u) : 480u};
     return {limit>30,0};
 }
+PacingMode pacing_with_space_warp(std::optional<uint32_t> fps_limit,uint32_t warp_hz,uint32_t game_hz_override,bool unlock_60fps) {
+    if(warp_hz && (!fps_limit || *fps_limit==0 || *fps_limit>30)) return {false,warp_hz};
+    return pacing_for_limit(fps_limit,game_hz_override,unlock_60fps);
+}
 void game_pacing_set_mode(PacingMode mode) { requested_mode=(uint64_t(1)<<63)|(uint64_t(mode.unlock_60)<<32)|mode.game_hz; }
 void game_pacing_set_network_period(uint64_t ticks) {
     if(ticks && (ticks<kTimebaseHz/120 || ticks>kTimebaseHz/20))throw std::invalid_argument("network frame period out of range");

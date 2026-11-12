@@ -19,6 +19,13 @@ If something is missing or wrong, the app shows a message and writes `HOW-TO-ADD
 
 An unpacked disc (`/sdcard/UmbrellaChronicles/game/DATA/sys/main.dol`, as older builds needed) still works. The app uses it only when it finds no image.
 
+## Space warp
+
+**Display > Space warp** (off by default) turns on Meta's Application SpaceWarp: the game runs at half the display rate (45 fps at
+90 Hz) and the headset fills in every other frame from the game's motion vectors and depth. The display then gets a new picture every
+refresh with an even cadence, at the full eye resolution. Without it, heavy scenes run at about 50 fps and the picture alternates between
+one and two refreshes. Details: `docs/spikes/S23-quest-spacewarp.md`.
+
 ## Building the APK
 
 See the header of `scripts/build-quest.sh`. The build translates `main.dol` from `UC_INSTALL_DIR` and records its SHA-256 in the APK. At start-up the game checks the `main.dol` inside the player's image against it.

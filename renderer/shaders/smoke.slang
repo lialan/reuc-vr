@@ -165,7 +165,9 @@ float3 generateTexcoord(uint id, Input input) {
 // mergeMap (UC_UBER_SMALL): where the packet's vertex map starts in the attribute buffer, two words a position (the vertex's first attribute
 // word; the draw's uniform block index | coordinate mask << 24), which the small-draw ubershader's vertex stage reads instead of the
 // draw's push constants, so draws of different strides and uniform blocks are one run; 0xFFFFFFFF: no map.
-struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint mergeMap; uint pad1; uint pad2; };
+// motionKind / prevPalette (the headset's space warp, xr_motion.slang): 1 = the draw has last frame's matrices in palette prevPalette, so its
+// last frame's view positions go to xformPrevious; anything else writes nothing there.
+struct XformJob { uint* vertices; uint count; uint draw; float4 rows[4]; uint palette; uint current; uint indexed; uint bank; uint positions; uint attributes; uint mask; uint stride; uint table; uint mergeMap; uint motionKind; uint prevPalette; };
 // Keep the view position as well as guest clip: stereo world draws must not
 // recover it from a rounded projected depth. HUD/copy draws still use clip.
 struct XformPosition { float4 clip; float4 view; };
@@ -176,6 +178,7 @@ uint packColor(float4 c) { const uint4 b = uint4(round(saturate(c) * 255.0)); re
 [[vk::binding(9, 0)]] StructuredBuffer<uint2> xformChunks;   // per 64-thread group: job, first vertex
 [[vk::binding(6, 0)]] RWStructuredBuffer<XformPosition> xformPositions;
 [[vk::binding(7, 0)]] RWStructuredBuffer<uint> xformAttributes;
+[[vk::binding(10, 0)]] RWStructuredBuffer<float4> xformPrevious;   // last frame's view position per position (motionKind 1 only)
 [numthreads(64, 1, 1)]
 void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     const uint2 chunk = xformChunks[group.x];
@@ -198,6 +201,10 @@ void xformMain(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     float4 viewPosition = float4(dot(row0, objectPosition), dot(row1, objectPosition), dot(row2, objectPosition), 1.0);
     xformPositions[job.positions + i].clip = float4(dot(projection.rows[0], viewPosition), dot(projection.rows[1], viewPosition), dot(projection.rows[2], viewPosition), dot(projection.rows[3], viewPosition));
     xformPositions[job.positions + i].view = viewPosition;
+    if (job.motionKind == 1) {   // the same vertex through last frame's matrices of this draw (gx::MotionTracker), same matrix row
+        const float4 p0 = positionRow(job.prevPalette, row), p1 = positionRow(job.prevPalette, row + 1), p2 = positionRow(job.prevPalette, row + 2);
+        xformPrevious[job.positions + i] = float4(dot(p0, objectPosition), dot(p1, objectPosition), dot(p2, objectPosition), 1.0);
+    }
     uint normalRow = row & 31;
     uint4 loaded = loadedRows(projection.palette);
     bool allLoaded = true;

@@ -333,13 +333,13 @@ void XrCompositor::announce_space_warp() {
                  space_warp_supported_ ? "" : " (runtime has no XR_FB_space_warp)", hz ? std::to_string(hz).append(" Hz").c_str() : "from the frame limit");
     if (space_warp_step_) space_warp_step_(hz);
 }
-void XrCompositor::WarpTarget::acquire(const char* what) {
+void XrCompositor::WarpSwapchain::acquire(const char* what) {
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     xr_check(xrAcquireSwapchainImage(swapchain, &acquire, &index), what);
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout = XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(swapchain, &ready), what);
 }
-void XrCompositor::WarpTarget::release() {
+void XrCompositor::WarpSwapchain::release() {
     XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xr_check(xrReleaseSwapchainImage(swapchain, &info), "release OpenXR space warp image");
 }
@@ -359,7 +359,7 @@ void XrCompositor::create_space_warp(const std::vector<int64_t>& formats) {
         return;
     }
     warp_extent_ = {warp.recommendedMotionVectorImageRectWidth, warp.recommendedMotionVectorImageRectHeight};
-    const auto make = [&](WarpTarget& target, VkFormat format, XrSwapchainUsageFlags usage, VkImageAspectFlags aspect, const char* what) {
+    const auto make = [&](WarpSwapchain& target, VkFormat format, XrSwapchainUsageFlags usage, VkImageAspectFlags aspect, const char* what) {
         XrSwapchainCreateInfo swap{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         swap.usageFlags = usage; swap.format = format; swap.sampleCount = 1; swap.width = warp_extent_.width; swap.height = warp_extent_.height;
         swap.faceCount = 1; swap.arraySize = 2; swap.mipCount = 1;
@@ -375,8 +375,11 @@ void XrCompositor::create_space_warp(const std::vector<int64_t>& formats) {
             target.views.push_back(created);
         }
     };
-    make(warp_motion_, VK_FORMAT_R16G16B16A16_SFLOAT, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, "OpenXR space warp motion swapchain");
-    make(warp_depth_, warp_depth_format_, XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, "OpenXR space warp depth swapchain");
+    // SAMPLED as well: the runtime reads both (the spec's XrCompositionLayerSpaceWarpInfoFB asks for it on the depth swapchain).
+    make(warp_motion_, VK_FORMAT_R16G16B16A16_SFLOAT, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+         "OpenXR space warp motion swapchain");
+    make(warp_depth_, warp_depth_format_, XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+         "OpenXR space warp depth swapchain");
     std::fprintf(stderr, "[vulkan-xr] space warp swapchains %ux%u x2 (motion RGBA16F, depth format %d)\n", warp_extent_.width, warp_extent_.height, int(warp_depth_format_));
 }
 // The space warp images of this frame: motion 0 (nothing moves) and depth at the far plane, so the runtime reprojects by the head's pose alone.
@@ -391,6 +394,12 @@ void XrCompositor::record_space_warp(VkCommandBuffer command) {
     rendering.colorAttachmentCount = 1; rendering.pColorAttachments = &motion; rendering.pDepthAttachment = &depth;
     vkCmdBeginRendering(command, &rendering);
     vkCmdEndRendering(command);
+}
+XrCompositor::WarpTarget XrCompositor::warp_target() {
+    if (!warp_frame_) throw std::logic_error("XR: space warp images outside a space warp frame");
+    WarpTarget target{warp_motion_.views.at(warp_motion_.index), warp_depth_.views.at(warp_depth_.index), warp_extent_, !warp_written_};
+    warp_written_ = true;
+    return target;
 }
 
 void XrCompositor::poll() {
@@ -546,7 +555,7 @@ bool XrCompositor::begin_frame() {
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout = XR_INFINITE_DURATION;
     const auto t2 = std::chrono::steady_clock::now();
     xr_check(xrWaitSwapchainImage(swapchain_, &ready), "wait OpenXR eye array");
-    warp_frame_ = space_warp();   // fixed for the frame: a panel change applies from the next one
+    warp_frame_ = space_warp(); warp_written_ = false;   // fixed for the frame: a panel change applies from the next one
     if (warp_frame_) { warp_motion_.acquire("acquire OpenXR space warp motion"); warp_depth_.acquire("acquire OpenXR space warp depth"); }
     xr_time(2, t2, std::chrono::steady_clock::now());
     return true;
@@ -743,7 +752,7 @@ void XrCompositor::record(VkCommandBuffer command, VkImage picture, VkImageView 
     vkCmdDraw(command, 6, 1, 0, 0);
     overlay_.draw(command, scene_.overlay_matrices(), scene_.overlay_eyes(), panel_.guns(), panel_.draws());
     vkCmdEndRendering(command);
-    if (warp_frame_) record_space_warp(command);
+    if (warp_frame_ && !warp_written_) record_space_warp(command);   // no motion pass this frame (menus, no world): no motion, far depth
     barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
             transfer_picture ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             transfer_picture ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -857,7 +866,7 @@ void XrCompositor::detach() {
     pool_ = VK_NULL_HANDLE; for (auto& p : pipelines_) p = VK_NULL_HANDLE; layout_ = VK_NULL_HANDLE; set_layout_ = VK_NULL_HANDLE; sampler_ = VK_NULL_HANDLE; vertex_ = fragment_ = VK_NULL_HANDLE;
     if (profile_ && destroy_profile_) destroy_profile_(profile_); profile_ = XR_NULL_HANDLE;
     if (swapchain_) xrDestroySwapchain(swapchain_); swapchain_ = XR_NULL_HANDLE;
-    for (auto* target : {&warp_motion_, &warp_depth_}) { if (target->swapchain) xrDestroySwapchain(target->swapchain); *target = WarpTarget{}; }
+    for (auto* target : {&warp_motion_, &warp_depth_}) { if (target->swapchain) xrDestroySwapchain(target->swapchain); *target = WarpSwapchain{}; }
     warp_frame_ = false; warp_extent_ = {}; warp_depth_format_ = VK_FORMAT_UNDEFINED;
     if (space_) xrDestroySpace(space_); space_ = XR_NULL_HANDLE;
     if (base_space_) xrDestroySpace(base_space_); base_space_ = XR_NULL_HANDLE;
