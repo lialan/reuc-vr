@@ -8,9 +8,10 @@ Updated 2026-11-12. Branch `worktree-appsw` (from `main` f280916). Details and n
   motion pass ~free after merging draws (55k world draws per 2 s in ~4k calls).
 - Owner verdict (2026-11-12): real depth ghosted on head movement; vectors + flat depth are clean, now what On sends. Vectors verified
   from captures (UC_CAPTURE_WARP). At 120 Hz only render scale 2.25 holds 60 (0 stale, GPU 85%); 2.5 dips; native 41-46. See S23.
-- Superseded note:
-  how it looks and feels worn. The owner should try it, ideally on a moving-camera rail section, and compare with Space warp off.
-- Diagnostics: `UC_SPACE_WARP_VECTORS=0` (head pose only), `UC_SPACE_WARP_FLIP_Y=1` (y negated), `[space-warp]` stats line.
+- The game step is half the display rate (60 at 120 Hz). The owner's vr.cfg was set to refresh 120, render_scale 2.25, space_warp on.
+- Diagnostics: `UC_SPACE_WARP_VECTORS=0` (head pose only), `UC_SPACE_WARP_NO_HEAD=1`, `UC_SPACE_WARP_DEPTH=1` (real depth),
+  `UC_SPACE_WARP_FLIP_Y=1`, `UC_CAPTURE_WARP=N` (frames N, N+1 to warp-capture-*.raw), the `[space-warp]` stats line.
+- Open: default is still off; not merged to `main`.
 - Test builds were installed as versionName `0.1.5-appsw`, versionCode 105 (equal to the owner's release so either installs over the
   other). The owner's previous APK is kept at `~/workspace/reuc-gpu-efficiency/appsw/pre-appsw-installed.apk` (SHA-256 0038f2f5...).
 
