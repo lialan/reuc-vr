@@ -6,8 +6,10 @@
 extern "C" {
 #endif
 enum { XP_SIGHT,XP_LASER,XP_CROSSHAIR,XP_GUN,XP_HAND,XP_DUAL,XP_STATS,XP_SCREEN,XP_HUD,XP_RATE,XP_DISPLAY,XP_CONTROLS,XP_RECENTRE,XP_RESET,XP_CLOSE,XP_COUNT };
-/* The Display page (XP_DISPLAY opens it): the picture's size and what the GPU spends on it, all but the eye size applied live. */
-enum { XD_PRESET,XD_RES,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_SHARPEN,XD_POST,XD_MERGE,XD_GLOW,XD_SPACE_WARP,XD_BACK,XD_COUNT };
+#define XP_PRESET_COUNT 3
+/* The Display page (XP_DISPLAY opens it): the picture's size and what the GPU spends on it, all but the eye size applied live. Its first
+ * rows are the presets (XD_PRESET + i is xp_presets[i]): choosing one saves it and restarts the game, so the eye images take its size. */
+enum { XD_PRESET,XD_RES=XD_PRESET+XP_PRESET_COUNT,XD_SCALE,XD_FOVEATION,XD_FXAA,XD_SHARPEN,XD_POST,XD_MERGE,XD_GLOW,XD_SPACE_WARP,XD_BACK,XD_COUNT };
 /* The Controls page (XP_CONTROLS opens it): what each Touch input does in the game, read only, and the Vibration switch. */
 enum { XC_FIRE,XC_RELOAD,XC_ACTION,XC_KNIFE,XC_GRENADE,XC_WEAPON,XC_SHAKE,XC_PAUSE,XC_MENU,XC_HAND,XC_VIBRATION,XC_BACK,XC_COUNT };
 #define XP_MAX2(a,b) ((int)(a)>(int)(b)?(int)(a):(int)(b))
@@ -20,7 +22,6 @@ enum { XP_SAVE=1,XP_CROSSHAIR_CHANGED=2,XP_SCREEN_CHANGED=4,XP_HUD_CHANGED=8,XP_
 /* The Display page's presets: each sets the display rate, space warp, render scale and foveation together (measured on the Quest 3, live
  * train fight: docs/spikes/S23-quest-spacewarp.md). render_scale 0 is native. */
 typedef struct { const char *name; int refresh,space_warp,foveation; float render_scale; } XpPreset;
-#define XP_PRESET_COUNT 3
 extern const XpPreset xp_presets[XP_PRESET_COUNT];
 int xp_preset_of(const LgXrSettings *settings);   /* the preset the settings match, -1 none (Custom) */
 typedef struct {

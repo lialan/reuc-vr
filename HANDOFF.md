@@ -8,7 +8,7 @@ Updated 2026-11-12. Branch `worktree-appsw` (from `main` f280916). Details and n
   motion pass ~free after merging draws (55k world draws per 2 s in ~4k calls).
 - Owner verdict (2026-11-12): real depth ghosted on head movement; vectors + flat depth are clean, now what On sends. Vectors verified
   from captures (UC_CAPTURE_WARP). At 120 Hz only render scale 2.25 holds 60 (0 stale, GPU 85%); 2.5 dips; native 41-46. See S23.
-- Display **Preset** row: 90 Hz SW native / 120 Hz SW 2.25x / 72 Hz no SW 2.25x (game at 72; the Quest 3 has no 60 Hz). See S23 "Display presets".
+- Display preset rows (choosing one saves and restarts the game): 90 Hz SW native / 120 Hz SW 2.25x / 72 Hz no SW 2.25x (game at 72; the Quest 3 has no 60 Hz). See S23 "Display presets".
 - The game step is half the display rate (60 at 120 Hz). The owner's vr.cfg was set to refresh 120, render_scale 2.25, space_warp on.
 - Diagnostics: `UC_SPACE_WARP_VECTORS=0` (head pose only), `UC_SPACE_WARP_NO_HEAD=1`, `UC_SPACE_WARP_DEPTH=1` (real depth),
   `UC_SPACE_WARP_FLIP_Y=1`, `UC_CAPTURE_WARP=N` (frames N, N+1 to warp-capture-*.raw), the `[space-warp]` stats line.

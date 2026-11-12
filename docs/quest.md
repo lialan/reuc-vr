@@ -26,7 +26,8 @@ An unpacked disc (`/sdcard/UmbrellaChronicles/game/DATA/sys/main.dol`, as older 
 refresh with an even cadence, at the full eye resolution. Without it, heavy scenes run at about 50 fps and the picture alternates between
 one and two refreshes. Details: `docs/spikes/S23-quest-spacewarp.md`.
 
-**Display > Preset** sets the display rate, space warp, render scale and foveation (high) together; any other combination shows Custom:
+The Display page's first three rows are presets. Each sets the display rate, space warp, render scale and foveation (high) together,
+saves them and restarts the game, so the eye images take the preset's size. The row in use shows "In use"; it does nothing when chosen:
 
 | Preset | Display | Game | Render scale |
 |---|---|---|---|

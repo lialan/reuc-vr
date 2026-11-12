@@ -97,6 +97,11 @@ One step lower in render scale frees GPU but leaves the same few stale frames: t
 keep the sharper scales. Game speed varies ~3% per window (the timer step catching up after a hitch) and averages real time. The preset
 row was driven live through `UC_XR_TEST_PANEL_FILE` (Custom -> 90 -> 120 -> 72): each applied its refresh, space warp mode and step.
 
+Applied live, the eye images kept their start-up size (an explicit render scale caps them, `game/xr_android.cpp`), so 2.25x -> native ran
+at 1620 rows until a restart. At the owner's request the presets are now one row each, and choosing one saves it and restarts the game
+(`XP_SAVE|XP_RESTART`; the one in use does nothing). Verified on the headset: 72 preset (1514x1620 eyes) -> 90 -> new process with
+2064x2208 eyes, 90 Hz, step 45 -> 120 -> new process with 1514x1620 eyes, 120 Hz, step 60.
+
 ## Not done / follow-ups
 
 - Controller and gun overlay: zero vectors (hand motion updates at 45 Hz).

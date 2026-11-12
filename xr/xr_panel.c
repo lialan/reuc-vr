@@ -35,10 +35,14 @@ static void controls_items(const LgXrSettings *cfg,XmItem *it)
 }
 static void display_items(const LgXrSettings *cfg,int running_resolution,int running_width,XmItem *it)
 {
-    static const char *const labels[XD_COUNT] = { "Preset", "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Space warp", "Back" };
-    for (int i = 0; i < XD_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
+    static const char *const labels[XD_COUNT - XD_RES] = { "Resolution per eye", "Render scale", "Foveation", "Edge smoothing", "Sharpening", "Post-effect shading", "Draw merging", "Glow", "Space warp", "Back" };
+    for (int i = XD_RES; i < XD_COUNT; i++) { it[i].label = labels[i - XD_RES]; it[i].value[0] = 0; }
+    /* one row a preset: the one in use, the others restart the game (the eye images take their size at start) */
     const int preset = xp_preset_of(cfg);
-    snprintf(it[XD_PRESET].value, 40, "%s", preset < 0 ? "Custom" : xp_presets[preset].name);
+    for (int i = 0; i < XP_PRESET_COUNT; i++) {
+        it[XD_PRESET + i].label = xp_presets[i].name;
+        snprintf(it[XD_PRESET + i].value, 40, "%s", i == preset ? "In use" : "Restarts the game");
+    }
     char res[24];
     if (cfg->width) snprintf(res, sizeof res, "%d x %d", cfg->width, cfg->resolution);
     else snprintf(res, sizeof res, "%d", cfg->resolution);
@@ -91,17 +95,17 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
 static unsigned display_choose(XpPanel *p,LgXrSettings *cfg,int item,const float *rates,int nrates)
 {
     unsigned effects=XP_SAVE;
-    switch(item) {
-    case XD_PRESET:{/* the next preset after the one in use (the first from Custom), skipping any the headset's display rates lack */
-        const int at=xp_preset_of(cfg);int k=-1;
-        for(int step=1;step<=XP_PRESET_COUNT&&k<0;++step){
-            const int i=(at+step+XP_PRESET_COUNT)%XP_PRESET_COUNT;int ok=!nrates;
-            for(int r=0;r<nrates;++r)if((int)(rates[r]+.5f)==xp_presets[i].refresh)ok=1;
-            if(ok&&i!=at)k=i;}
-        if(k<0)return 0;
+    if(item>=XD_PRESET&&item<XD_PRESET+XP_PRESET_COUNT){
+        /* a preset: saved, then the game restarts so the eye images take its size (an explicit render scale caps them at start,
+         * xr_android.cpp). The one in use, or one whose display rate the headset lacks, does nothing. */
+        const int k=item-XD_PRESET;int ok=!nrates;
+        for(int r=0;r<nrates;++r)if((int)(rates[r]+.5f)==xp_presets[k].refresh)ok=1;
+        if(!ok||xp_preset_of(cfg)==k)return 0;
         const XpPreset *q=&xp_presets[k];
         cfg->refresh=q->refresh;cfg->space_warp=q->space_warp;cfg->foveation=q->foveation;cfg->render_scale=q->render_scale;
-        effects|=XP_RATE_CHANGED|XP_SPACE_WARP_CHANGED|XP_SCALE_CHANGED|XP_FOVEATION_CHANGED;break;}
+        p->dirty=1;return XP_SAVE|XP_RESTART;
+    }
+    switch(item) {
     case XD_RES:{/* smaller sizes at the headset's proportions, then its panel */
         static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{LG_XR_NATIVE_WIDTH,LG_XR_NATIVE_HEIGHT}};int k=0;
         while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
